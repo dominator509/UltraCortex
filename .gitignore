@@ -1,0 +1,16 @@
+/target/
+/ultracortex-data/
+*.sock
+
+# Local Codex / Serena workspace state
+.serena/
+.obsidian/
+
+# Editor and OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Accidental local artifact from a brace-expansion-style mkdir
+/{src/

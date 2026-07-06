@@ -1,0 +1,32 @@
+[package]
+name = "ultracortex"
+version = "1.0.0-alpha.1"
+edition = "2021"
+rust-version = "1.75"
+description = "UltraCortex — self-policing shared-memory substrate for multi-agent AI. Single Rust binary. Zero external dependencies."
+license = "LicenseRef-TBD"
+authors = ["Dominic Sarria-Wiley"]
+build = "build.rs"
+
+# SPEC-DERIVED-§1 (Architecture.md): one Rust binary, no glued-together systems.
+# Zero external dependencies is a deliberate v1.0-alpha decision: every
+# primitive (SHA-256, CRC32C, ChaCha20, HMAC, canonical CBOR, ULID, HNSW,
+# BM25, TOML subset) is implemented in-tree with standard test vectors.
+# See IMPLEMENTATION_STATUS.md §2 for the dependency policy and upgrade path.
+[dependencies]
+
+[lib]
+name = "ultracortex"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ultracortex"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1

@@ -1,0 +1,51 @@
+# UltraCortex v1.0 — node configuration.
+# Merge order: this file ← UC_* environment variables ← `--set key=value`.
+# Every value below is the default; a missing file boots identically.
+
+[node]
+id = "ultracortex-0"
+data_dir = "./ultracortex-data"
+# WAL shards; default max(2, cores - 2). Renumbering after first boot is
+# safe (sharding is by handle hash), shrinking is not.
+shards = 2
+# Root of all seed-derived randomness (ULIDs, probes, judge tie-breaks).
+# Fixed seed + same envelope stream = byte-identical state (replay).
+boot_seed = 5462438252926
+# Feature-hash embedder dimensionality for VectorCell/RerankerCell.
+embedder_dim = 256
+
+[persist]
+# T0 = plaintext (dev), T1 = node-key sealed values, T2 = per-stream keys +
+# batch-signed CrossCheckLedger, T3 = external KMS wrap (unimplemented —
+# fails loudly, see IMPLEMENTATION_STATUS.md).
+encryption_tier = "T1"
+
+[listen]
+# Preferred transport: Unix socket, chmod 0600. Empty string disables.
+uds = ""            # default: <data_dir>/ultracortex.sock
+# Opt-in TCP for tooling without UDS. Loopback only by policy.
+tcp = ""            # e.g. "127.0.0.1:7741"
+
+[curator]
+# Librarian↔Warden agreement band over the rolling 200-audit window.
+# Above 0.99 → suspicious_agreement (collusion tripwire, probe rate ×10).
+# Below quota_low → miscalibration.
+disagreement_quota_low = 0.92
+disagreement_quota_high = 0.97
+# Adversarial probe rate (fabricated-handle audits the Warden must catch).
+probe_rate = 0.001
+# Fraction of passed audits re-run blind with permuted evidence order.
+blind_reaudit_rate = 0.01
+# Rotating adjudication pool (judge = pool[envelope.seed % len]).
+pool = "phi-3.5-mini, llama-3.2-3b, smollm2-1.7b"
+# External llama.cpp-style CLI for GGUF-backed curators. Empty = the
+# built-in deterministic backend (extractive skeletons, evidence-tally
+# adjudication) — fully functional and replay-exact.
+external_cmd = ""
+
+# Pinned curator weights: model name -> sha256 of
+# <data_dir>/weights/<model>/<sha>.gguf. Verified at boot and on
+# `ultracortex curator verify-weights`. Uncomment to enable GGUF backends:
+# [curator.pinned]
+# librarian = "0000000000000000000000000000000000000000000000000000000000000000"
+# phi-3.5-mini = "…"
