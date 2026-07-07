@@ -21,7 +21,7 @@ use super::{
 use crate::cells::{CellBehavior, CellType};
 use crate::core::cbor::Cbor;
 use crate::core::ulid::{DetRng, Ulid};
-use crate::core::{CellId, SchemaId, UcError, UcResult};
+use crate::core::{CellId, SchemaId, Severity, UcError, UcResult};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -59,6 +59,7 @@ pub struct CurationJob {
     pub subject: Option<String>,
     pub predicate: Option<String>,
     pub object_text: String,
+    pub severity: Severity,
     pub logical_at: u64,
     pub seed: u64,
 }
@@ -167,9 +168,7 @@ impl LibrarianCell {
         }
 
         // Default: Skeleton of the written body.
-        let body = self
-            .backend
-            .skeleton(&job.object_text, SKELETON_MAX_TOKENS);
+        let body = self.backend.skeleton(&job.object_text, SKELETON_MAX_TOKENS);
         let precise = if body.is_empty() { 0.3 } else { 0.85 };
         (
             CuratorOperation::Skeleton,
@@ -230,11 +229,7 @@ impl LibrarianCell {
     /// Returns `true` (agree — the flagged output really is bad) or `false`
     /// (disagree — escalate to the Adjudicator). Escalation power, not veto
     /// (CURATOR_PAIR_PROTOCOL.md §5.3).
-    pub fn sanity_check_warden(
-        &self,
-        view: &dyn SubstrateView,
-        flag: &CuratorPublic,
-    ) -> bool {
+    pub fn sanity_check_warden(&self, view: &dyn SubstrateView, flag: &CuratorPublic) -> bool {
         match flag.operation {
             CuratorOperation::FlagHallucination => {
                 // The flag claims some grounded_in handle doesn't exist.
@@ -453,12 +448,16 @@ mod tests {
             object_text: "The auth service uses capability tokens. Tokens carry facet scopes. \
                           Scopes are enforced by the router before dispatch."
                 .into(),
+            severity: Severity::P2,
             logical_at: 100,
             seed: 7,
         };
         let out1 = lib.curate(&view, &job);
         assert_eq!(out1.public.operation, CuratorOperation::Skeleton);
-        assert_eq!(lib.status(&out1.public.output_handle), Some(OutputStatus::Pending));
+        assert_eq!(
+            lib.status(&out1.public.output_handle),
+            Some(OutputStatus::Pending)
+        );
         assert!(!out1.public.body.is_empty());
         // Determinism: same job in a fresh librarian => identical output.
         let mut lib2 = librarian();
@@ -479,6 +478,7 @@ mod tests {
             subject: Some("svc.auth".into()),
             predicate: Some("owner".into()),
             object_text: "team-y".into(),
+            severity: Severity::P2,
             logical_at: 200,
             seed: 7,
         };
@@ -504,7 +504,7 @@ mod tests {
             body: "cites nonexistent fact/GHOST".into(),
         };
         assert!(lib.sanity_check_warden(&view, &flag)); // agree
-        // But a flag citing a real handle draws disagreement -> escalation.
+                                                        // But a flag citing a real handle draws disagreement -> escalation.
         let bogus_flag = CuratorPublic {
             grounded_in: vec!["fact/REAL".into()],
             ..flag
@@ -521,6 +521,7 @@ mod tests {
             subject: None,
             predicate: None,
             object_text: "Body text to skeletonize. It has two sentences.".into(),
+            severity: Severity::P2,
             logical_at: 9,
             seed: 1,
         };
@@ -531,7 +532,10 @@ mod tests {
         let snap = lib.snapshot_state();
         let mut lib2 = librarian();
         lib2.restore_state(&snap).unwrap();
-        assert_eq!(lib2.status(&out.public.output_handle), Some(OutputStatus::Active));
+        assert_eq!(
+            lib2.status(&out.public.output_handle),
+            Some(OutputStatus::Active)
+        );
         assert_eq!(
             lib2.private_facet_sha(&facet_handle(&out.public.output_handle, "rationale")),
             Some(&[9u8; 32])

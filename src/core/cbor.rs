@@ -170,6 +170,12 @@ impl Cbor {
         Ok(v)
     }
 
+    pub fn decode_prefix(bytes: &[u8]) -> UcResult<(Cbor, usize)> {
+        let mut cur = Cursor { b: bytes, pos: 0 };
+        let v = decode_one(&mut cur)?;
+        Ok((v, cur.pos))
+    }
+
     /// Collect every Text leaf (used by the Warden to harvest handle-like
     /// strings from arbitrary payloads).
     pub fn collect_texts<'a>(&'a self, out: &mut Vec<&'a str>) {

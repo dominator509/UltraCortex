@@ -40,6 +40,7 @@ pub struct LibrarianState {
 - **Opt-in sync** only via `flags.semantic_check = true` (rare; explicit caller request).
 
 Jobs batch in groups of 16 to amortize tokenizer + KV-cache warmup.
+v1.0 ratifies three supported Librarian KV-cache planning budgets via `[curator].kv_budget_profile`: `small = 256 MiB`, `reference = 384 MiB` (default), `heavy = 768 MiB`. `curator status` surfaces the live profile and derived MiB totals.
 
 ## §5 Output Schema
 Per CURATOR_PAIR_PROTOCOL.md §3.1, every output split into PUBLIC + PRIVATE.
@@ -94,10 +95,6 @@ The proposed SummarizerCell from HyperCortex is subsumed. Skeleton generation is
 |---|---|
 | GAP-CU-001 | Librarian default model |
 | GAP-CU-003 | Confidence-band threshold defaults |
-| GAP-CU-005 | Adversarial probe corpus |
-| GAP-CU-006 | Calibration drift detection window |
-| GAP-CU-010 | KV cache size budget |
-| GAP-CU-013 | Curator shard topology for small deployments |
 
 ## §12 Congruence Contract
 Congruent with: Architecture.md (§16), CURATOR_PAIR_PROTOCOL.md, WardenCell.md, CrossCheckLedgerCell.md, RouterScheduler.md (`flags.semantic_check`), PersistenceLayer.md (weight-file storage + ContractCell pinning), ObservabilityAudit.md (librarian.* metrics).

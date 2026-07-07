@@ -523,6 +523,7 @@ fn c5_blind_reaudit_determinism() {
         subject: Some("c5".into()),
         predicate: Some("facts".into()),
         object_text: "one two three".into(),
+        severity: Severity::P2,
         logical_at: node.now(),
         seed: 131,
     };
@@ -736,8 +737,8 @@ fn c10_end_to_end() {
     assert!(r.ok);
     assert!(r.result.opt_u64("items").unwrap_or(0) >= 1);
     let view_bytes = r.result.get("view").and_then(|v| v.as_bytes()).unwrap().to_vec();
-    let decoded = Cbor::decode(&view_bytes).unwrap();
-    let skeletons = decoded.as_array().unwrap()[2].as_array().unwrap();
+    let decoded = ultracortex::router::view::decode_view(&view_bytes).unwrap();
+    let skeletons = &decoded.skeletons;
     assert!(
         skeletons
             .iter()

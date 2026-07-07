@@ -262,11 +262,7 @@ impl AdjudicatorCell {
     }
 
     /// Operator resolution of an escalated dispute.
-    pub fn resolve_human(
-        &mut self,
-        handle: &str,
-        uphold_auditor: bool,
-    ) -> UcResult<&Adjudication> {
+    pub fn resolve_human(&mut self, handle: &str, uphold_auditor: bool) -> UcResult<&Adjudication> {
         let rec = self
             .records
             .get_mut(handle)
@@ -325,14 +321,8 @@ impl CellBehavior for AdjudicatorCell {
                     ("pool", Cbor::U64(pool)),
                     ("human", Cbor::U64(human)),
                     ("queued", Cbor::U64(queued as u64)),
-                    (
-                        "policy_share_pct",
-                        Cbor::U64(policy * 100 / total),
-                    ),
-                    (
-                        "pool_members",
-                        Cbor::text_array(&self.pool_names()),
-                    ),
+                    ("policy_share_pct", Cbor::U64(policy * 100 / total)),
+                    ("pool_members", Cbor::text_array(&self.pool_names())),
                 ]))
             }
             Some("get") => {
@@ -420,7 +410,10 @@ fn adjudication_to_cbor(a: &Adjudication) -> Cbor {
         ("path", Cbor::t(a.path.as_str())),
         (
             "judge",
-            a.judge.as_ref().map(|j| Cbor::t(j.clone())).unwrap_or(Cbor::Null),
+            a.judge
+                .as_ref()
+                .map(|j| Cbor::t(j.clone()))
+                .unwrap_or(Cbor::Null),
         ),
         ("logical_at", Cbor::U64(a.logical_at)),
         ("human_resolved", Cbor::Bool(a.human_resolved)),
@@ -435,7 +428,10 @@ mod tests {
 
     fn pool3() -> Vec<(String, Arc<dyn CuratorBackend>)> {
         vec![
-            ("phi-3.5-mini".to_string(), Arc::new(DeterministicBackend) as Arc<dyn CuratorBackend>),
+            (
+                "phi-3.5-mini".to_string(),
+                Arc::new(DeterministicBackend) as Arc<dyn CuratorBackend>,
+            ),
             ("llama-3.2-3b".to_string(), Arc::new(DeterministicBackend)),
             ("smollm2-1.7b".to_string(), Arc::new(DeterministicBackend)),
         ]
@@ -476,24 +472,38 @@ mod tests {
         let init = output("librarian/output/01I", vec!["fact/REAL"]);
 
         // Warden flagged a truly-absent handle → auditor upheld by policy.
-        let f1 = flag("warden/judgment/01F", CuratorOperation::FlagHallucination, vec!["fact/GHOST"]);
-        let r1 = adj.adjudicate(&view, &Dispute {
-            initiator_output: &init,
-            auditor_flag: &f1,
-            logical_at: 10,
-            seed: 42,
-        });
+        let f1 = flag(
+            "warden/judgment/01F",
+            CuratorOperation::FlagHallucination,
+            vec!["fact/GHOST"],
+        );
+        let r1 = adj.adjudicate(
+            &view,
+            &Dispute {
+                initiator_output: &init,
+                auditor_flag: &f1,
+                logical_at: 10,
+                seed: 42,
+            },
+        );
         assert_eq!(r1.resolution, Resolution::AuditorUpheld);
         assert_eq!(r1.path, ResolutionPath::Policy);
 
         // Warden flagged an existing handle → initiator upheld by policy.
-        let f2 = flag("warden/judgment/02F", CuratorOperation::FlagHallucination, vec!["fact/REAL"]);
-        let r2 = adj.adjudicate(&view, &Dispute {
-            initiator_output: &init,
-            auditor_flag: &f2,
-            logical_at: 11,
-            seed: 42,
-        });
+        let f2 = flag(
+            "warden/judgment/02F",
+            CuratorOperation::FlagHallucination,
+            vec!["fact/REAL"],
+        );
+        let r2 = adj.adjudicate(
+            &view,
+            &Dispute {
+                initiator_output: &init,
+                auditor_flag: &f2,
+                logical_at: 11,
+                seed: 42,
+            },
+        );
         assert_eq!(r2.resolution, Resolution::InitiatorUpheld);
         let (policy, _, _, _) = adj.stats();
         assert_eq!(policy, 2);
@@ -535,12 +545,15 @@ mod tests {
         // deterministic backend) — bounded search keeps the test stable.
         let mut escalated = None;
         for seed in 0..512u64 {
-            let r = adj.adjudicate(&view, &Dispute {
-                initiator_output: &init,
-                auditor_flag: &f,
-                logical_at: 30,
-                seed,
-            });
+            let r = adj.adjudicate(
+                &view,
+                &Dispute {
+                    initiator_output: &init,
+                    auditor_flag: &f,
+                    logical_at: 30,
+                    seed,
+                },
+            );
             if r.resolution == Resolution::HumanEscalation {
                 escalated = Some(r);
                 break;

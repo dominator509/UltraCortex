@@ -141,7 +141,7 @@ Result is **handles, not bodies** (P1/P14). Bodies hydrate only when agent calls
 | lexical match | BM25Cell | top handles only |
 | graph expansion | GraphCell | expanded handle set only |
 | score refinement | RerankerCell | final order, no rationales |
-| summarization | SummarizerCell ([GAP-NT-013]) | skeleton, not full body |
+| summarization | LibrarianCell::Skeleton (GAP-NT-013 CLOSED) | skeleton, not full body |
 | congruence diff | CongruenceCell | `delta_handle` or none |
 | anchor lookup | SpecAnchorCell | `anchor_ref` only |
 | budget arithmetic | WorkBudgetCell | `tier_hint`, not raw budget |
@@ -150,11 +150,11 @@ Result is **handles, not bodies** (P1/P14). Bodies hydrate only when agent calls
 
 ---
 
-## §6 — SummarizerCell (Proposed — [GAP-NT-013])
+## §6 — SummarizerCell ([GAP-NT-013], CLOSED in UltraCortex v1.0)
 
-Phase 1B Cell producing ≤80-token skeletons from large bodies on write. Without it: every skeleton is hand-authored or LLM-extracted. With it: skeleton stored on write; recall serves it with zero LLM cost.
+HyperCortex proposed a dedicated SummarizerCell in this slot. UltraCortex closes this gap by implementing summarization as `LibrarianCell` skeleton output under Trinity/Curator governance, with the same ≤80-token target and stronger accountability.
 
-Status: proposed. Conformance: skeleton must preserve top-3 entities and canonical action verb.
+Status: closed — retained here for historical context only.
 
 ---
 
@@ -187,8 +187,8 @@ Every release MUST pass:
 1. **Embedding determinism**: same input + seed → byte-identical vector × 1k iterations.
 2. **Reranker determinism**: same input → byte-identical scores × 1k iterations.
 3. **Hybrid recall@10**: ≥ 0.85 on held-out benchmark.
-4. **Token-efficiency end-to-end**: tokens-injected-per-step ≤ 1.5 KB p50 on DeepSeek multi-step coding agent bench (**[GAP-NT-010]**).
-5. **Prefix-cache hit rate**: ≥ 80% on same bench (**[GAP-DS-001]**).
+4. **Token-efficiency end-to-end**: tokens-injected-per-step ≤ 1.5 KB p50 on the DeepSeek multi-step coding-agent bench. Verified locally by `tests/acceptance_bench.rs` with artifact `docs/benchmarks/deepseek_acceptance_2026-07-07.json` (`856` bytes p50, `1052` bytes p99).
+5. **Prefix-cache hit rate**: ≥ 80% on the same bench. Verified locally at `84.21%` in the same artifact.
 
 ---
 
@@ -197,9 +197,6 @@ Every release MUST pass:
 | ID | Description |
 |----|-------------|
 | GAP-004    | Hybrid retrieval ranking weights |
-| GAP-NT-010 | Token-injected-per-step acceptance bench |
-| GAP-NT-013 | SummarizerCell |
-| GAP-DS-001 | DeepSeek prefix-cache hit-rate measurement |
 
 ---
 

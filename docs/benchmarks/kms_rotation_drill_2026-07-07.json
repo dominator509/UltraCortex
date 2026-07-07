@@ -1,0 +1,37 @@
+{
+  "name": "kms_rotation_drill",
+  "recorded_at": "2026-07-07",
+  "command": "cargo test",
+  "suite_result": "158 passed (7 suites, 15.41s)",
+  "checks": [
+    {
+      "harness": "src/persist/mod.rs::tests::kms_t3_rotation_preserves_unseal_and_batch_verification",
+      "proves": [
+        "T3 opens with a persisted local keyring.",
+        "Pre-rotation and post-rotation payloads both unseal successfully.",
+        "Batch signatures remain verifiable across a retained-key roll."
+      ]
+    },
+    {
+      "harness": "src/curator/ledger.rs::tests::batch_signatures_persist_and_verify_across_restore",
+      "proves": [
+        "CrossCheck batch-signature metadata persists in wal/cross_check/batch-signatures.cbor.",
+        "Snapshot/restore plus sidecar reload preserves verification state.",
+        "Replay verification succeeds after restore."
+      ]
+    },
+    {
+      "harness": "src/bootstrap/mod.rs::tests::kms_status_and_rotate_surface_custody_and_keep_audit_chain_intact",
+      "proves": [
+        "The admin plane surfaces custody path, active key id, and rotation cadence.",
+        "Emergency rotation emits auditable key-roll metadata.",
+        "Audit-chain verification remains intact after rotation."
+      ]
+    }
+  ],
+  "notes": [
+    "T3 in this checkout is a local persisted keyring seam, not a remote cloud KMS integration.",
+    "Recovery now verifies completed CrossCheck batch signatures before MCP open."
+  ],
+  "status": "pass"
+}

@@ -88,9 +88,9 @@ impl BlindReauditScheduler {
 // CalibrationTracker
 // ---------------------------------------------------------------------------
 
-const CALIBRATION_WINDOW: usize = 50;
-const HIGH_BAND_FLOOR: f64 = 0.85;
-const MEDIUM_BAND_FLOOR: f64 = 0.60;
+pub const CALIBRATION_WINDOW: usize = 50;
+pub const HIGH_BAND_FLOOR: f64 = 0.85;
+pub const MEDIUM_BAND_FLOOR: f64 = 0.60;
 
 pub struct CalibrationTracker {
     high: VecDeque<bool>,
@@ -163,7 +163,10 @@ mod tests {
         let base_hits = a.iter().filter(|x| **x).count();
         let boosted_hits = run(10.0).iter().filter(|x| **x).count();
         assert!(base_hits >= 1 && base_hits <= 40, "base_hits={base_hits}");
-        assert!(boosted_hits > base_hits * 3, "boosted={boosted_hits} base={base_hits}");
+        assert!(
+            boosted_hits > base_hits * 3,
+            "boosted={boosted_hits} base={base_hits}"
+        );
     }
 
     #[test]
@@ -172,7 +175,7 @@ mod tests {
         let h = p.fabricated_handle(500);
         assert!(h.starts_with("fact/"));
         assert_eq!(h.len(), "fact/".len() + 26); // ULID base32 length
-        // Distinct across calls.
+                                                 // Distinct across calls.
         assert_ne!(h, p.fabricated_handle(500));
     }
 

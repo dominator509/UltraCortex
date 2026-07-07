@@ -7,6 +7,7 @@
 //! ultracortex quarantine list | reinject <qid> | reject <qid>
 //! ultracortex gap list
 //! ultracortex audit verify
+//! ultracortex kms status | rotate [--emergency]
 //! ultracortex congruence audit
 //! ultracortex contract list
 //! ultracortex curator status | probe-now | verify-weights
@@ -27,7 +28,7 @@ use ultracortex::proto::Client;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("usage: ultracortex <run|status|snapshot|quarantine|gap|audit|congruence|contract|curator|cross-check|adjudicator|resolve|metrics|shutdown> …");
+        eprintln!("usage: ultracortex <run|status|snapshot|quarantine|gap|audit|kms|congruence|contract|curator|cross-check|adjudicator|resolve|metrics|shutdown> …");
         return ExitCode::from(1);
     }
 
@@ -108,16 +109,50 @@ fn cmd_admin(args: &[String]) -> Result<(), String> {
             (v.clone(), Cbor::Null)
         }
         [g, sub] if g == "gap" && sub == "list" => ("gap list".into(), Cbor::Null),
+        [b, sub] if b == "budget" && sub == "defaults" => ("budget defaults".into(), Cbor::Null),
         [g, sub] if g == "quarantine" && sub == "list" => ("quarantine list".into(), Cbor::Null),
         [g, sub, qid] if g == "quarantine" && (sub == "reinject" || sub == "reject") => (
             format!("quarantine {sub}"),
             Cbor::map(vec![("qid", Cbor::t(qid.clone()))]),
         ),
         [a, sub] if a == "audit" && sub == "verify" => ("audit verify".into(), Cbor::Null),
+        [k, sub] if k == "kms" && sub == "status" => ("kms status".into(), Cbor::Null),
+        [k, sub] if k == "kms" && sub == "rotate" => (
+            "kms rotate".into(),
+            Cbor::map(vec![("emergency", Cbor::Bool(false))]),
+        ),
+        [k, sub, flag] if k == "kms" && sub == "rotate" && flag == "--emergency" => (
+            "kms rotate".into(),
+            Cbor::map(vec![("emergency", Cbor::Bool(true))]),
+        ),
         [c, sub] if c == "congruence" && sub == "audit" => {
             ("congruence audit".into(), Cbor::Null)
         }
+        xs if xs.len() >= 3 && xs[0] == "congruence" && xs[1] == "accept" => (
+            "congruence accept".into(),
+            Cbor::map(vec![("entities", Cbor::text_array(&xs[2..]))]),
+        ),
         [c, sub] if c == "contract" && sub == "list" => ("contract list".into(), Cbor::Null),
+        [c, sub, schema] if c == "contract" && sub == "verify-migration" => (
+            "contract verify-migration".into(),
+            Cbor::map(vec![("schema_id", Cbor::t(schema.clone()))]),
+        ),
+        [c, sub, schema] if c == "contract" && sub == "apply-migration" => (
+            "contract apply-migration".into(),
+            Cbor::map(vec![("schema_id", Cbor::t(schema.clone()))]),
+        ),
+        [c, sub, source, target, decision, plan, deprecated_after]
+            if c == "contract" && sub == "plan-migration" =>
+        (
+            "contract plan-migration".into(),
+            Cbor::map(vec![
+                ("schema_id", Cbor::t(source.clone())),
+                ("target_schema_id", Cbor::t(target.clone())),
+                ("decision_handle", Cbor::t(decision.clone())),
+                ("migration_plan_handle", Cbor::t(plan.clone())),
+                ("deprecated_after", Cbor::t(deprecated_after.clone())),
+            ]),
+        ),
         [c, sub] if c == "curator" && matches!(sub.as_str(), "status" | "probe-now" | "verify-weights") => {
             (format!("curator {sub}"), Cbor::Null)
         }

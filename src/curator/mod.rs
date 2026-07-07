@@ -26,7 +26,7 @@ pub mod librarian;
 pub mod warden;
 
 use crate::core::cbor::Cbor;
-use crate::core::{UcError, UcResult};
+use crate::core::{ShardTopology, UcError, UcResult};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -180,7 +180,11 @@ impl CuratorPublic {
             grounded_in: c
                 .get("grounded_in")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default(),
             confidence_band: c
                 .opt_str("confidence_band")
@@ -499,12 +503,73 @@ impl CuratorBackend for ExternalGgufBackend {
 // Curator config (mirrors [curator] TOML section)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CuratorKvBudgetProfile {
+    Small,
+    Reference,
+    Heavy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CuratorKvBudgets {
+    pub librarian_mib: u64,
+    pub warden_mib: u64,
+    pub adjudicator_mib: u64,
+}
+
+impl CuratorKvBudgetProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CuratorKvBudgetProfile::Small => "small",
+            CuratorKvBudgetProfile::Reference => "reference",
+            CuratorKvBudgetProfile::Heavy => "heavy",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "small" => CuratorKvBudgetProfile::Small,
+            "reference" => CuratorKvBudgetProfile::Reference,
+            "heavy" => CuratorKvBudgetProfile::Heavy,
+            _ => return None,
+        })
+    }
+
+    pub fn budgets(self) -> CuratorKvBudgets {
+        match self {
+            CuratorKvBudgetProfile::Small => CuratorKvBudgets {
+                librarian_mib: 256,
+                warden_mib: 256,
+                adjudicator_mib: 128,
+            },
+            CuratorKvBudgetProfile::Reference => CuratorKvBudgets {
+                librarian_mib: 384,
+                warden_mib: 384,
+                adjudicator_mib: 256,
+            },
+            CuratorKvBudgetProfile::Heavy => CuratorKvBudgets {
+                librarian_mib: 768,
+                warden_mib: 768,
+                adjudicator_mib: 512,
+            },
+        }
+    }
+}
+
+impl CuratorKvBudgets {
+    pub fn total_mib(self) -> u64 {
+        self.librarian_mib + self.warden_mib + self.adjudicator_mib
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CuratorConfig {
     pub disagreement_quota_low: f64,  // default 0.92
     pub disagreement_quota_high: f64, // default 0.97
     pub probe_rate: f64,              // default 0.001
     pub blind_reaudit_rate: f64,      // default 0.01
+    pub kv_budget_profile: CuratorKvBudgetProfile,
+    pub topology: ShardTopology,
     pub adjudicator_pool: Vec<String>,
     /// model -> sha256 hex, for external backends.
     pub pinned: BTreeMap<String, String>,
@@ -518,6 +583,8 @@ impl Default for CuratorConfig {
             disagreement_quota_high: 0.97,
             probe_rate: 0.001,
             blind_reaudit_rate: 0.01,
+            kv_budget_profile: CuratorKvBudgetProfile::Reference,
+            topology: ShardTopology::Dedicated,
             adjudicator_pool: vec![
                 "phi-3.5-mini".into(),
                 "llama-3.2-3b".into(),
@@ -526,6 +593,12 @@ impl Default for CuratorConfig {
             pinned: BTreeMap::new(),
             external_cmd: None,
         }
+    }
+}
+
+impl CuratorConfig {
+    pub fn kv_budgets(&self) -> CuratorKvBudgets {
+        self.kv_budget_profile.budgets()
     }
 }
 
@@ -579,7 +652,10 @@ mod tests {
         assert_eq!(b.adjudicate(1, "d", &ev_aud), Verdict::AuditorCorrect);
         // Same seed + same dead-tie dispute => same verdict.
         let tie: Vec<String> = vec![];
-        assert_eq!(b.adjudicate(7, "same dispute", &tie), b.adjudicate(7, "same dispute", &tie));
+        assert_eq!(
+            b.adjudicate(7, "same dispute", &tie),
+            b.adjudicate(7, "same dispute", &tie)
+        );
     }
 
     #[test]
@@ -601,5 +677,20 @@ mod tests {
         assert_eq!(p2.operation, CuratorOperation::Skeleton);
         assert_eq!(p2.grounded_in.len(), 2);
         assert_eq!(p2.confidence_band, ConfidenceBand::Medium);
+    }
+
+    #[test]
+    fn kv_budget_profiles_surface_expected_totals() {
+        let small = CuratorKvBudgetProfile::Small.budgets();
+        assert_eq!(small.librarian_mib, 256);
+        assert_eq!(small.warden_mib, 256);
+        assert_eq!(small.adjudicator_mib, 128);
+        assert_eq!(small.total_mib(), 640);
+
+        let reference = CuratorKvBudgetProfile::Reference.budgets();
+        assert_eq!(reference.total_mib(), 1_024);
+
+        let heavy = CuratorKvBudgetProfile::Heavy.budgets();
+        assert_eq!(heavy.total_mib(), 2_048);
     }
 }

@@ -88,6 +88,7 @@ OTel-compatible. Every Envelope opens a root span at the Router; child spans for
 ### §3.4 Export
 
 OTLP/gRPC to configurable collector. **[GAP-013]** default endpoint.
+Current-checkout note: `src/obs.rs` still implements only in-process Metrics/Logger/AuditChain; the exporter path itself has not been wired yet.
 
 ---
 
@@ -161,13 +162,13 @@ struct AuditRecord {
 
 ### §5.4 Signing
 
-T2/T3: every record (or every 256-record batch) signed by KMS-held Ed25519 key. **[GAP-NT-012]** key custody.
+Current checkout: T2/T3 CrossCheck batches carry key-id HMAC evidence, T3 custody state persists in `kms/keyring.cbor`, `ultracortex kms rotate` emits `kms.key_rotated`, and batch-signature metadata persists in `wal/cross_check/batch-signatures.cbor`.
 
 ### §5.5 Replay Verification
 
 On boot, AuditSubsystem replays chain from known-good root and verifies:
 1. all hashes link,
-2. all signatures verify (T2+),
+2. every completed CrossCheck batch signature still matches its persisted key id and digest,
 3. `seq` unbroken.
 
 Failure → `bootstrap.audit_chain_invalid` → node refuses MCP open until human review.
@@ -235,7 +236,6 @@ Every release MUST pass:
 | ID | Description |
 |----|-------------|
 | GAP-013    | OTel exporter default endpoints |
-| GAP-NT-012 | Audit signing key custody |
 
 ---
 
@@ -319,7 +319,6 @@ Curator PRIVATE blobs (rationale_handle, considered_alts, reasoning_trace, confi
 | ID | Description |
 |---|---|
 | GAP-CU-004 | Disagreement quota bounds (default 92–97%) |
-| GAP-CU-006 | Calibration drift detection window size |
 
 ## §A.8 Congruence Contract (Updated)
 

@@ -2,11 +2,11 @@
 //! SPEC-DERIVED-§3 (DeepSeekOptimization.md).
 //!
 //! A view is a deterministic render of substrate state whose byte layout is
-//! **prefix-stable**: the render is a CBOR *array* (order-preserving, unlike
-//! maps) of five segments — header, handles, skeletons, bodies, footer —
-//! each internally lexicographically sorted. Adding content only ever
-//! appends within a segment or grows later segments, so a prefix-caching
-//! model (DeepSeek et al.) keeps its KV cache warm across re-renders.
+//! **prefix-stable**: the render is an opaque CBOR item stream with a fixed
+//! header, fixed section markers, and lexicographically sorted section items.
+//! Appending content only emits additional items later in the stream, so a
+//! prefix-caching model (DeepSeek et al.) keeps its KV cache warm across
+//! re-renders instead of losing the shared prefix to container length churn.
 //!
 //! Tier policy (RouterScheduler.md §5.1):
 //!
@@ -22,7 +22,12 @@
 
 use crate::core::cbor::Cbor;
 use crate::core::crypto::{hex, sha256};
-use crate::core::{est_tokens, Tier};
+use crate::core::{est_tokens, Tier, UcError, UcResult};
+
+const SECTION_HANDLES: u64 = 0;
+const SECTION_SKELETONS: u64 = 1;
+const SECTION_BODIES: u64 = 2;
+const SECTION_FOOTER: u64 = 3;
 
 /// Cache key: (view_id, namespace, version, params_hash) — matches
 /// PrefixCacheStore::ViewKey (PersistenceLayer.md §6.2).
@@ -44,6 +49,58 @@ pub struct RenderedView {
     pub truncated: bool,
     pub next_tier_hint: Option<Tier>,
     pub items_included: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct DecodedView {
+    pub header: Cbor,
+    pub handles: Vec<Cbor>,
+    pub skeletons: Vec<Cbor>,
+    pub bodies: Vec<Cbor>,
+    pub footer: Cbor,
+}
+
+fn append_section(out: &mut Vec<u8>, marker: u64, items: &[Cbor]) {
+    out.extend_from_slice(&Cbor::U64(marker).encode());
+    for item in items {
+        out.extend_from_slice(&item.encode());
+    }
+}
+
+fn decode_section(bytes: &[u8], mut pos: usize, end_marker: u64) -> UcResult<(Vec<Cbor>, usize)> {
+    let mut items = Vec::new();
+    loop {
+        let (item, used) = Cbor::decode_prefix(&bytes[pos..])?;
+        pos += used;
+        if item.as_u64() == Some(end_marker) {
+            return Ok((items, pos));
+        }
+        items.push(item);
+    }
+}
+
+pub fn decode_view(bytes: &[u8]) -> UcResult<DecodedView> {
+    let (header, mut pos) = Cbor::decode_prefix(bytes)?;
+    let (marker, used) = Cbor::decode_prefix(&bytes[pos..])?;
+    pos += used;
+    if marker.as_u64() != Some(SECTION_HANDLES) {
+        return Err(UcError::internal("view: missing handles marker"));
+    }
+    let (handles, pos) = decode_section(bytes, pos, SECTION_SKELETONS)?;
+    let (skeletons, pos) = decode_section(bytes, pos, SECTION_BODIES)?;
+    let (bodies, pos) = decode_section(bytes, pos, SECTION_FOOTER)?;
+    let (footer, used) = Cbor::decode_prefix(&bytes[pos..])?;
+    let consumed = pos + used;
+    if consumed != bytes.len() {
+        return Err(UcError::internal("view: trailing bytes"));
+    }
+    Ok(DecodedView {
+        header,
+        handles,
+        skeletons,
+        bodies,
+        footer,
+    })
 }
 
 /// Tier byte budgets. L0's budget is expressed in tokens (≤500) which at
@@ -95,14 +152,13 @@ pub fn render_view(
             ("items", Cbor::U64(handles.len() as u64)),
             ("truncated", Cbor::Bool(truncated)),
         ]);
-        Cbor::Array(vec![
-            header.clone(),
-            Cbor::Array(handles.to_vec()),
-            Cbor::Array(skeletons.to_vec()),
-            Cbor::Array(bodies.to_vec()),
-            footer,
-        ])
-        .encode()
+        let mut out = header.clone().encode();
+        append_section(&mut out, SECTION_HANDLES, handles);
+        append_section(&mut out, SECTION_SKELETONS, skeletons);
+        append_section(&mut out, SECTION_BODIES, bodies);
+        out.extend_from_slice(&Cbor::U64(SECTION_FOOTER).encode());
+        out.extend_from_slice(&footer.encode());
+        out
     };
 
     for item in items {
@@ -201,7 +257,7 @@ mod tests {
         let r5 = render_view("fact_subject", "default", 1, &params, &five, Tier::L3);
         let r7 = render_view("fact_subject", "default", 1, &params, &seven, Tier::L3);
         // Growth must not disturb the header segment bytes: the header is
-        // the first array element and identical for both renders.
+        // first and identical for both renders.
         let header_len = {
             let header = Cbor::map(vec![
                 ("view_id", Cbor::t("fact_subject")),
@@ -213,13 +269,12 @@ mod tests {
             .encode();
             header.len()
         };
-        // Skip the outer array tag (1 byte for a 5-element array).
-        assert_eq!(&r5.bytes[1..1 + header_len], &r7.bytes[1..1 + header_len]);
+        assert_eq!(&r5.bytes[..header_len], &r7.bytes[..header_len]);
         // And the shared handles prefix is byte-identical.
-        let shared = 40; // comfortably within the first items
+        let shared = Cbor::U64(SECTION_HANDLES).encode().len() + 40;
         assert_eq!(
-            &r5.bytes[1 + header_len..1 + header_len + shared],
-            &r7.bytes[1 + header_len..1 + header_len + shared]
+            &r5.bytes[header_len..header_len + shared],
+            &r7.bytes[header_len..header_len + shared]
         );
     }
 
@@ -260,16 +315,26 @@ mod tests {
         let params = Cbor::Null;
         let it = items(1, 5000);
         let l2 = render_view("v", "ns", 1, &params, &it, Tier::L2);
-        let decoded = Cbor::decode(&l2.bytes).unwrap();
-        let bodies = decoded.as_array().unwrap()[3].as_array().unwrap();
-        let body = bodies[0].req_str("body").unwrap();
+        let decoded = decode_view(&l2.bytes).unwrap();
+        let body = decoded.bodies[0].req_str("body").unwrap();
         assert!(body.len() < 600);
         assert!(body.ends_with('…'));
         // L3 keeps it whole.
         let l3 = render_view("v", "ns", 1, &params, &it, Tier::L3);
-        let decoded = Cbor::decode(&l3.bytes).unwrap();
-        let bodies = decoded.as_array().unwrap()[3].as_array().unwrap();
-        assert_eq!(bodies[0].req_str("body").unwrap().len(), 5000);
+        let decoded = decode_view(&l3.bytes).unwrap();
+        assert_eq!(decoded.bodies[0].req_str("body").unwrap().len(), 5000);
+    }
+
+    #[test]
+    fn stream_sections_decode_in_order() {
+        let params = Cbor::map(vec![("subject", Cbor::t("svc"))]);
+        let rendered = render_view("fact_subject", "default", 1, &params, &items(2, 12), Tier::L3);
+        let decoded = decode_view(&rendered.bytes).unwrap();
+        assert_eq!(decoded.header.req_str("view_id").unwrap(), "fact_subject");
+        assert_eq!(decoded.handles.len(), 2);
+        assert_eq!(decoded.skeletons.len(), 2);
+        assert_eq!(decoded.bodies.len(), 2);
+        assert_eq!(decoded.footer.req_u64("items").unwrap(), 2);
     }
 
     #[test]

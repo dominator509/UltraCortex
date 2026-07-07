@@ -288,6 +288,86 @@ mod tests {
     }
 
     #[test]
+    fn fixed_chain_order_short_circuits_before_later_steps() {
+        let assert_counters = |m: &Metrics, expected: (u64, u64, u64, u64, u64)| {
+            assert_eq!(m.counter("trinity.contract.checked"), expected.0);
+            assert_eq!(m.counter("trinity.spec_anchor.checked"), expected.1);
+            assert_eq!(m.counter("trinity.decision.checked"), expected.2);
+            assert_eq!(m.counter("trinity.budget.checked"), expected.3);
+            assert_eq!(m.counter("trinity.congruence.checked"), expected.4);
+        };
+
+        let mut t = fresh();
+        let m = Metrics::new();
+        let bad_contract = Cbor::map(vec![("subject", Cbor::t("only"))]);
+        let _ = run_pre_validation(
+            &mut t,
+            &m,
+            &ctx(&bad_contract, Some(AnchorRef::new("Architecture.md", "4"))),
+        )
+        .unwrap_err();
+        assert_counters(&m, (1, 0, 0, 0, 0));
+
+        let mut t = fresh();
+        let m = Metrics::new();
+        let good_payload = Cbor::map(vec![
+            ("subject", Cbor::t("s")),
+            ("predicate", Cbor::t("p")),
+            ("object", Cbor::t("o")),
+        ]);
+        let _ = run_pre_validation(&mut t, &m, &ctx(&good_payload, None)).unwrap_err();
+        assert_counters(&m, (1, 1, 0, 0, 0));
+
+        let mut t = fresh();
+        t.decision_ledger.append(
+            1,
+            9,
+            "governance",
+            "writes in governance scope require a decision reference",
+            "operator",
+            "Architecture.md§4",
+        );
+        let m = Metrics::new();
+        let decision_blocked = Cbor::map(vec![
+            ("subject", Cbor::t("s")),
+            ("predicate", Cbor::t("p")),
+            ("object", Cbor::t("o")),
+            ("decision_scope", Cbor::t("governance")),
+        ]);
+        let _ = run_pre_validation(
+            &mut t,
+            &m,
+            &ctx(&decision_blocked, Some(AnchorRef::new("Architecture.md", "4"))),
+        )
+        .unwrap_err();
+        assert_counters(&m, (1, 1, 1, 0, 0));
+
+        let mut t = fresh();
+        t.work_budget.ensure("task-B", Some(5));
+        let m = Metrics::new();
+        let mut c = ctx(&good_payload, Some(AnchorRef::new("Architecture.md", "4")));
+        c.task_id = "task-B".into();
+        c.estimate = 10;
+        let _ = run_pre_validation(&mut t, &m, &c).unwrap_err();
+        assert_counters(&m, (1, 1, 1, 1, 0));
+
+        let mut t = fresh();
+        let m = Metrics::new();
+        let drifty = Cbor::map(vec![
+            ("subject", Cbor::t("s")),
+            ("predicate", Cbor::t("p")),
+            ("object", Cbor::t("adopt the TelepathyCell")),
+        ]);
+        let _ = run_pre_validation(
+            &mut t,
+            &m,
+            &ctx(&drifty, Some(AnchorRef::new("Architecture.md", "4"))),
+        )
+        .unwrap_err();
+        assert_counters(&m, (1, 1, 1, 1, 1));
+    }
+
+    #[test]
     fn quarantined_payload_is_reinjectable() {
         let mut t = fresh();
         let m = Metrics::new();

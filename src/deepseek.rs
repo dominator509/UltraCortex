@@ -18,6 +18,38 @@ pub fn fim_wrap(prefix: &str, suffix: &str) -> String {
     format!("<|fim_begin|>{prefix}<|fim_hole|>{suffix}<|fim_end|>")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeepSeekClientKind {
+    Coder,
+    V3,
+    R1,
+    Other,
+}
+
+impl DeepSeekClientKind {
+    pub fn parse(s: &str) -> DeepSeekClientKind {
+        match s {
+            "deepseek-coder" => DeepSeekClientKind::Coder,
+            "deepseek-v3" => DeepSeekClientKind::V3,
+            "deepseek-r1" => DeepSeekClientKind::R1,
+            _ => DeepSeekClientKind::Other,
+        }
+    }
+}
+
+/// Variant-aware edit framing. DeepSeek-Coder gets real FIM tags; current
+/// non-Coder variants downgrade to a plain prefix+suffix splice so callers
+/// never accidentally ship coder-only tokens to models that do not support
+/// them.
+pub fn frame_edit_prompt(kind: DeepSeekClientKind, prefix: &str, suffix: &str) -> String {
+    match kind {
+        DeepSeekClientKind::Coder => fim_wrap(prefix, suffix),
+        DeepSeekClientKind::V3 | DeepSeekClientKind::R1 | DeepSeekClientKind::Other => {
+            format!("{prefix}{suffix}")
+        }
+    }
+}
+
 /// Remove `<think>…</think>` blocks. Returns (stripped_answer, reasoning).
 /// Unclosed blocks strip to end-of-text (defensive: truncated generations).
 pub fn r1_strip(text: &str) -> (String, String) {
@@ -111,6 +143,22 @@ mod tests {
         assert_eq!(
             fim_wrap("fn a() {", "}"),
             "<|fim_begin|>fn a() {<|fim_hole|>}<|fim_end|>"
+        );
+    }
+
+    #[test]
+    fn variant_fim_framing() {
+        assert_eq!(
+            frame_edit_prompt(DeepSeekClientKind::Coder, "fn a() {", "}"),
+            "<|fim_begin|>fn a() {<|fim_hole|>}<|fim_end|>"
+        );
+        assert_eq!(
+            frame_edit_prompt(DeepSeekClientKind::V3, "fn a() {", "}"),
+            "fn a() {}"
+        );
+        assert_eq!(
+            frame_edit_prompt(DeepSeekClientKind::R1, "fn a() {", "}"),
+            "fn a() {}"
         );
     }
 

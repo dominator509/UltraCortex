@@ -14,7 +14,8 @@
 //! - agreement < 92% → `curator.miscalibration` (the pair is thrashing).
 //!
 //! Every 256 records at encryption tier T2+, a batch HMAC signature over
-//! the record hashes is appended (tamper-evidence beyond the WAL CRCs).
+//! the record hashes is appended and persisted beside the dedicated WAL
+//! stream (tamper-evidence beyond the WAL CRCs).
 //!
 //! **The Adjudicator never reads this cell** — enforced structurally
 //! (adjudicator.rs takes no ledger reference) and by capability token
@@ -26,12 +27,16 @@ use crate::core::crypto::{hex, sha256};
 use crate::core::{CellId, SchemaId, UcError, UcResult};
 use crate::obs::Metrics;
 use crate::persist::wal::{WalFrame, WalOp, WalWriter, FLAG_CROSS_CHECK};
-use crate::persist::Kms;
+use crate::persist::{BatchSignature, Kms};
 use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 
 pub const AGREEMENT_WINDOW: usize = 200;
 pub const BATCH_SIGN_EVERY: u64 = 256;
+pub const PROBE_BOOST_ON_SUSPICIOUS: f64 = 10.0;
+pub const RETENTION_POLICY: &str = "indefinite";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CrossCheckKind {
@@ -151,6 +156,31 @@ pub enum AgreementHealth {
     InsufficientData,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchSignatureRecord {
+    pub last_seq: u64,
+    pub key_id: u64,
+    pub hmac_hex: String,
+}
+
+impl BatchSignatureRecord {
+    fn to_cbor(&self) -> Cbor {
+        Cbor::map(vec![
+            ("last_seq", Cbor::U64(self.last_seq)),
+            ("key_id", Cbor::U64(self.key_id)),
+            ("hmac", Cbor::t(self.hmac_hex.clone())),
+        ])
+    }
+
+    fn from_cbor(c: &Cbor) -> UcResult<BatchSignatureRecord> {
+        Ok(BatchSignatureRecord {
+            last_seq: c.opt_u64("last_seq").unwrap_or(0),
+            key_id: c.opt_u64("key_id").unwrap_or(0),
+            hmac_hex: c.opt_str("hmac").unwrap_or_default(),
+        })
+    }
+}
+
 pub struct CrossCheckLedgerCell {
     pub id: CellId,
     records: Vec<CrossCheckRecord>,
@@ -165,7 +195,7 @@ pub struct CrossCheckLedgerCell {
     wal: Option<Arc<WalWriter>>,
     kms: Option<Arc<Kms>>,
     batch_hashes: Vec<[u8; 32]>,
-    pub batch_signatures: Vec<(u64, String)>, // (last_seq, hmac hex)
+    pub batch_signatures: Vec<BatchSignatureRecord>,
 }
 
 impl CrossCheckLedgerCell {
@@ -239,9 +269,7 @@ impl CrossCheckLedgerCell {
                 .push_back(outcome == CrossCheckOutcome::Agree);
             // Health metrics on every audit append.
             match self.health() {
-                AgreementHealth::SuspiciousAgreement => {
-                    metrics.inc("curator.suspicious_agreement")
-                }
+                AgreementHealth::SuspiciousAgreement => metrics.inc("curator.suspicious_agreement"),
                 AgreementHealth::Miscalibration => metrics.inc("curator.miscalibration"),
                 _ => {}
             }
@@ -250,7 +278,7 @@ impl CrossCheckLedgerCell {
 
         // Batch signature every 256 records at T2+ (§7).
         if self.next_seq % BATCH_SIGN_EVERY == BATCH_SIGN_EVERY - 1 {
-            self.sign_batch();
+            self.sign_batch()?;
         }
 
         self.records.push(rec);
@@ -258,10 +286,89 @@ impl CrossCheckLedgerCell {
         Ok(self.next_seq - 1)
     }
 
-    fn sign_batch(&mut self) {
+    fn signatures_path(&self) -> Option<std::path::PathBuf> {
+        self.wal
+            .as_ref()
+            .map(|wal| wal.dir().join("batch-signatures.cbor"))
+    }
+
+    fn persist_signature_state(&self) -> UcResult<()> {
+        let Some(path) = self.signatures_path() else {
+            return Ok(());
+        };
+        let bytes = Cbor::Array(
+            self.batch_signatures
+                .iter()
+                .map(BatchSignatureRecord::to_cbor)
+                .collect(),
+        )
+        .encode();
+        atomic_write_bytes(&path, &bytes)?;
+        Ok(())
+    }
+
+    pub fn reload_signature_state_from_sidecar(&mut self) -> UcResult<()> {
+        let Some(path) = self.signatures_path() else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Ok(());
+        }
+        let raw = std::fs::read(&path)?;
+        let parsed = Cbor::decode(&raw)?;
+        let mut sigs = Vec::new();
+        if let Some(items) = parsed.as_array() {
+            for item in items {
+                sigs.push(BatchSignatureRecord::from_cbor(item)?);
+            }
+        }
+        self.batch_signatures = sigs;
+        Ok(())
+    }
+
+    pub fn verify_batch_signatures(&self) -> UcResult<(u64, bool)> {
+        let expected_batches = (self.records.len() / BATCH_SIGN_EVERY as usize) as u64;
+        if expected_batches == 0 {
+            return Ok((0, true));
+        }
+        let Some(kms) = &self.kms else {
+            return Ok((0, false));
+        };
+        if self.batch_signatures.len() != expected_batches as usize {
+            return Ok((0, false));
+        }
+        let mut verified = 0u64;
+        for (batch_idx, sig) in self.batch_signatures.iter().enumerate() {
+            let start = batch_idx * BATCH_SIGN_EVERY as usize;
+            let end = start + BATCH_SIGN_EVERY as usize;
+            let expected_last_seq = end as u64 - 1;
+            if sig.last_seq != expected_last_seq {
+                return Ok((verified, false));
+            }
+            let mut concat = Vec::with_capacity(BATCH_SIGN_EVERY as usize * 32);
+            for rec in &self.records[start..end] {
+                concat.extend_from_slice(&sha256(&rec.to_cbor().encode()));
+            }
+            let digest = sha256(&concat);
+            let mac = parse_hex_32(&sig.hmac_hex)?;
+            if !kms.verify_batch_signature(
+                &BatchSignature {
+                    key_id: sig.key_id,
+                    mac,
+                },
+                &digest,
+            ) {
+                return Ok((verified, false));
+            }
+            verified += 1;
+        }
+        Ok((verified, true))
+    }
+
+    fn sign_batch(&mut self) -> UcResult<()> {
         let Some(kms) = &self.kms else {
             self.batch_hashes.clear();
-            return;
+            return Ok(());
         };
         let mut concat = Vec::with_capacity(self.batch_hashes.len() * 32);
         for h in &self.batch_hashes {
@@ -269,9 +376,15 @@ impl CrossCheckLedgerCell {
         }
         let digest = sha256(&concat);
         if let Some(sig) = kms.batch_sign(&digest) {
-            self.batch_signatures.push((self.next_seq, hex(&sig)));
+            self.batch_signatures.push(BatchSignatureRecord {
+                last_seq: self.next_seq,
+                key_id: sig.key_id,
+                hmac_hex: hex(&sig.mac),
+            });
+            self.persist_signature_state()?;
         }
         self.batch_hashes.clear();
+        Ok(())
     }
 
     /// Rolling-window Warden-audit agreement rate; `None` until 20 samples.
@@ -295,7 +408,7 @@ impl CrossCheckLedgerCell {
     /// Probe-rate boost multiplier when collusion is suspected (§6.3).
     pub fn probe_boost(&self) -> f64 {
         match self.health() {
-            AgreementHealth::SuspiciousAgreement => 10.0,
+            AgreementHealth::SuspiciousAgreement => PROBE_BOOST_ON_SUSPICIOUS,
             _ => 1.0,
         }
     }
@@ -303,6 +416,10 @@ impl CrossCheckLedgerCell {
     pub fn tail(&self, n: usize) -> Vec<&CrossCheckRecord> {
         let start = self.records.len().saturating_sub(n);
         self.records[start..].iter().collect()
+    }
+
+    pub fn retention_policy(&self) -> &'static str {
+        RETENTION_POLICY
     }
 
     pub fn len(&self) -> usize {
@@ -365,12 +482,7 @@ impl CellBehavior for CrossCheckLedgerCell {
         let sigs: Vec<Cbor> = self
             .batch_signatures
             .iter()
-            .map(|(seq, sig)| {
-                Cbor::map(vec![
-                    ("last_seq", Cbor::U64(*seq)),
-                    ("hmac", Cbor::t(sig.clone())),
-                ])
-            })
+            .map(BatchSignatureRecord::to_cbor)
             .collect();
         Cbor::map(vec![
             ("records", Cbor::Array(items)),
@@ -406,26 +518,67 @@ impl CellBehavior for CrossCheckLedgerCell {
         }
         if let Some(arr) = state.get("batch_signatures").and_then(|v| v.as_array()) {
             for item in arr {
-                self.batch_signatures.push((
-                    item.opt_u64("last_seq").unwrap_or(0),
-                    item.opt_str("hmac").unwrap_or_default(),
-                ));
+                self.batch_signatures.push(BatchSignatureRecord::from_cbor(item)?);
             }
         }
         Ok(())
     }
 }
 
+fn parse_hex_32(s: &str) -> UcResult<[u8; 32]> {
+    if s.len() != 64 {
+        return Err(UcError::schema("cross_check signature hex must be 64 chars"));
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        let hi = u8::from_str_radix(&s[i * 2..i * 2 + 1], 16)
+            .map_err(|_| UcError::schema("cross_check signature hex invalid"))?;
+        let lo = u8::from_str_radix(&s[i * 2 + 1..i * 2 + 2], 16)
+            .map_err(|_| UcError::schema("cross_check signature hex invalid"))?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> UcResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| UcError::internal("cross_check signatures path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persist::wal::WalWriter;
+    use crate::persist::EncryptionTier;
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
-    fn append_audit(
-        ledger: &mut CrossCheckLedgerCell,
-        m: &Metrics,
-        at: u64,
-        agree: bool,
-    ) {
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "uc-cross-check-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn append_audit(ledger: &mut CrossCheckLedgerCell, m: &Metrics, at: u64, agree: bool) {
         ledger
             .append(
                 m,
@@ -495,11 +648,43 @@ mod tests {
         for i in 0..50 {
             append_audit(&mut ledger, &m, i, i % 10 != 0);
         }
+        assert_eq!(ledger.retention_policy(), RETENTION_POLICY);
         let snap = ledger.snapshot_state();
         let mut ledger2 = CrossCheckLedgerCell::new(CellId(33));
         ledger2.restore_state(&snap).unwrap();
         assert_eq!(ledger2.len(), 50);
+        assert_eq!(ledger2.retention_policy(), RETENTION_POLICY);
         assert_eq!(ledger.agreement_rate(), ledger2.agreement_rate());
         assert_eq!(snap.encode(), ledger2.snapshot_state().encode());
+    }
+
+    #[test]
+    fn batch_signatures_persist_and_verify_across_restore() {
+        let dir = tmpdir("signatures");
+        let wal = WalWriter::open(&dir.join("wal")).unwrap();
+        let kms = Arc::new(Kms::open(&dir, EncryptionTier::T3).unwrap());
+        let mut ledger = CrossCheckLedgerCell::new(CellId(33));
+        ledger.attach_persistence(wal.clone(), kms.clone());
+        let m = Metrics::new();
+        for i in 0..BATCH_SIGN_EVERY {
+            append_audit(&mut ledger, &m, i, true);
+        }
+        let (verified, ok) = ledger.verify_batch_signatures().unwrap();
+        assert_eq!(verified, 1);
+        assert!(ok);
+        assert_eq!(ledger.batch_signatures.len(), 1);
+
+        let snap = ledger.snapshot_state();
+        let mut restored = CrossCheckLedgerCell::new(CellId(33));
+        restored.attach_persistence(wal.clone(), kms);
+        restored.restore_state(&snap).unwrap();
+        restored.reload_signature_state_from_sidecar().unwrap();
+        let (verified_restored, ok_restored) = restored.verify_batch_signatures().unwrap();
+        assert_eq!(verified_restored, 1);
+        assert!(ok_restored);
+        assert_eq!(restored.batch_signatures[0].last_seq, BATCH_SIGN_EVERY - 1);
+
+        wal.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

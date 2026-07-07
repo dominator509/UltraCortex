@@ -80,7 +80,7 @@ $ ultracortex congruence audit     # check the 13 docs in sync
 
 ## Status
 
-v1.0 specification complete. Implementation roadmap in Roadmap.md. Phase 1G is the final phase — Curator Pair + Adjudication acceptance gate.
+v1.0 specification complete. The current checkout now compiles and passes `cargo test` locally, but it is not gap-complete: the audited open/closed register lives in `HANDOFF.md`, and Phase 1G remains the final Curator Pair + Adjudication acceptance gate.
 
 ## License
 

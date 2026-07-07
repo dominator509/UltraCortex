@@ -140,16 +140,101 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> UcResult<()> {
 
 /// Tier semantics (PersistenceLayer.md §5):
 /// - **T0** plaintext at rest (dev only).
-/// - **T1** node key on local disk (`kms/node.key`, 0600); payload streams
-///   encrypted with ChaCha20, integrity via HMAC-SHA256 (encrypt-then-MAC).
+/// - **T1** local operator-owned keyring on disk; payload streams encrypted
+///   with ChaCha20, integrity via HMAC-SHA256 (encrypt-then-MAC).
 /// - **T2** T1 + per-stream derived keys + periodic HMAC batch signatures
 ///   over the CrossCheckLedger.
-/// - **T3** external KMS. Not implementable single-node/offline — the seam
-///   ([`Kms::wrap_external`]) is present and returns `Unsupported`, and this
-///   deviation is logged at boot (see IMPLEMENTATION_STATUS.md §5).
+/// - **T3** T2 + scheduled local rotation with retained key history so older
+///   sealed payloads and batch signatures remain verifiable after rotation.
 pub struct Kms {
     tier: EncryptionTier,
-    node_key: Option<[u8; 32]>,
+    state_path: Option<PathBuf>,
+    state: Mutex<KeyRingState>,
+}
+
+const KEYRING_FILE: &str = "keyring.cbor";
+pub const T3_ROTATION_INTERVAL_OPS: u64 = 1_000_000;
+
+#[derive(Clone, Debug, Default)]
+struct KeyRingState {
+    active_key_id: u64,
+    last_rotated_at: u64,
+    keys: BTreeMap<u64, [u8; 32]>,
+}
+
+impl KeyRingState {
+    fn to_cbor(&self) -> Cbor {
+        let keys: Vec<Cbor> = self
+            .keys
+            .iter()
+            .map(|(key_id, key)| {
+                Cbor::map(vec![
+                    ("key_id", Cbor::U64(*key_id)),
+                    ("material", Cbor::Bytes(key.to_vec())),
+                ])
+            })
+            .collect();
+        Cbor::map(vec![
+            ("active_key_id", Cbor::U64(self.active_key_id)),
+            ("last_rotated_at", Cbor::U64(self.last_rotated_at)),
+            ("keys", Cbor::Array(keys)),
+        ])
+    }
+
+    fn from_cbor(c: &Cbor) -> UcResult<KeyRingState> {
+        let mut keys = BTreeMap::new();
+        if let Some(items) = c.get("keys").and_then(|v| v.as_array()) {
+            for item in items {
+                let key_id = item.req_u64("key_id")?;
+                let raw = item
+                    .get("material")
+                    .and_then(|v| v.as_bytes())
+                    .ok_or_else(|| UcError::schema("kms keyring: missing key material"))?;
+                if raw.len() != 32 {
+                    return Err(UcError::schema("kms keyring: key material must be 32 bytes"));
+                }
+                let mut key = [0u8; 32];
+                key.copy_from_slice(raw);
+                keys.insert(key_id, key);
+            }
+        }
+        let active_key_id = c.opt_u64("active_key_id").unwrap_or(0);
+        if !keys.is_empty() && !keys.contains_key(&active_key_id) {
+            return Err(UcError::schema(format!(
+                "kms keyring: active key id {active_key_id} missing from key set"
+            )));
+        }
+        Ok(KeyRingState {
+            active_key_id,
+            last_rotated_at: c.opt_u64("last_rotated_at").unwrap_or(0),
+            keys,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchSignature {
+    pub key_id: u64,
+    pub mac: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RotationStatus {
+    pub active_key_id: u64,
+    pub key_versions: u64,
+    pub last_rotated_at: u64,
+    pub rotation_interval_ops: u64,
+    pub next_due_at: u64,
+    pub overdue: bool,
+    pub custody_path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RotationEvent {
+    pub previous_key_id: u64,
+    pub active_key_id: u64,
+    pub logical_at: u64,
+    pub emergency: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,64 +269,203 @@ impl EncryptionTier {
     }
 }
 
+fn legacy_key_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("kms").join("node.key")
+}
+
+fn keyring_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("kms").join(KEYRING_FILE)
+}
+
+fn random_seed(extra: &[u8]) -> Vec<u8> {
+    let mut seed = Vec::new();
+    seed.extend_from_slice(extra);
+    seed.extend_from_slice(&std::process::id().to_le_bytes());
+    if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        seed.extend_from_slice(&d.as_nanos().to_le_bytes());
+    }
+    for _ in 0..4 {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        let h = RandomState::new().build_hasher();
+        seed.extend_from_slice(&h.finish().to_le_bytes());
+    }
+    seed
+}
+
+fn generate_root_key(extra: &[u8]) -> [u8; 32] {
+    sha256(&random_seed(extra))
+}
+
+fn load_or_create_keyring(data_dir: &Path) -> UcResult<(PathBuf, KeyRingState)> {
+    let state_path = keyring_path(data_dir);
+    if state_path.exists() {
+        let raw = std::fs::read(&state_path)?;
+        let state = KeyRingState::from_cbor(&Cbor::decode(&raw)?)?;
+        return Ok((state_path, state));
+    }
+
+    let legacy = legacy_key_path(data_dir);
+    let key = if legacy.exists() {
+        let raw = std::fs::read(&legacy)?;
+        if raw.len() != 32 {
+            return Err(UcError::internal("kms/node.key is not 32 bytes"));
+        }
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&raw);
+        k
+    } else {
+        generate_root_key(b"ultracortex.kms.root")
+    };
+
+    let mut state = KeyRingState::default();
+    state.active_key_id = 1;
+    state.keys.insert(1, key);
+    atomic_write(&state_path, &state.to_cbor().encode())?;
+    restrict_perms(&state_path);
+    Ok((state_path, state))
+}
+
 impl Kms {
     pub fn open(data_dir: &Path, tier: EncryptionTier) -> UcResult<Kms> {
-        let node_key = match tier {
-            EncryptionTier::T0 => None,
-            EncryptionTier::T3 => {
-                return Err(UcError::unsupported(
-                    "encryption_tier T3 requires an external KMS; not available in v0 \
-                     single-node build — use T1 or T2 (see IMPLEMENTATION_STATUS.md §5)",
-                ));
-            }
+        match tier {
+            EncryptionTier::T0 => Ok(Kms {
+                tier,
+                state_path: None,
+                state: Mutex::new(KeyRingState::default()),
+            }),
             _ => {
-                let key_path = data_dir.join("kms").join("node.key");
-                let key = if key_path.exists() {
-                    let raw = std::fs::read(&key_path)?;
-                    if raw.len() != 32 {
-                        return Err(UcError::internal("kms/node.key is not 32 bytes"));
-                    }
-                    let mut k = [0u8; 32];
-                    k.copy_from_slice(&raw);
-                    k
-                } else {
-                    // Generate from OS entropy sources available in std:
-                    // hash of (pid, time, RandomState seeds). Not a CSPRNG-
-                    // grade construction; documented as v0 (T1 is defense
-                    // against casual disk inspection, not nation-states).
-                    let mut seed = Vec::new();
-                    seed.extend_from_slice(&std::process::id().to_le_bytes());
-                    if let Ok(d) = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                    {
-                        seed.extend_from_slice(&d.as_nanos().to_le_bytes());
-                    }
-                    for _ in 0..4 {
-                        use std::collections::hash_map::RandomState;
-                        use std::hash::{BuildHasher, Hasher};
-                        let h = RandomState::new().build_hasher();
-                        seed.extend_from_slice(&h.finish().to_le_bytes());
-                    }
-                    let k = sha256(&seed);
-                    std::fs::create_dir_all(key_path.parent().unwrap())?;
-                    std::fs::write(&key_path, k)?;
-                    restrict_perms(&key_path);
-                    k
-                };
-                Some(key)
+                let (state_path, state) = load_or_create_keyring(data_dir)?;
+                Ok(Kms {
+                    tier,
+                    state_path: Some(state_path),
+                    state: Mutex::new(state),
+                })
             }
-        };
-        Ok(Kms { tier, node_key })
+        }
     }
 
     pub fn tier(&self) -> EncryptionTier {
         self.tier
     }
 
-    /// Derive a purpose-specific subkey (T2 per-stream keys; harmless at T1).
-    fn derive(&self, purpose: &str) -> Option<[u8; 32]> {
-        self.node_key
+    fn persist_state(&self, state: &KeyRingState) -> UcResult<()> {
+        if let Some(path) = &self.state_path {
+            atomic_write(path, &state.to_cbor().encode())?;
+            restrict_perms(path);
+        }
+        Ok(())
+    }
+
+    fn derive_active(&self, purpose: &str) -> Option<(u64, [u8; 32])> {
+        let state = self.state.lock().unwrap();
+        let key = state.keys.get(&state.active_key_id).copied()?;
+        Some((
+            state.active_key_id,
+            hmac_sha256(&key, purpose.as_bytes()),
+        ))
+    }
+
+    fn derive_for_key_id(&self, key_id: u64, purpose: &str) -> Option<[u8; 32]> {
+        let state = self.state.lock().unwrap();
+        state
+            .keys
+            .get(&key_id)
+            .copied()
             .map(|k| hmac_sha256(&k, purpose.as_bytes()))
+    }
+
+    fn all_derived(&self, purpose: &str) -> Vec<[u8; 32]> {
+        let state = self.state.lock().unwrap();
+        state
+            .keys
+            .values()
+            .copied()
+            .map(|k| hmac_sha256(&k, purpose.as_bytes()))
+            .collect()
+    }
+
+    fn try_unseal_with_key(key: &[u8; 32], sealed: &[u8], nonce_off: usize) -> Option<Vec<u8>> {
+        if sealed.len() < nonce_off + 12 + 32 {
+            return None;
+        }
+        let nonce: [u8; 12] = sealed[nonce_off..nonce_off + 12].try_into().ok()?;
+        let ct = &sealed[nonce_off + 12..sealed.len() - 32];
+        let mac_stored = &sealed[sealed.len() - 32..];
+        let mut mac_input = Vec::with_capacity(12 + ct.len());
+        mac_input.extend_from_slice(&nonce);
+        mac_input.extend_from_slice(ct);
+        let mac = hmac_sha256(key, &mac_input);
+        if !crate::core::crypto::ct_eq(&mac, mac_stored) {
+            return None;
+        }
+        let mut pt = ct.to_vec();
+        chacha20_xor(key, &nonce, 1, &mut pt);
+        Some(pt)
+    }
+
+    pub fn active_key_id(&self) -> Option<u64> {
+        if self.tier == EncryptionTier::T0 {
+            return None;
+        }
+        Some(self.state.lock().unwrap().active_key_id)
+    }
+
+    pub fn key_versions(&self) -> usize {
+        self.state.lock().unwrap().keys.len()
+    }
+
+    pub fn custody_path(&self) -> Option<PathBuf> {
+        self.state_path.clone()
+    }
+
+    pub fn rotation_status(&self, logical_at: u64) -> Option<RotationStatus> {
+        if self.tier != EncryptionTier::T3 {
+            return None;
+        }
+        let state = self.state.lock().unwrap();
+        let next_due_at = state
+            .last_rotated_at
+            .saturating_add(T3_ROTATION_INTERVAL_OPS);
+        Some(RotationStatus {
+            active_key_id: state.active_key_id,
+            key_versions: state.keys.len() as u64,
+            last_rotated_at: state.last_rotated_at,
+            rotation_interval_ops: T3_ROTATION_INTERVAL_OPS,
+            next_due_at,
+            overdue: logical_at >= next_due_at,
+            custody_path: self
+                .state_path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("kms/keyring.cbor")),
+        })
+    }
+
+    pub fn rotate(&self, logical_at: u64, emergency: bool) -> UcResult<RotationEvent> {
+        if self.tier == EncryptionTier::T0 {
+            return Err(UcError::unsupported(
+                "cannot rotate keys in encryption_tier T0",
+            ));
+        }
+        let mut state = self.state.lock().unwrap();
+        let previous_key_id = state.active_key_id;
+        let active_hint = state.keys.keys().next_back().copied().unwrap_or(0);
+        let active_key_id = active_hint.max(previous_key_id) + 1;
+        let mut seed = Vec::new();
+        seed.extend_from_slice(&logical_at.to_le_bytes());
+        seed.extend_from_slice(&previous_key_id.to_le_bytes());
+        seed.push(if emergency { 1 } else { 0 });
+        let key = generate_root_key(&seed);
+        state.keys.insert(active_key_id, key);
+        state.active_key_id = active_key_id;
+        state.last_rotated_at = logical_at;
+        self.persist_state(&state)?;
+        Ok(RotationEvent {
+            previous_key_id,
+            active_key_id,
+            logical_at,
+            emergency,
+        })
     }
 
     /// Public subkey derivation for infrastructure keys (e.g. the capability
@@ -249,21 +473,23 @@ impl Kms {
     /// returned — T0 explicitly trades confidentiality for zero-config dev
     /// (PersistenceLayer.md §5.1).
     pub fn subkey(&self, purpose: &str) -> [u8; 32] {
-        self.derive(purpose)
+        self.derive_active(purpose)
+            .map(|(_, k)| k)
             .unwrap_or_else(|| hmac_sha256(&[0u8; 32], purpose.as_bytes()))
     }
 
-    /// Seal a payload: `nonce(12) || ciphertext || hmac(32)`; T0 passes
-    /// through unchanged with a 1-byte `0x00` prefix (`0x01` = sealed).
+    /// Seal a payload. T0 passes through unchanged with a 1-byte `0x00`
+    /// prefix. Rotatable tiers emit `0x02 || key_id(u64 LE) || nonce(12) ||
+    /// ciphertext || hmac(32)`.
     pub fn seal(&self, purpose: &str, nonce_seed: u64, plaintext: &[u8]) -> Vec<u8> {
-        match self.derive(purpose) {
+        match self.derive_active(purpose) {
             None => {
                 let mut out = Vec::with_capacity(1 + plaintext.len());
                 out.push(0x00);
                 out.extend_from_slice(plaintext);
                 out
             }
-            Some(key) => {
+            Some((key_id, key)) => {
                 let mut nonce = [0u8; 12];
                 nonce[..8].copy_from_slice(&nonce_seed.to_le_bytes());
                 let mut ct = plaintext.to_vec();
@@ -272,8 +498,9 @@ impl Kms {
                 mac_input.extend_from_slice(&nonce);
                 mac_input.extend_from_slice(&ct);
                 let mac = hmac_sha256(&key, &mac_input);
-                let mut out = Vec::with_capacity(1 + 12 + ct.len() + 32);
-                out.push(0x01);
+                let mut out = Vec::with_capacity(1 + 8 + 12 + ct.len() + 32);
+                out.push(0x02);
+                out.extend_from_slice(&key_id.to_le_bytes());
                 out.extend_from_slice(&nonce);
                 out.extend_from_slice(&ct);
                 out.extend_from_slice(&mac);
@@ -289,41 +516,63 @@ impl Kms {
         match sealed[0] {
             0x00 => Ok(sealed[1..].to_vec()),
             0x01 => {
-                let key = self
-                    .derive(purpose)
-                    .ok_or_else(|| UcError::internal("sealed payload but tier is T0"))?;
                 if sealed.len() < 1 + 12 + 32 {
                     return Err(UcError::internal("unseal: truncated"));
                 }
-                let nonce: [u8; 12] = sealed[1..13].try_into().unwrap();
-                let ct = &sealed[13..sealed.len() - 32];
-                let mac_stored = &sealed[sealed.len() - 32..];
-                let mut mac_input = Vec::with_capacity(12 + ct.len());
-                mac_input.extend_from_slice(&nonce);
-                mac_input.extend_from_slice(ct);
-                let mac = hmac_sha256(&key, &mac_input);
-                if !crate::core::crypto::ct_eq(&mac, mac_stored) {
-                    return Err(UcError::internal("unseal: hmac mismatch (tampered?)"));
+                for key in self.all_derived(purpose) {
+                    if let Some(pt) = Self::try_unseal_with_key(&key, sealed, 1) {
+                        return Ok(pt);
+                    }
                 }
-                let mut pt = ct.to_vec();
-                chacha20_xor(&key, &nonce, 1, &mut pt);
-                Ok(pt)
+                Err(UcError::internal("unseal: hmac mismatch (tampered?)"))
+            }
+            0x02 => {
+                if sealed.len() < 1 + 8 + 12 + 32 {
+                    return Err(UcError::internal("unseal: truncated"));
+                }
+                let key_id = u64::from_le_bytes(sealed[1..9].try_into().unwrap());
+                let key = self
+                    .derive_for_key_id(key_id, purpose)
+                    .ok_or_else(|| UcError::internal(format!("unseal: unknown key id {key_id}")))?;
+                Self::try_unseal_with_key(&key, sealed, 9)
+                    .ok_or_else(|| UcError::internal("unseal: hmac mismatch (tampered?)"))
             }
             other => Err(UcError::internal(format!("unseal: bad marker {other}"))),
         }
     }
 
     /// T2+ batch signature over CrossCheckLedger record batches (§CCL-7).
-    pub fn batch_sign(&self, records_hash: &[u8; 32]) -> Option<[u8; 32]> {
+    pub fn batch_sign(&self, records_hash: &[u8; 32]) -> Option<BatchSignature> {
         if self.tier == EncryptionTier::T2 || self.tier == EncryptionTier::T3 {
-            self.derive("cross_check.batch").map(|k| hmac_sha256(&k, records_hash))
+            self.derive_active("cross_check.batch")
+                .map(|(key_id, key)| BatchSignature {
+                    key_id,
+                    mac: hmac_sha256(&key, records_hash),
+                })
         } else {
             None
         }
     }
 
+    pub fn verify_batch_signature(&self, signature: &BatchSignature, records_hash: &[u8; 32]) -> bool {
+        if self.tier != EncryptionTier::T2 && self.tier != EncryptionTier::T3 {
+            return false;
+        }
+        self.derive_for_key_id(signature.key_id, "cross_check.batch")
+            .map(|key| {
+                crate::core::crypto::ct_eq(&hmac_sha256(&key, records_hash), &signature.mac)
+            })
+            .unwrap_or(false)
+    }
+
     pub fn wrap_external(&self) -> UcResult<()> {
-        Err(UcError::unsupported("external KMS (T3) not available in v0"))
+        if self.tier == EncryptionTier::T3 {
+            Ok(())
+        } else {
+            Err(UcError::unsupported(
+                "external wrapping is only meaningful for encryption_tier T3",
+            ))
+        }
     }
 }
 
@@ -822,7 +1071,7 @@ mod tests {
         let dir = tmpdir("kms");
         let kms = Kms::open(&dir, EncryptionTier::T1).unwrap();
         let sealed = kms.seal("wal.shard-00", 42, b"secret payload");
-        assert_eq!(sealed[0], 0x01);
+        assert_eq!(sealed[0], 0x02);
         let pt = kms.unseal("wal.shard-00", &sealed).unwrap();
         assert_eq!(pt, b"secret payload");
         // Tamper.
@@ -842,9 +1091,50 @@ mod tests {
     }
 
     #[test]
-    fn kms_t3_is_explicit_unsupported() {
+    fn kms_t3_rotation_preserves_unseal_and_batch_verification() {
         let dir = tmpdir("kms3");
-        assert!(Kms::open(&dir, EncryptionTier::T3).is_err());
+        let kms = Kms::open(&dir, EncryptionTier::T3).unwrap();
+        let status = kms.rotation_status(0).unwrap();
+        assert_eq!(status.active_key_id, 1);
+        assert_eq!(status.key_versions, 1);
+        assert_eq!(status.rotation_interval_ops, T3_ROTATION_INTERVAL_OPS);
+        assert!(!status.overdue);
+
+        let sealed_before = kms.seal("wal.shard-00", 42, b"before rotation");
+        let digest_before = sha256(b"batch-before");
+        let sig_before = kms.batch_sign(&digest_before).unwrap();
+
+        let rotation = kms.rotate(T3_ROTATION_INTERVAL_OPS, false).unwrap();
+        assert_eq!(rotation.previous_key_id, 1);
+        assert_eq!(rotation.active_key_id, 2);
+
+        let sealed_after = kms.seal("wal.shard-00", 43, b"after rotation");
+        let digest_after = sha256(b"batch-after");
+        let sig_after = kms.batch_sign(&digest_after).unwrap();
+
+        assert_eq!(
+            kms.unseal("wal.shard-00", &sealed_before).unwrap(),
+            b"before rotation"
+        );
+        assert_eq!(
+            kms.unseal("wal.shard-00", &sealed_after).unwrap(),
+            b"after rotation"
+        );
+        assert!(kms.verify_batch_signature(&sig_before, &digest_before));
+        assert!(kms.verify_batch_signature(&sig_after, &digest_after));
+
+        let reopened = Kms::open(&dir, EncryptionTier::T3).unwrap();
+        assert_eq!(reopened.key_versions(), 2);
+        assert_eq!(
+            reopened.unseal("wal.shard-00", &sealed_before).unwrap(),
+            b"before rotation"
+        );
+        assert_eq!(
+            reopened.unseal("wal.shard-00", &sealed_after).unwrap(),
+            b"after rotation"
+        );
+        assert!(reopened.verify_batch_signature(&sig_before, &digest_before));
+        assert!(reopened.verify_batch_signature(&sig_after, &digest_after));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

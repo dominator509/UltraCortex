@@ -39,8 +39,9 @@ Four non-negotiable properties:
 ### §2.2 TCP
 
 - Default port: `7741`.
-- TLS via rustls; mutual TLS REQUIRED outside loopback. **[GAP-006]**.
-- ALPN string: `ultracortex/1`.
+- Plaintext TCP is supported only on loopback (`127.0.0.1` / `::1`) for local tooling.
+- Non-loopback listener addresses are rejected at config/load time and again before bind; this checkout does not expose LAN or multi-host TCP transport.
+- UDS remains the preferred transport. A future multi-host transport may add TLS/mTLS, but it is not part of the enforced v1.0 default.
 
 ### §2.3 Framing
 
@@ -164,11 +165,15 @@ struct ViewReq {
     view_id:    ViewId,
     params:     CanonicalCbor,
     tier:       Tier,
+    view_version: Option<Version>,
+    allow_migrate: bool,
     formatting: Formatting,     // Default | DeepSeekFim | DeepSeekR1
 }
 
 struct ViewResp {
     view_bytes:     Bytes,       // prefix-stable per RouterScheduler.md §9
+    view_version:   Version,
+    migrated_from:  Option<Version>,
     view_key:       ViewKey,
     cache_hit:      bool,
     tokens_emitted: u32,
@@ -176,6 +181,12 @@ struct ViewResp {
 ```
 
 **Primary delivery vehicle for context-as-view (P11). DeepSeek prefix-cache benefits accrue here.**
+
+Compatibility contract:
+- missing `view_version` means "serve the current version";
+- `view_version == current` serves normally;
+- `view_version < current` rejects with `ContractViolation` unless `allow_migrate = true`, in which case the server serves the current view bytes and sets `migrated_from`;
+- `view_version > current` always rejects with `ContractViolation`.
 
 ### §4.6 `supersede`
 
@@ -213,13 +224,15 @@ This is what allows DeepSeek's prefix cache to hit the entire shared prefix when
 
 ### §6.1 FIM framing (DeepSeek-Coder)
 
-When `capability.deepseek_coder = true` and `Formatting::DeepSeekFim`, view bodies for code-editing:
+When `Formatting::DeepSeekFim`, callers supply `prefix` / `suffix` in the request payload:
 
 ```
 <|fim_begin|>{prefix}<|fim_hole|>{suffix}<|fim_end|>
 ```
 
-`prefix`/`suffix` extracted at the SpecAnchor position. Hole position from agent's `edit_target_facet`. **[GAP-DS-002]** non-Coder variants.
+Supported variants:
+- `client_kind = "deepseek-coder"` → emit the real FIM tags above.
+- `client_kind = "deepseek-v3"` or `client_kind = "deepseek-r1"` → downgrade to a plain `prefix + suffix` splice with no coder-only tokens.
 
 ### §6.2 R1 `<think>` strip-and-replay
 
@@ -272,7 +285,7 @@ struct HelloAck {
 }
 ```
 
-Mismatches → negotiated downgrade or connection-level `ContractViolation`. **[GAP-NT-008]**.
+Mismatches → negotiated downgrade or connection-level `ContractViolation`. Contract migrations are now tracked through the ContractCell admin surface: `contract plan-migration`, `contract verify-migration`, and `contract apply-migration`.
 
 ---
 
@@ -352,11 +365,7 @@ In-process verification (≤ 2 μs p99). Revocation lazily replicated from `Agen
 
 | ID | Description |
 |----|-------------|
-| GAP-006    | MCP-over-tcp TLS termination defaults |
-| GAP-NT-008 | ContractCell migration tooling |
-| GAP-DS-002 | FIM framing for non-Coder DeepSeek variants |
 | GAP-DS-003 | R1 `<think>` canonical strip format |
-| GAP-DS-004 | View-schema versioning for prefix stability |
 
 ---
 

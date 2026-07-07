@@ -50,7 +50,7 @@ The hot path is **unaffected** by Curator Cells unless `flags.semantic_check=tru
 
 ## §5 Theoretical Sizing Math
 
-RAM ≈ Σ(cell stable regions) + PrefixCacheStore cap + HNSW indexes + **Curator weights (~3 GiB resident) + KV caches (~1 GiB)** + Trinity shard overhead.
+RAM ≈ Σ(cell stable regions) + PrefixCacheStore cap + HNSW indexes + **Curator weights (~3 GiB resident) + KV caches (`640 MiB` small / `1.0 GiB` reference / `2.0 GiB` heavy)** + Trinity shard overhead.
 
 Disk ≈ WAL retention + CAS blobs + snapshots + PrefixCacheStore + **CrossCheckLedger WAL stream + ~7 GB of model weights**.
 
@@ -59,8 +59,7 @@ Sustained throughput per shard ≥100k msg/s (unchanged from HyperCortex).
 ## §6 Open Sizing GAPs
 
 Inherited GAPs + NEW:
-- **GAP-CU-010** — per-Cell KV cache size budget → affects RAM at scale.
-- **GAP-CU-013** — Curator shard topology for small deployments (co-tenant on shard 0 vs dedicated).
+Small deployments now default Curator to dedicated shard placement; `co-tenant-shard-0` remains the supported override when operators explicitly trade isolation for footprint.
 - **GAP-CU-007** — Adjudicator LLM pool composition (3 vs 5 models) → affects RAM ceiling.
 
 ## §7 Quick Reference Card

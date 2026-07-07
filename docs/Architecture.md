@@ -215,6 +215,7 @@ Unchanged from HyperCortex v1.0.
 ### §22.3 Curator Pair (NEW)
 | ID | Description | Phase |
 |---|---|---|
+| _Note_ | _This table is the Phase 1G gap namespace catalog; live open/closed status is maintained in `docs/HANDOFF.md`._ | — |
 | GAP-CU-001 | Librarian default model | 1G |
 | GAP-CU-002 | Warden default model | 1G |
 | GAP-CU-003 | Confidence-band threshold defaults | 1G |

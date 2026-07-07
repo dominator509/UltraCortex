@@ -330,6 +330,7 @@ fn apply_write(
                 subject: Some(subject),
                 predicate: Some(predicate),
                 object_text: object,
+                severity: env.severity,
                 logical_at: at,
                 seed: env.seed,
             };
@@ -342,6 +343,7 @@ fn apply_write(
                 subject: None,
                 predicate: None,
                 object_text: body,
+                severity: env.severity,
                 logical_at: at,
                 seed: env.seed,
             };
@@ -549,7 +551,7 @@ pub fn run_curation_cycle(node: &Node, job: &CurationJob) {
                 schema_id: "curator.librarian.output.v1",
                 target_type: CellType::Librarian,
                 spec_anchor: SpecAnchorCell::parse_anchor(&output.public.spec_anchor),
-                severity: Severity::P2,
+                severity: job.severity,
                 payload: &output.public.to_cbor(),
                 estimate: 5,
             },
@@ -1083,13 +1085,82 @@ fn handle_hydrate(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnve
 fn handle_view(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelope> {
     let view_id = env.payload.req_str("view_id")?;
     let params = env.payload.get("params").cloned().unwrap_or(Cbor::Null);
-    let version = *node.view_version.lock().unwrap();
+    let current_version = *node.view_version.lock().unwrap();
+    let requested_version = env.payload.opt_u64("view_version");
+    let migrated_from = match requested_version {
+        Some(v) if v > current_version => {
+            return Err(UcError::new(
+                ErrCode::ContractViolation,
+                format!(
+                    "requested view_version {v} is newer than current {current_version}"
+                ),
+            ));
+        }
+        Some(v) if v < current_version => {
+            if env.payload.opt_bool("allow_migrate").unwrap_or(false) {
+                Some(v)
+            } else {
+                return Err(UcError::new(
+                    ErrCode::ContractViolation,
+                    format!(
+                        "requested view_version {v} is stale; current is {current_version} \
+                         (set allow_migrate=true to accept migrated output)"
+                    ),
+                ));
+            }
+        }
+        _ => None,
+    };
+    let version = current_version;
     let key = ViewKey {
         view_id: view_id.clone(),
         ns: "default".into(),
         version,
         params_hash: crate::core::crypto::sha256(&params.encode()),
     };
+    let view_key_cbor = Cbor::map(vec![
+        ("view_id", Cbor::t(view_id.clone())),
+        ("namespace", Cbor::t("default")),
+        ("version", Cbor::U64(version)),
+        (
+            "params_hash",
+            Cbor::t(crate::core::crypto::hex(&key.params_hash)),
+        ),
+    ]);
+
+    if matches!(env.payload.opt_str("formatting").as_deref(), Some("deepseek_fim")) {
+        let prefix = env
+            .payload
+            .get("prefix")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| UcError::schema("view formatting deepseek_fim requires prefix"))?;
+        let suffix = env
+            .payload
+            .get("suffix")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| UcError::schema("view formatting deepseek_fim requires suffix"))?;
+        let client_kind = crate::deepseek::DeepSeekClientKind::parse(
+            &env.payload.opt_str("client_kind").unwrap_or_else(|| "deepseek-coder".into()),
+        );
+        let framed = crate::deepseek::frame_edit_prompt(client_kind, &prefix, &suffix);
+        let tokens = est_tokens(framed.len()) as u64;
+        charge_read(node, env, tokens)?;
+        return Ok(ResponseEnvelope::ok(
+            env.request_id,
+            at,
+            Cbor::map(vec![
+                ("view", Cbor::Bytes(framed.into_bytes())),
+                ("cached", Cbor::Bool(false)),
+                ("view_version", Cbor::U64(version)),
+                (
+                    "migrated_from",
+                    migrated_from.map(Cbor::U64).unwrap_or(Cbor::Null),
+                ),
+                ("view_key", view_key_cbor),
+            ]),
+            tokens,
+        ));
+    }
 
     if let Some(bytes) = node.view_cache.get(&key, at) {
         node.metrics.inc("cache.hit");
@@ -1101,6 +1172,12 @@ fn handle_view(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelop
             Cbor::map(vec![
                 ("view", Cbor::Bytes(bytes)),
                 ("cached", Cbor::Bool(true)),
+                ("view_version", Cbor::U64(version)),
+                (
+                    "migrated_from",
+                    migrated_from.map(Cbor::U64).unwrap_or(Cbor::Null),
+                ),
+                ("view_key", view_key_cbor.clone()),
             ]),
             tokens,
         ));
@@ -1121,6 +1198,12 @@ fn handle_view(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelop
             ("view", Cbor::Bytes(rendered.bytes.clone())),
             ("cached", Cbor::Bool(false)),
             ("truncated", Cbor::Bool(rendered.truncated)),
+            ("view_version", Cbor::U64(version)),
+            (
+                "migrated_from",
+                migrated_from.map(Cbor::U64).unwrap_or(Cbor::Null),
+            ),
+            ("view_key", view_key_cbor),
         ]),
         rendered.tokens_emitted,
     );

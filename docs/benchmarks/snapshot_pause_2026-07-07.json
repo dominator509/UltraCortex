@@ -1,0 +1,23 @@
+{
+  "name": "snapshot_pause_bench",
+  "recorded_at": "2026-07-07",
+  "harness": "tests/acceptance_bench.rs::snapshot_pause_bench_meets_target",
+  "command": "cargo test snapshot_pause_bench_meets_target -- --nocapture",
+  "workload": {
+    "iterations": 7,
+    "cells_per_snapshot": 25,
+    "notes": [
+      "Runs through the real admin snapshot path on a booted node.",
+      "Seeds representative fact, persistence, audit, and curator records before repeated snapshots.",
+      "Exercises recall, view, and hydrate traffic before measuring the snapshot pause window.",
+      "Measures the in-memory checkpoint cut (`pause_us`); post-pause write and manifest timings are surfaced separately by the admin response."
+    ]
+  },
+  "results": {
+    "pause_target_us": 50000,
+    "pause_p50_us": 392,
+    "pause_p99_us": 562,
+    "pause_max_us": 562
+  },
+  "status": "pass"
+}

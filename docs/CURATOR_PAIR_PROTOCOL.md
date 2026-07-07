@@ -95,10 +95,10 @@ Per §3. The foundation.
 Correlated blind spots track training corpus. Orthogonal lineages → consistent-wrong-consensus structurally implausible.
 
 ### §5.3 Periodic Adversarial Probes
-Substrate injects known-wrong synthetic envelopes on deterministic schedule (seeded by logical clock). Cells cannot distinguish probes from real. Probe pass-rate = `ultracortex.curator.probe_pass_rate`. Below threshold → auto-quarantine of Cell + alert. **[GAP-CU-005]**.
+Substrate injects known-wrong synthetic envelopes on deterministic schedule (seeded by logical clock). v1.0 fixes the schedule at a base probe rate of `0.001`, boosted `x10` when the rolling agreement window enters suspicious-agreement state. The v1.0 probe corpus is the fabricated-handle existence probe: a well-formed but nonexistent `fact/<ulid>` citation that the Warden MUST flag. Probe pass-rate = `ultracortex.curator.probe_pass_rate`. Below threshold → auto-quarantine of Cell + alert.
 
 ### §5.4 Confidence Calibration Drift Detection
-Track empirical accuracy per band over rolling windows. Drift beyond tolerance → Cell enters **degraded mode**: sync path disabled, all outputs auto-escalated to Adjudicator. Exits only on fresh re-validation Decision. **[GAP-CU-006]**.
+Track empirical accuracy per band over rolling windows. v1.0 fixes the calibration window at `50` outcomes per band, with degraded mode triggered when High-band accuracy drops below `0.85` or Medium-band accuracy drops below `0.60` once a band has at least 10 observations. Drift beyond tolerance → Cell enters **degraded mode**: sync path disabled, all outputs auto-escalated to Adjudicator. Exits only on fresh re-validation Decision.
 
 ### §5.5 Mandatory Disagreement Quota
 Healthy = 92–97% agreement. **>99% agreement = collusion signal**, not health.
@@ -108,7 +108,11 @@ Healthy = 92–97% agreement. **>99% agreement = collusion signal**, not health.
 **[GAP-CU-004]** bounds.
 
 ### §5.6 No Shared KV-Cache, No Shared Embeddings, No Shared Shards
-Separate mmap'd weights, separate shards, separate KV caches. Tokenizer + embedding caches NOT shared. Only inter-Cell channel = substrate. **[GAP-CU-010]**.
+Separate mmap'd weights, separate shards, separate KV caches. Tokenizer + embedding caches NOT shared. Only inter-Cell channel = substrate.
+Supported v1.0 KV-budget profiles are selected by `[curator].kv_budget_profile` and surfaced by `curator status`:
+- `small` = Librarian `256 MiB`, Warden `256 MiB`, Adjudicator `128 MiB`
+- `reference` = Librarian `384 MiB`, Warden `384 MiB`, Adjudicator `256 MiB` (default)
+- `heavy` = Librarian `768 MiB`, Warden `768 MiB`, Adjudicator `512 MiB`
 
 ### §5.7 No Reciprocal Awareness of Timing
 Warden MUST NOT see when Librarian wrote outputs or in what order. Capability scope excludes `logical_at` ordering reads on Librarian-produced nodes. Outputs as set, not sequence.

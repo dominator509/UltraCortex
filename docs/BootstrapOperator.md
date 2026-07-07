@@ -94,7 +94,7 @@ Every TOML field is overridable via CLI flag in `--snake.case=value` form. CLI >
 
 ### Phase B3a — Fresh-Node Path
 
-1. Generate node UUID + initial KMS key (per `[kms]` config).
+1. Generate node UUID + initial KMS key / keyring state (per `[kms]` config).
 2. Initialize empty Manifest with default policies.
 3. Initialize empty WAL (epoch 0).
 4. **Bootstrap Trinity shard first**:
@@ -172,11 +172,17 @@ A crash (SIGKILL or panic): the next boot follows recovery path B3b.
 | `ultracortex quarantine list` | list pending QuarantineRecords |
 | `ultracortex quarantine reinject <id>` | re-dispatch a quarantined envelope |
 | `ultracortex gap list` | list GapRecords by status |
-| `ultracortex audit verify` | full audit-chain verification |
+| `ultracortex audit verify` | full audit-chain plus CrossCheck batch-signature verification |
+| `ultracortex kms status` | show live KMS tier, custody path, active key id, and next rotation due point |
+| `ultracortex kms rotate [--emergency]` | rotate the active T3 key, emit `kms.key_rotated`, and report the next due point |
+| `ultracortex budget defaults` | show default grants and namespace-specific overrides |
 | `ultracortex congruence audit` | force CongruenceCell recompute |
+| `ultracortex congruence accept <entity...>` | accept one or more pending congruence entities |
 | `ultracortex contract list` | list registered contracts + versions |
 
 All admin commands are themselves audited.
+
+For payload-specific review, the admin plane also exposes `congruence preview` when tooling supplies a candidate payload document; operators can inspect whether a write would introduce a delta before accepting entities.
 
 ---
 
@@ -197,10 +203,7 @@ Violation of this ordering is a fatal config error.
 
 ## §7 — GAPs
 
-| ID | Description |
-|----|-------------|
-| GAP-NT-001 | Trinity shard topology default (dedicated vs co-tenant-shard-0) |
-| GAP-NT-009 | Pre-validation chain ordering proof |
+No bootstrap-scoped Native Trinity gaps remain open in the current checkout. The pre-validation chain ordering is documented in NATIVE_TRINITY.md §11.1 and regression-locked by `fixed_chain_order_short_circuits_before_later_steps`.
 
 ---
 
@@ -221,19 +224,21 @@ The HyperCortex Bootstrap Operator content above remains normative. UltraCortex 
 
 ```toml
 [curator]
-librarian_model_sha256 = "..."   # pinned Gemma 2 2B Q4_K_M
-warden_model_sha256    = "..."   # pinned Qwen 2.5 Coder 1.5B Q4_K_M
-adjudicator_pool = [
-    "...",  # Phi-3.5 Mini sha256
-    "...",  # Llama 3.2 3B sha256
-    "...",  # SmolLM-2 1.7B sha256
-]
-disagreement_quota_min = 0.92
-disagreement_quota_max = 0.97
-adversarial_probe_rate = 0.001
-blind_reaudit_sample   = 0.01
-curator_topology       = "dedicated"   # "dedicated" | "co-tenant-shard-0"
+disagreement_quota_low  = 0.92
+disagreement_quota_high = 0.97
+probe_rate              = 0.001
+blind_reaudit_rate      = 0.01
+kv_budget_profile       = "reference"  # "small" | "reference" | "heavy"
+pool                    = "phi-3.5-mini, llama-3.2-3b, smollm2-1.7b"
+topology                = "dedicated"  # "dedicated" | "co-tenant-shard-0"
+external_cmd            = ""
+
+# [curator.pinned]
+# librarian = "..."       # current checkout can pin the Librarian GGUF backend
+# phi-3.5-mini = "..."    # adjudicator pool members pin individually
 ```
+
+Current-checkout note: `GAP-CU-001` remains open because the Librarian defaults to `DeterministicBackend` unless operators configure the optional GGUF seam. `GAP-CU-002` remains open because the Warden still runs deterministic evidence checks and no pinned GGUF/Qwen backend is wired into `WardenCell` yet.
 
 ## §A.2 Phase B3 — Provisioning Order (Updated)
 
@@ -287,7 +292,7 @@ B5.11 [NEW] PUBLIC/PRIVATE boundary test
 
 | Command | Action |
 |---|---|
-| `ultracortex curator status` | agreement rate, calibration band, degraded-mode status |
+| `ultracortex curator status` | agreement rate, calibration band, degraded-mode status, KV-budget profile |
 | `ultracortex curator probe-now` | manually inject adversarial probe |
 | `ultracortex cross-check tail` | recent CrossCheckRecords (paged) |
 | `ultracortex adjudicator stats` | deterministic vs LLM vs human resolution split |
@@ -300,7 +305,7 @@ All admin commands are themselves audited.
 Clean shutdown now includes:
 - Snapshot every Trinity Cell.
 - **(NEW)** Verify Curator KV cache erasure — KV pages MUST NOT survive to disk.
-- **(NEW)** Final CrossCheckLedger WAL fsync + signature batch flush.
+- **(NEW)** Final CrossCheckLedger WAL fsync + batch-HMAC flush.
 - Audit `bootstrap.clean_shutdown` with per-Cell state hashes (including Curator weight pins).
 
 ## §A.6 New GAPs (Bootstrap-scoped)
@@ -309,7 +314,6 @@ Clean shutdown now includes:
 |---|---|
 | GAP-CU-001 | Librarian default model (Gemma 2 2B vs Gemma 3) |
 | GAP-CU-002 | Warden default model (Qwen 2.5 Coder 1.5B vs alternates) |
-| GAP-CU-013 | Curator shard topology for small deployments |
 
 ## §A.7 Congruence Contract (Updated)
 

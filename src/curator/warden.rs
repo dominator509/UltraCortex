@@ -99,11 +99,7 @@ impl WardenCell {
     /// the UltraCortex-specific codes (`HallucinationDetected`,
     /// `SemanticDrift`) so callers can route them into the curator
     /// disagreement flow rather than plain quarantine (McpProtocol.md §A.2).
-    pub fn judge_envelope(
-        &self,
-        view: &dyn SubstrateView,
-        payload: &Cbor,
-    ) -> UcResult<()> {
+    pub fn judge_envelope(&self, view: &dyn SubstrateView, payload: &Cbor) -> UcResult<()> {
         // Hallucination: any referenced handle that doesn't exist.
         for h in Self::harvest_handles(payload) {
             if !view.handle_exists(&h) {
@@ -269,11 +265,9 @@ impl WardenCell {
                 }
             }
             match output.operation {
-                CuratorOperation::Skeleton if output.body.trim().is_empty() => {
-                    AuditVerdict::Fail {
-                        reason: "empty skeleton".into(),
-                    }
-                }
+                CuratorOperation::Skeleton if output.body.trim().is_empty() => AuditVerdict::Fail {
+                    reason: "empty skeleton".into(),
+                },
                 CuratorOperation::SupersedeProposal if output.grounded_in.len() < 2 => {
                     AuditVerdict::Fail {
                         reason: "supersede proposal must ground old and new handles".into(),
@@ -388,7 +382,9 @@ impl CellBehavior for WardenCell {
                         .get("independent_grounds")
                         .and_then(|v| v.as_array())
                         .map(|a| {
-                            a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(str::to_string))
+                                .collect()
                         })
                         .unwrap_or_default(),
                     hash_proof: item.opt_str("hash_proof"),
@@ -424,6 +420,7 @@ fn audit_to_cbor(rec: &AuditRecord) -> Cbor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::Severity;
     use crate::curator::librarian::test_support::FakeView;
 
     #[test]
@@ -499,6 +496,7 @@ mod tests {
             subject: Some("svc".into()),
             predicate: Some("design".into()),
             object_text: "uses tokens".into(),
+            severity: Severity::P2,
             logical_at: 10,
             seed: 3,
         };
@@ -521,6 +519,7 @@ mod tests {
             subject: Some("x".into()),
             predicate: Some("y".into()),
             object_text: "z body".into(),
+            severity: Severity::P2,
             logical_at: 12,
             seed: 3,
         };

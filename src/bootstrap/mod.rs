@@ -22,9 +22,15 @@
 use crate::core::cbor::Cbor;
 use crate::core::minitoml::{self, TomlValue};
 use crate::core::ulid::{DetRng, Ulid};
-use crate::core::{fnv1a64, ErrCode, Intent, Severity, Tier, UcError, UcResult};
-use crate::curator::{CuratorConfig, SubstrateView};
+use crate::core::{fnv1a64, ErrCode, Intent, Severity, ShardTopology, Tier, UcError, UcResult};
+use crate::curator::guardrails::{CALIBRATION_WINDOW, HIGH_BAND_FLOOR, MEDIUM_BAND_FLOOR};
+use crate::curator::ledger::{
+    BATCH_SIGN_EVERY, PROBE_BOOST_ON_SUSPICIOUS,
+    RETENTION_POLICY as CROSS_CHECK_RETENTION_POLICY,
+};
+use crate::curator::{CuratorConfig, CuratorKvBudgetProfile};
 use crate::node::{ids, Node};
+use crate::obs::AuditChain;
 use crate::persist::wal::{replay_dir, WalOp};
 use crate::persist::{EncryptionTier, Manifest};
 use crate::router::captoken::{
@@ -32,10 +38,11 @@ use crate::router::captoken::{
 };
 use crate::router::envelope::{Envelope, EnvelopeFlags, WorkBudget, PROTO_VERSION};
 use crate::router::handle_envelope;
-use crate::obs::AuditChain;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+static DRY_RUN_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // B1 — Config
@@ -46,6 +53,7 @@ pub struct Config {
     pub node_id: String,
     pub data_dir: PathBuf,
     pub shards: u64,
+    pub trinity_topology: ShardTopology,
     pub encryption_tier: EncryptionTier,
     pub boot_seed: u64,
     pub embedder_dim: usize,
@@ -63,6 +71,7 @@ impl Default for Config {
             node_id: "ultracortex-0".into(),
             data_dir: PathBuf::from("./ultracortex-data"),
             shards: cores.saturating_sub(2).max(2),
+            trinity_topology: ShardTopology::Dedicated,
             encryption_tier: EncryptionTier::T1,
             boot_seed: 0x0517AC0817E,
             embedder_dim: 256,
@@ -81,11 +90,11 @@ impl Config {
         if let Some(p) = path {
             let text = std::fs::read_to_string(p).map_err(UcError::from)?;
             let doc = minitoml::parse(&text).map_err(UcError::schema)?;
-            cfg.apply_toml(&doc);
+            cfg.apply_toml(&doc)?;
         } else if Path::new("ultracortex.toml").exists() {
             let text = std::fs::read_to_string("ultracortex.toml").map_err(UcError::from)?;
             let doc = minitoml::parse(&text).map_err(UcError::schema)?;
-            cfg.apply_toml(&doc);
+            cfg.apply_toml(&doc)?;
         }
 
         // UC_* environment overrides.
@@ -106,7 +115,7 @@ impl Config {
         Ok(cfg)
     }
 
-    fn apply_toml(&mut self, doc: &minitoml::TomlDoc) {
+    fn apply_toml(&mut self, doc: &minitoml::TomlDoc) -> UcResult<()> {
         let get = |section: &str, key: &str| -> Option<TomlValue> {
             doc.get(section).and_then(|s| s.get(key)).cloned()
         };
@@ -119,23 +128,40 @@ impl Config {
         if let Some(v) = get("node", "shards").and_then(|v| v.as_int()) {
             self.shards = (v.max(1)) as u64;
         }
+        if let Some(v) =
+            get("shards", "trinity_topology").and_then(|v| v.as_str().map(String::from))
+        {
+            if let Some(topology) = ShardTopology::from_str(&v) {
+                self.trinity_topology = topology;
+            }
+        }
         if let Some(v) = get("node", "boot_seed").and_then(|v| v.as_int()) {
             self.boot_seed = v as u64;
         }
         if let Some(v) = get("node", "embedder_dim").and_then(|v| v.as_int()) {
             self.embedder_dim = v.max(16) as usize;
         }
-        if let Some(v) = get("persist", "encryption_tier").and_then(|v| v.as_str().map(String::from))
+        if let Some(v) =
+            get("persist", "encryption_tier").and_then(|v| v.as_str().map(String::from))
         {
             if let Ok(t) = EncryptionTier::parse(&v) {
                 self.encryption_tier = t;
             }
         }
         if let Some(v) = get("listen", "uds").and_then(|v| v.as_str().map(String::from)) {
-            self.uds_path = if v.is_empty() { None } else { Some(PathBuf::from(v)) };
+            self.uds_path = if v.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(v))
+            };
         }
         if let Some(v) = get("listen", "tcp").and_then(|v| v.as_str().map(String::from)) {
-            self.tcp_addr = if v.is_empty() { None } else { Some(v) };
+            self.tcp_addr = if v.is_empty() {
+                None
+            } else {
+                crate::proto::validate_tcp_listen_addr(&v)?;
+                Some(v)
+            };
         }
         // [curator]
         if let Some(v) = get("curator", "disagreement_quota_low").and_then(|v| v.as_float()) {
@@ -150,8 +176,18 @@ impl Config {
         if let Some(v) = get("curator", "blind_reaudit_rate").and_then(|v| v.as_float()) {
             self.curator.blind_reaudit_rate = v;
         }
-        if let Some(v) = get("curator", "external_cmd").and_then(|v| v.as_str().map(String::from))
+        if let Some(v) =
+            get("curator", "kv_budget_profile").and_then(|v| v.as_str().map(String::from))
         {
+            self.curator.kv_budget_profile = CuratorKvBudgetProfile::from_str(&v)
+                .ok_or_else(|| UcError::schema("bad curator kv budget profile"))?;
+        }
+        if let Some(v) = get("curator", "topology").and_then(|v| v.as_str().map(String::from)) {
+            if let Some(topology) = ShardTopology::from_str(&v) {
+                self.curator.topology = topology;
+            }
+        }
+        if let Some(v) = get("curator", "external_cmd").and_then(|v| v.as_str().map(String::from)) {
             self.curator.external_cmd = if v.is_empty() { None } else { Some(v) };
         }
         if let Some(v) = get("curator", "pool").and_then(|v| v.as_str().map(String::from)) {
@@ -172,11 +208,12 @@ impl Config {
                 }
             }
         }
+        Ok(())
     }
 }
 
 type EnvSetter = fn(&mut Config, &str) -> UcResult<()>;
-const ENV_KEYS: [(&str, EnvSetter); 6] = [
+const ENV_KEYS: [(&str, EnvSetter); 9] = [
     ("UC_NODE_ID", |c, v| {
         c.node_id = v.to_string();
         Ok(())
@@ -186,7 +223,15 @@ const ENV_KEYS: [(&str, EnvSetter); 6] = [
         Ok(())
     }),
     ("UC_SHARDS", |c, v| {
-        c.shards = v.parse::<u64>().map_err(|e| UcError::schema(e.to_string()))?.max(1);
+        c.shards = v
+            .parse::<u64>()
+            .map_err(|e| UcError::schema(e.to_string()))?
+            .max(1);
+        Ok(())
+    }),
+    ("UC_TRINITY_TOPOLOGY", |c, v| {
+        c.trinity_topology =
+            ShardTopology::from_str(v).ok_or_else(|| UcError::schema("bad UC_TRINITY_TOPOLOGY"))?;
         Ok(())
     }),
     ("UC_ENCRYPTION_TIER", |c, v| {
@@ -194,11 +239,30 @@ const ENV_KEYS: [(&str, EnvSetter); 6] = [
         Ok(())
     }),
     ("UC_UDS", |c, v| {
-        c.uds_path = if v.is_empty() { None } else { Some(PathBuf::from(v)) };
+        c.uds_path = if v.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(v))
+        };
         Ok(())
     }),
     ("UC_TCP", |c, v| {
-        c.tcp_addr = if v.is_empty() { None } else { Some(v.to_string()) };
+        c.tcp_addr = if v.is_empty() {
+            None
+        } else {
+            crate::proto::validate_tcp_listen_addr(v)?;
+            Some(v.to_string())
+        };
+        Ok(())
+    }),
+    ("UC_CURATOR_TOPOLOGY", |c, v| {
+        c.curator.topology =
+            ShardTopology::from_str(v).ok_or_else(|| UcError::schema("bad UC_CURATOR_TOPOLOGY"))?;
+        Ok(())
+    }),
+    ("UC_CURATOR_KV_BUDGET_PROFILE", |c, v| {
+        c.curator.kv_budget_profile = CuratorKvBudgetProfile::from_str(v)
+            .ok_or_else(|| UcError::schema("bad UC_CURATOR_KV_BUDGET_PROFILE"))?;
         Ok(())
     }),
 ];
@@ -208,16 +272,42 @@ fn apply_kv(cfg: &mut Config, k: &str, v: &str) -> UcResult<()> {
         "node.id" => cfg.node_id = v.to_string(),
         "node.data_dir" => cfg.data_dir = PathBuf::from(v),
         "node.shards" => {
-            cfg.shards = v.parse::<u64>().map_err(|e| UcError::schema(e.to_string()))?.max(1)
+            cfg.shards = v
+                .parse::<u64>()
+                .map_err(|e| UcError::schema(e.to_string()))?
+                .max(1)
+        }
+        "shards.trinity_topology" => {
+            cfg.trinity_topology =
+                ShardTopology::from_str(v).ok_or_else(|| UcError::schema("bad trinity topology"))?
         }
         "node.boot_seed" => {
             cfg.boot_seed = v.parse().map_err(|_| UcError::schema("bad boot_seed"))?
         }
         "persist.encryption_tier" => cfg.encryption_tier = EncryptionTier::parse(v)?,
         "listen.uds" => {
-            cfg.uds_path = if v.is_empty() { None } else { Some(PathBuf::from(v)) }
+            cfg.uds_path = if v.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(v))
+            }
         }
-        "listen.tcp" => cfg.tcp_addr = if v.is_empty() { None } else { Some(v.to_string()) },
+        "listen.tcp" => {
+            cfg.tcp_addr = if v.is_empty() {
+                None
+            } else {
+                crate::proto::validate_tcp_listen_addr(v)?;
+                Some(v.to_string())
+            }
+        }
+        "curator.kv_budget_profile" => {
+            cfg.curator.kv_budget_profile = CuratorKvBudgetProfile::from_str(v)
+                .ok_or_else(|| UcError::schema("bad curator kv budget profile"))?
+        }
+        "curator.topology" => {
+            cfg.curator.topology =
+                ShardTopology::from_str(v).ok_or_else(|| UcError::schema("bad curator topology"))?
+        }
         other => return Err(UcError::schema(format!("unknown config key `{other}`"))),
     }
     Ok(())
@@ -260,6 +350,7 @@ pub fn boot(cfg: &Config) -> UcResult<BootReport> {
         cfg.shards,
         cfg.encryption_tier,
         cfg.boot_seed,
+        cfg.trinity_topology,
         cfg.curator.clone(),
         cfg.embedder_dim,
     )?);
@@ -334,7 +425,11 @@ fn provision_fresh(node: &Node) -> UcResult<()> {
         t.contract.register(
             at,
             "curator.warden.judgment.v1",
-            vec!["output_handle".into(), "operation".into(), "target_handle".into()],
+            vec![
+                "output_handle".into(),
+                "operation".into(),
+                "target_handle".into(),
+            ],
         );
         t.contract.register(at, "blob.v1", vec!["body".into()]);
         t.contract
@@ -388,12 +483,31 @@ fn provision_fresh(node: &Node) -> UcResult<()> {
 
         // 5. CongruenceCell — vocabulary of known entities.
         for ct in [
-            "CatalogCell", "FactCell", "TimelineCell", "PlaybookCell", "ScratchpadCell",
-            "VectorCell", "GraphCell", "Bm25Cell", "BlobCell", "CacheCell",
-            "AgentRegistryCell", "ProposalCell", "SubscriptionCell", "RerankerCell",
-            "SpecAnchorCell", "DecisionLedgerCell", "CongruenceCell", "GapCell",
-            "QuarantineCell", "WorkBudgetCell", "ContractCell", "LibrarianCell",
-            "WardenCell", "AdjudicatorCell", "CrossCheckLedgerCell",
+            "CatalogCell",
+            "FactCell",
+            "TimelineCell",
+            "PlaybookCell",
+            "ScratchpadCell",
+            "VectorCell",
+            "GraphCell",
+            "Bm25Cell",
+            "BlobCell",
+            "CacheCell",
+            "AgentRegistryCell",
+            "ProposalCell",
+            "SubscriptionCell",
+            "RerankerCell",
+            "SpecAnchorCell",
+            "DecisionLedgerCell",
+            "CongruenceCell",
+            "GapCell",
+            "QuarantineCell",
+            "WorkBudgetCell",
+            "ContractCell",
+            "LibrarianCell",
+            "WardenCell",
+            "AdjudicatorCell",
+            "CrossCheckLedgerCell",
         ] {
             t.congruence.register_entity(ct);
         }
@@ -401,10 +515,8 @@ fn provision_fresh(node: &Node) -> UcResult<()> {
         t.congruence.register_entity("P19");
         t.congruence.register_entity("P20");
 
-        // 6/7. WorkBudget grants + Quarantine need no seeding beyond
-        // construction; the curator task gets a standing grant.
-        t.work_budget.ensure("curator.librarian", Some(10_000_000));
-        t.work_budget.ensure("bootstrap.selftest", Some(1_000_000));
+        // 6/7. WorkBudget + Quarantine need no extra seeding here: the
+        // namespace-default policy covers curator/bootstrap/admin tasks.
     }
 
     // Curators + operator in the registry (after Trinity — order matters).
@@ -473,6 +585,16 @@ fn recover(node: &Node, manifest: &Manifest) -> UcResult<u64> {
         if !ok {
             return Err(UcError::internal(format!(
                 "audit chain integrity failure after {records} records — refusing to serve"
+            )));
+        }
+    }
+    {
+        let mut ledger = node.cross_check.lock().unwrap();
+        ledger.reload_signature_state_from_sidecar()?;
+        let (verified_batches, ok) = ledger.verify_batch_signatures()?;
+        if !ok {
+            return Err(UcError::internal(format!(
+                "cross-check batch signature verification failed after {verified_batches} verified batches — refusing to serve"
             )));
         }
     }
@@ -624,7 +746,11 @@ pub fn self_test(node: &Arc<Node>) -> UcResult<u32> {
         ),
     );
     let written = r.result.opt_str("handle").unwrap_or_default();
-    check("B5.1 write", r.ok && written.starts_with("fact/"), format!("{:?}", r.err_message))?;
+    check(
+        "B5.1 write",
+        r.ok && written.starts_with("fact/"),
+        format!("{:?}", r.err_message),
+    )?;
 
     // B5.2 — recall finds it.
     let r = handle_envelope(
@@ -633,7 +759,10 @@ pub fn self_test(node: &Arc<Node>) -> UcResult<u32> {
             node,
             &agent,
             Intent::Recall,
-            Cbor::map(vec![("query", Cbor::t("substrate polices")), ("k", Cbor::U64(4))]),
+            Cbor::map(vec![
+                ("query", Cbor::t("substrate polices")),
+                ("k", Cbor::U64(4)),
+            ]),
             None,
             task,
             12,
@@ -667,9 +796,15 @@ pub fn self_test(node: &Arc<Node>) -> UcResult<u32> {
     );
     let superseded = {
         let fact = node.cells.fact.lock().unwrap();
-        fact.get(&written).and_then(|f| f.superseded_by.clone()).is_some()
+        fact.get(&written)
+            .and_then(|f| f.superseded_by.clone())
+            .is_some()
     };
-    check("B5.3 supersede", r2.ok && superseded, format!("{:?}", r2.err_message))?;
+    check(
+        "B5.3 supersede",
+        r2.ok && superseded,
+        format!("{:?}", r2.err_message),
+    )?;
 
     // B5.4 — anchor-missing write quarantines with a qid.
     let r = handle_envelope(
@@ -693,7 +828,10 @@ pub fn self_test(node: &Arc<Node>) -> UcResult<u32> {
         "B5.4 anchor quarantine",
         !r.ok
             && r.err_code == Some(ErrCode::AnchorMissing)
-            && r.quarantine_id.as_deref().unwrap_or("").starts_with("quarantine/"),
+            && r.quarantine_id
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("quarantine/"),
         format!("{:?} {:?}", r.err_code, r.quarantine_id),
     )?;
 
@@ -731,12 +869,30 @@ pub fn self_test(node: &Arc<Node>) -> UcResult<u32> {
     ]);
     let r = handle_envelope(
         node,
-        &selftest_env(node, &agent, Intent::View, view_payload.clone(), None, task, 16, false),
+        &selftest_env(
+            node,
+            &agent,
+            Intent::View,
+            view_payload.clone(),
+            None,
+            task,
+            16,
+            false,
+        ),
     );
     let hits_before = node.metrics.counter("cache.hit");
     let r2 = handle_envelope(
         node,
-        &selftest_env(node, &agent, Intent::View, view_payload, None, task, 17, false),
+        &selftest_env(
+            node,
+            &agent,
+            Intent::View,
+            view_payload,
+            None,
+            task,
+            17,
+            false,
+        ),
     );
     check(
         "B5.6 view+cache",
@@ -760,7 +916,11 @@ pub fn self_test(node: &Arc<Node>) -> UcResult<u32> {
             }
         }
     };
-    check("B5.7 librarian active", skeleton_active, "no active skeleton".into())?;
+    check(
+        "B5.7 librarian active",
+        skeleton_active,
+        "no active skeleton".into(),
+    )?;
 
     // B5.8 — semantic gate flags a hallucinated reference.
     let r = handle_envelope(
@@ -772,7 +932,10 @@ pub fn self_test(node: &Arc<Node>) -> UcResult<u32> {
             Cbor::map(vec![
                 ("subject", Cbor::t("selftest")),
                 ("predicate", Cbor::t("grounding")),
-                ("object", Cbor::t("grounded in fact/01GHOSTGHOSTGHOSTGHOSTGHOST")),
+                (
+                    "object",
+                    Cbor::t("grounded in fact/01GHOSTGHOSTGHOSTGHOSTGHOST"),
+                ),
             ]),
             Some("Architecture.md\u{00a7}4"),
             task,
@@ -885,7 +1048,8 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
     let verb = msg.opt_str("verb").unwrap_or_default();
     let args = msg.get("args").cloned().unwrap_or(Cbor::Null);
     let at = node.tick();
-    node.metrics.inc(&format!("admin.{}", verb.replace(' ', "_")));
+    node.metrics
+        .inc(&format!("admin.{}", verb.replace(' ', "_")));
 
     match verb.as_str() {
         "status" => {
@@ -894,6 +1058,12 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
             Ok(Cbor::map(vec![
                 ("node_id", Cbor::t(node.node_id.clone())),
                 ("logical_at", Cbor::U64(node.now())),
+                ("shards", Cbor::U64(node.shard_count)),
+                ("trinity_topology", Cbor::t(node.trinity_topology.as_str())),
+                (
+                    "curator_topology",
+                    Cbor::t(node.curator_cfg.topology.as_str()),
+                ),
                 ("quarantine_pending", Cbor::U64(pending as u64)),
                 ("librarian_pending", Cbor::U64(p as u64)),
                 ("librarian_active", Cbor::U64(a as u64)),
@@ -901,16 +1071,22 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
             ]))
         }
         "snapshot" => {
-            let states = node.snapshot_all();
-            let name = node.snapshots.write(at, &states)?;
-            {
-                let mut m = node.manifest.lock().unwrap();
-                m.logical_at = at;
-                m.last_snapshot = Some(name.clone());
-                m.state_hashes = node.state_hashes();
-                m.save(&node.data_dir)?;
-            }
-            Ok(Cbor::map(vec![("snapshot", Cbor::t(name))]))
+            let snap = node.write_snapshot(at)?;
+            Ok(Cbor::map(vec![
+                ("snapshot", Cbor::t(snap.name)),
+                ("cells", Cbor::U64(snap.cells as u64)),
+                ("pause_us", Cbor::U64(snap.pause_us)),
+                ("total_us", Cbor::U64(snap.total_us)),
+                (
+                    "pause_target_us",
+                    Cbor::U64(crate::node::SNAPSHOT_PAUSE_TARGET_US),
+                ),
+                ("capture_us", Cbor::U64(snap.capture_us)),
+                ("hash_us", Cbor::U64(snap.hash_us)),
+                ("write_us", Cbor::U64(snap.write_us)),
+                ("manifest_us", Cbor::U64(snap.manifest_us)),
+                ("within_target", Cbor::Bool(snap.within_target)),
+            ]))
         }
         "quarantine list" => {
             let t = node.trinity.lock().unwrap();
@@ -928,7 +1104,14 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
                     ])
                 })
                 .collect();
-            Ok(Cbor::map(vec![("items", Cbor::Array(items))]))
+            Ok(Cbor::map(vec![
+                ("items", Cbor::Array(items)),
+                (
+                    "resolved_retention_logical",
+                    Cbor::U64(t.quarantine.resolved_retention),
+                ),
+                ("pending_never_pruned", Cbor::Bool(true)),
+            ]))
         }
         "quarantine reinject" => {
             let qid = args.req_str("qid")?;
@@ -946,7 +1129,10 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
                 &operator,
                 Intent::Write,
                 inner,
-                payload.opt_str("spec_anchor").as_deref().or(Some("Architecture.md\u{00a7}4")),
+                payload
+                    .opt_str("spec_anchor")
+                    .as_deref()
+                    .or(Some("Architecture.md\u{00a7}4")),
                 "admin.reinject",
                 at,
                 false,
@@ -957,7 +1143,11 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
                 ("ok", Cbor::Bool(resp.ok)),
                 (
                     "result",
-                    if resp.ok { resp.result } else { Cbor::t(resp.err_message.unwrap_or_default()) },
+                    if resp.ok {
+                        resp.result
+                    } else {
+                        Cbor::t(resp.err_message.unwrap_or_default())
+                    },
                 ),
             ]))
         }
@@ -990,16 +1180,198 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
         "audit verify" => {
             let path = node.data_dir.join("audit.chain");
             let (records, ok) = AuditChain::verify(&path).map_err(UcError::internal)?;
+            let (expected_batches, verified_batches, signatures_ok) = {
+                let mut ledger = node.cross_check.lock().unwrap();
+                ledger.reload_signature_state_from_sidecar()?;
+                let expected = (ledger.len() / BATCH_SIGN_EVERY as usize) as u64;
+                let (verified, sig_ok) = ledger.verify_batch_signatures()?;
+                (expected, verified, sig_ok)
+            };
             Ok(Cbor::map(vec![
                 ("records", Cbor::U64(records)),
                 ("intact", Cbor::Bool(ok)),
+                (
+                    "cross_check_batches_expected",
+                    Cbor::U64(expected_batches),
+                ),
+                (
+                    "cross_check_batches_verified",
+                    Cbor::U64(verified_batches),
+                ),
+                (
+                    "cross_check_signatures_intact",
+                    Cbor::Bool(signatures_ok),
+                ),
+            ]))
+        }
+        "kms status" => {
+            let status = node.kms.rotation_status(at);
+            Ok(Cbor::map(vec![
+                ("tier", Cbor::t(node.kms.tier().as_str())),
+                (
+                    "custody_path",
+                    node.kms
+                        .custody_path()
+                        .map(|p| Cbor::t(p.display().to_string()))
+                        .unwrap_or(Cbor::Null),
+                ),
+                (
+                    "active_key_id",
+                    node.kms
+                        .active_key_id()
+                        .map(Cbor::U64)
+                        .unwrap_or(Cbor::Null),
+                ),
+                ("key_versions", Cbor::U64(node.kms.key_versions() as u64)),
+                (
+                    "last_rotated_at",
+                    status
+                        .as_ref()
+                        .map(|s| Cbor::U64(s.last_rotated_at))
+                        .unwrap_or(Cbor::Null),
+                ),
+                (
+                    "rotation_interval_ops",
+                    status
+                        .as_ref()
+                        .map(|s| Cbor::U64(s.rotation_interval_ops))
+                        .unwrap_or(Cbor::Null),
+                ),
+                (
+                    "next_due_at",
+                    status
+                        .as_ref()
+                        .map(|s| Cbor::U64(s.next_due_at))
+                        .unwrap_or(Cbor::Null),
+                ),
+                (
+                    "overdue",
+                    status
+                        .as_ref()
+                        .map(|s| Cbor::Bool(s.overdue))
+                        .unwrap_or(Cbor::Bool(false)),
+                ),
+            ]))
+        }
+        "kms rotate" => {
+            let emergency = args.opt_bool("emergency").unwrap_or(false);
+            let rotation = node.kms.rotate(at, emergency)?;
+            let due = node.kms.rotation_status(at).map(|s| s.next_due_at);
+            node.audit
+                .lock()
+                .unwrap()
+                .append(
+                    at,
+                    "kms.key_rotated",
+                    &[
+                        ("tier", Cbor::t(node.kms.tier().as_str())),
+                        ("previous_key_id", Cbor::U64(rotation.previous_key_id)),
+                        ("active_key_id", Cbor::U64(rotation.active_key_id)),
+                        ("emergency", Cbor::Bool(rotation.emergency)),
+                    ],
+                )
+                .map_err(UcError::internal)?;
+            node.logger.info(
+                at,
+                "kms.key_rotated",
+                &[
+                    ("tier", node.kms.tier().as_str().into()),
+                    ("previous_key_id", rotation.previous_key_id.to_string()),
+                    ("active_key_id", rotation.active_key_id.to_string()),
+                    ("emergency", rotation.emergency.to_string()),
+                ],
+            );
+            Ok(Cbor::map(vec![
+                ("tier", Cbor::t(node.kms.tier().as_str())),
+                ("previous_key_id", Cbor::U64(rotation.previous_key_id)),
+                ("active_key_id", Cbor::U64(rotation.active_key_id)),
+                ("logical_at", Cbor::U64(rotation.logical_at)),
+                ("emergency", Cbor::Bool(rotation.emergency)),
+                (
+                    "next_due_at",
+                    due.map(Cbor::U64).unwrap_or(Cbor::Null),
+                ),
+                ("audited", Cbor::Bool(true)),
             ]))
         }
         "congruence audit" => {
             let t = node.trinity.lock().unwrap();
             Ok(Cbor::map(vec![
-                ("known_entities", Cbor::U64(t.congruence.known_count() as u64)),
-                ("accepted_deltas", Cbor::U64(t.congruence.accepted_count() as u64)),
+                (
+                    "known_entities",
+                    Cbor::U64(t.congruence.known_count() as u64),
+                ),
+                (
+                    "accepted_deltas",
+                    Cbor::U64(t.congruence.accepted_count() as u64),
+                ),
+                (
+                    "accepted",
+                    Cbor::text_array(&t.congruence.accepted_entities()),
+                ),
+            ]))
+        }
+        "congruence preview" => {
+            let payload = args
+                .get("payload")
+                .ok_or_else(|| UcError::schema("congruence preview: missing payload"))?;
+            let t = node.trinity.lock().unwrap();
+            match t.congruence.preview_delta(payload) {
+                Ok(()) => Ok(Cbor::map(vec![("delta", Cbor::Bool(false))])),
+                Err(e) => Ok(Cbor::map(vec![
+                    ("delta", Cbor::Bool(true)),
+                    ("detail", Cbor::t(e.message)),
+                ])),
+            }
+        }
+        "congruence accept" => {
+            let mut entities: Vec<String> = args
+                .get("entities")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if entities.is_empty() {
+                if let Some(entity) = args.opt_str("entity") {
+                    entities.push(entity);
+                }
+            }
+            if entities.is_empty() {
+                return Err(UcError::schema(
+                    "congruence accept: missing entity or entities",
+                ));
+            }
+            let mut t = node.trinity.lock().unwrap();
+            for entity in &entities {
+                t.congruence.accept_delta(entity);
+            }
+            Ok(Cbor::map(vec![
+                ("accepted", Cbor::text_array(&entities)),
+                (
+                    "accepted_deltas",
+                    Cbor::U64(t.congruence.accepted_count() as u64),
+                ),
+            ]))
+        }
+        "budget defaults" => {
+            let t = node.trinity.lock().unwrap();
+            let items: Vec<Cbor> = t
+                .work_budget
+                .namespace_defaults()
+                .iter()
+                .map(|(namespace, grant)| {
+                    Cbor::map(vec![
+                        ("namespace", Cbor::t(namespace.clone())),
+                        ("grant", Cbor::U64(*grant)),
+                    ])
+                })
+                .collect();
+            Ok(Cbor::map(vec![
+                ("default_grant", Cbor::U64(t.work_budget.default_grant)),
+                ("namespace_defaults", Cbor::Array(items)),
             ]))
         }
         "contract list" => {
@@ -1013,15 +1385,85 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
                         ("schema_id", Cbor::t(c.schema_id.clone())),
                         ("required", Cbor::text_array(&c.required_fields)),
                         ("deprecated", Cbor::Bool(c.deprecated)),
+                        (
+                            "superseded_by",
+                            c.superseded_by
+                                .as_ref()
+                                .map(|s| Cbor::t(s.clone()))
+                                .unwrap_or(Cbor::Null),
+                        ),
+                        (
+                            "migration_plan_handle",
+                            c.migration_plan_handle
+                                .as_ref()
+                                .map(|s| Cbor::t(s.clone()))
+                                .unwrap_or(Cbor::Null),
+                        ),
+                        (
+                            "decision_handle",
+                            c.decision_handle
+                                .as_ref()
+                                .map(|s| Cbor::t(s.clone()))
+                                .unwrap_or(Cbor::Null),
+                        ),
+                        (
+                            "deprecated_after",
+                            c.deprecated_after.map(Cbor::U64).unwrap_or(Cbor::Null),
+                        ),
+                        (
+                            "migration_applied_at",
+                            c.migration_applied_at.map(Cbor::U64).unwrap_or(Cbor::Null),
+                        ),
                     ])
                 })
                 .collect();
             Ok(Cbor::map(vec![("contracts", Cbor::Array(items))]))
         }
+        "contract plan-migration" => {
+            let source_schema_id = args.req_str("schema_id")?;
+            let target_schema_id = args.req_str("target_schema_id")?;
+            let migration_plan_handle = args.req_str("migration_plan_handle")?;
+            let decision_handle = args.req_str("decision_handle")?;
+            let deprecated_after = args
+                .opt_u64("deprecated_after")
+                .or_else(|| {
+                    args.opt_str("deprecated_after")
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
+                .ok_or_else(|| {
+                    UcError::schema("contract plan-migration: missing deprecated_after")
+                })?;
+            let mut t = node.trinity.lock().unwrap();
+            if !t.decision_ledger.exists(&decision_handle) {
+                return Err(UcError::not_found(format!(
+                    "decision handle `{decision_handle}` does not exist"
+                )));
+            }
+            t.contract.plan_migration(
+                &source_schema_id,
+                &target_schema_id,
+                &migration_plan_handle,
+                &decision_handle,
+                deprecated_after,
+            )?;
+            t.contract.migration_status(&source_schema_id)
+        }
+        "contract verify-migration" => {
+            let source_schema_id = args.req_str("schema_id")?;
+            let t = node.trinity.lock().unwrap();
+            t.contract.migration_status(&source_schema_id)
+        }
+        "contract apply-migration" => {
+            let source_schema_id = args.req_str("schema_id")?;
+            let mut t = node.trinity.lock().unwrap();
+            t.contract.apply_migration(at, &source_schema_id)?;
+            t.contract.migration_status(&source_schema_id)
+        }
         "curator status" => {
             let (p, a, q) = node.curators.librarian.lock().unwrap().counts();
             let audits = node.curators.warden.lock().unwrap().audit_count();
             let ledger = node.cross_check.lock().unwrap();
+            let kv_budgets = node.curator_cfg.kv_budgets();
             Ok(Cbor::map(vec![
                 ("librarian_pending", Cbor::U64(p as u64)),
                 ("librarian_active", Cbor::U64(a as u64)),
@@ -1038,6 +1480,41 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
                 (
                     "probe_missed",
                     Cbor::U64(node.metrics.counter("curator.probe_missed")),
+                ),
+                ("probe_rate", Cbor::F64(node.curator_cfg.probe_rate)),
+                (
+                    "probe_boost_on_suspicious",
+                    Cbor::F64(PROBE_BOOST_ON_SUSPICIOUS),
+                ),
+                (
+                    "kv_budget_profile",
+                    Cbor::t(node.curator_cfg.kv_budget_profile.as_str()),
+                ),
+                (
+                    "librarian_kv_cache_mib",
+                    Cbor::U64(kv_budgets.librarian_mib),
+                ),
+                ("warden_kv_cache_mib", Cbor::U64(kv_budgets.warden_mib)),
+                (
+                    "adjudicator_kv_cache_mib",
+                    Cbor::U64(kv_budgets.adjudicator_mib),
+                ),
+                ("total_kv_cache_mib", Cbor::U64(kv_budgets.total_mib())),
+                ("topology", Cbor::t(node.curator_cfg.topology.as_str())),
+                (
+                    "blind_reaudit_rate",
+                    Cbor::F64(node.curator_cfg.blind_reaudit_rate),
+                ),
+                (
+                    "cross_check_retention_policy",
+                    Cbor::t(CROSS_CHECK_RETENTION_POLICY),
+                ),
+                ("calibration_window", Cbor::U64(CALIBRATION_WINDOW as u64)),
+                ("high_band_floor", Cbor::F64(HIGH_BAND_FLOOR)),
+                ("medium_band_floor", Cbor::F64(MEDIUM_BAND_FLOOR)),
+                (
+                    "degraded",
+                    Cbor::Bool(node.guardrails.calibration.lock().unwrap().degraded()),
                 ),
             ]))
         }
@@ -1063,19 +1540,30 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
             let n = args.opt_u64("n").unwrap_or(20) as usize;
             let ledger = node.cross_check.lock().unwrap();
             let items: Vec<Cbor> = ledger.tail(n).iter().map(|r| r.to_cbor()).collect();
-            Ok(Cbor::map(vec![("records", Cbor::Array(items))]))
+            Ok(Cbor::map(vec![
+                ("records", Cbor::Array(items)),
+                ("retention_policy", Cbor::t(ledger.retention_policy())),
+            ]))
         }
         "adjudicator stats" => {
             let adj = node.curators.adjudicator.lock().unwrap();
             let (policy, pool, human, queued) = adj.stats();
+            let escalation_subscribers = node
+                .cells
+                .agent_registry
+                .lock()
+                .unwrap()
+                .escalation_subscribers();
             Ok(Cbor::map(vec![
                 ("policy", Cbor::U64(policy)),
                 ("pool", Cbor::U64(pool)),
                 ("human", Cbor::U64(human)),
                 ("queued", Cbor::U64(queued as u64)),
-                ("escalations", Cbor::text_array(
-                    &adj.escalations().to_vec(),
-                )),
+                ("escalations", Cbor::text_array(&adj.escalations().to_vec())),
+                (
+                    "escalation_subscribers",
+                    Cbor::text_array(&escalation_subscribers),
+                ),
             ]))
         }
         "resolve" => {
@@ -1122,7 +1610,9 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
             node.shutdown()?;
             Ok(Cbor::map(vec![("shutdown", Cbor::Bool(true))]))
         }
-        other => Err(UcError::unsupported(format!("unknown admin verb `{other}`"))),
+        other => Err(UcError::unsupported(format!(
+            "unknown admin verb `{other}`"
+        ))),
     }
 }
 
@@ -1150,7 +1640,10 @@ pub fn run(cfg: &Config) -> UcResult<()> {
     }
 
     // B6 — the contractual ready line.
-    println!("ready node_id={} proto_version={}", node.node_id, PROTO_VERSION);
+    println!(
+        "ready node_id={} proto_version={}",
+        node.node_id, PROTO_VERSION
+    );
     node.logger.info(
         node.now(),
         "node.ready",
@@ -1177,11 +1670,14 @@ pub fn run(cfg: &Config) -> UcResult<()> {
 /// boot in a temp dir, no listeners.
 pub fn dry_run() -> UcResult<BootReport> {
     let mut cfg = Config::default();
+    let seq = DRY_RUN_SEQ.fetch_add(1, Ordering::Relaxed);
     cfg.data_dir = std::env::temp_dir().join(format!(
-        "ultracortex-dryrun-{}-{}",
+        "ultracortex-dryrun-{}-{}-{}",
         std::process::id(),
-        DetRng::new(fnv1a64(b"dryrun")).next_u64()
+        DetRng::new(fnv1a64(b"dryrun")).next_u64(),
+        seq
     ));
+    let _ = std::fs::remove_dir_all(&cfg.data_dir);
     cfg.uds_path = Some(cfg.data_dir.join("ultracortex.sock"));
     boot(&cfg)
 }
@@ -1189,6 +1685,7 @@ pub fn dry_run() -> UcResult<BootReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn fresh_boot_passes_self_test() {
@@ -1205,10 +1702,8 @@ mod tests {
     #[test]
     fn recovery_restores_written_facts() {
         let mut cfg = Config::default();
-        cfg.data_dir = std::env::temp_dir().join(format!(
-            "ultracortex-recover-{}",
-            std::process::id()
-        ));
+        cfg.data_dir =
+            std::env::temp_dir().join(format!("ultracortex-recover-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cfg.data_dir);
         cfg.uds_path = Some(cfg.data_dir.join("ultracortex.sock"));
 
@@ -1229,7 +1724,10 @@ mod tests {
         // Boot again from the same dir: recovery path.
         let report2 = boot(&cfg).unwrap();
         assert!(report2.recovered);
-        assert!(report2.node.handle_exists(&handle));
+        assert!(crate::curator::SubstrateView::handle_exists(
+            &*report2.node,
+            &handle
+        ));
         let _ = std::fs::remove_dir_all(&cfg.data_dir);
     }
 
@@ -1239,8 +1737,10 @@ mod tests {
         let node = report.node;
         let verbs = [
             "status",
+            "budget defaults",
             "quarantine list",
             "gap list",
+            "kms status",
             "congruence audit",
             "contract list",
             "curator status",
@@ -1256,5 +1756,666 @@ mod tests {
         // Unknown verb rejected.
         let msg = Cbor::map(vec![("verb", Cbor::t("frobnicate"))]);
         assert!(admin_dispatch(&node, &msg).is_err());
+    }
+
+    #[test]
+    fn snapshot_admin_surfaces_pause_breakdown() {
+        let report = dry_run().unwrap();
+        let node = report.node;
+        let snap = admin_dispatch(
+            &node,
+            &Cbor::map(vec![("verb", Cbor::t("snapshot")), ("args", Cbor::Null)]),
+        )
+        .unwrap();
+        let pause = snap.opt_u64("pause_us").unwrap_or(0);
+        assert!(snap
+            .opt_str("snapshot")
+            .unwrap_or_default()
+            .starts_with("snap-"));
+        assert!(snap.opt_u64("cells").unwrap_or(0) >= 25);
+        assert_eq!(
+            snap.opt_u64("pause_target_us"),
+            Some(crate::node::SNAPSHOT_PAUSE_TARGET_US)
+        );
+        assert_eq!(
+            snap.opt_bool("within_target"),
+            Some(pause <= crate::node::SNAPSHOT_PAUSE_TARGET_US)
+        );
+        assert!(snap.opt_u64("total_us").is_some());
+        assert!(snap.opt_u64("capture_us").is_some());
+        assert!(snap.opt_u64("hash_us").is_some());
+        assert!(snap.opt_u64("write_us").is_some());
+        assert!(snap.opt_u64("manifest_us").is_some());
+    }
+
+    #[test]
+    fn kms_status_and_rotate_surface_custody_and_keep_audit_chain_intact() {
+        let dir = std::env::temp_dir().join(format!(
+            "uc-kms-admin-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let node = Arc::new(Node::open(
+            "kms-admin-node",
+            &dir,
+            2,
+            EncryptionTier::T3,
+            7,
+            ShardTopology::Dedicated,
+            CuratorConfig::default(),
+            256,
+        )
+        .unwrap());
+        provision_fresh(&node).unwrap();
+
+        let status = admin_dispatch(
+            &node,
+            &Cbor::map(vec![("verb", Cbor::t("kms status")), ("args", Cbor::Null)]),
+        )
+        .unwrap();
+        assert_eq!(status.opt_str("tier"), Some("T3".to_string()));
+        assert_eq!(status.opt_u64("active_key_id"), Some(1));
+        assert_eq!(status.opt_u64("rotation_interval_ops"), Some(crate::persist::T3_ROTATION_INTERVAL_OPS));
+        assert!(status.opt_str("custody_path").unwrap_or_default().ends_with("keyring.cbor"));
+
+        let rotated = admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("kms rotate")),
+                (
+                    "args",
+                    Cbor::map(vec![("emergency", Cbor::Bool(true))]),
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(rotated.opt_u64("previous_key_id"), Some(1));
+        assert_eq!(rotated.opt_u64("active_key_id"), Some(2));
+        assert_eq!(rotated.opt_bool("emergency"), Some(true));
+        assert_eq!(rotated.opt_bool("audited"), Some(true));
+
+        let audit = admin_dispatch(
+            &node,
+            &Cbor::map(vec![("verb", Cbor::t("audit verify")), ("args", Cbor::Null)]),
+        )
+        .unwrap();
+        assert_eq!(audit.opt_bool("intact"), Some(true));
+        assert_eq!(audit.opt_bool("cross_check_signatures_intact"), Some(true));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contract_migration_admin_flow_requires_decision_and_enforces_deadline() {
+        let report = dry_run().unwrap();
+        let node = report.node;
+        let at = node.now();
+        {
+            let mut t = node.trinity.lock().unwrap();
+            t.contract.register(at, "shape.v1", vec!["subject".into()]);
+            t.contract
+                .register(at + 1, "shape.v2", vec!["subject".into(), "mode".into()]);
+        }
+
+        let missing_decision = admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("contract plan-migration")),
+                (
+                    "args",
+                    Cbor::map(vec![
+                        ("schema_id", Cbor::t("shape.v1")),
+                        ("target_schema_id", Cbor::t("shape.v2")),
+                        ("migration_plan_handle", Cbor::t("blob/shape-plan")),
+                        ("decision_handle", Cbor::t("decision/missing")),
+                        ("deprecated_after", Cbor::U64(node.now() + 10)),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(missing_decision.code, ErrCode::NotFound);
+
+        let decision_handle = {
+            let mut t = node.trinity.lock().unwrap();
+            t.decision_ledger.append(
+                node.now(),
+                77,
+                "contract.shape",
+                "shape.v1 migrates to shape.v2",
+                "operator",
+                "NATIVE_TRINITY.md§10.1",
+            )
+        };
+
+        let future_deadline = node.now() + 50;
+        let planned = admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("contract plan-migration")),
+                (
+                    "args",
+                    Cbor::map(vec![
+                        ("schema_id", Cbor::t("shape.v1")),
+                        ("target_schema_id", Cbor::t("shape.v2")),
+                        ("migration_plan_handle", Cbor::t("blob/shape-plan")),
+                        ("decision_handle", Cbor::t(decision_handle.clone())),
+                        ("deprecated_after", Cbor::U64(future_deadline)),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(planned.opt_str("target_schema_id"), Some("shape.v2".into()));
+        assert_eq!(
+            planned.opt_str("decision_handle"),
+            Some(decision_handle.clone())
+        );
+
+        let verified = admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("contract verify-migration")),
+                ("args", Cbor::map(vec![("schema_id", Cbor::t("shape.v1"))])),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(verified.opt_str("status"), Some("planned".into()));
+        assert_eq!(verified.opt_u64("deprecated_after"), Some(future_deadline));
+
+        let too_early = admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("contract apply-migration")),
+                ("args", Cbor::map(vec![("schema_id", Cbor::t("shape.v1"))])),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(too_early.code, ErrCode::ContractViolation);
+
+        let mut t = node.trinity.lock().unwrap();
+        t.contract
+            .plan_migration("shape.v2", "shape.v1", "blob/bad", "decision/02", 0)
+            .unwrap_err();
+        drop(t);
+
+        let ready = admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("contract plan-migration")),
+                (
+                    "args",
+                    Cbor::map(vec![
+                        ("schema_id", Cbor::t("shape.v2")),
+                        ("target_schema_id", Cbor::t("shape.v3")),
+                        ("migration_plan_handle", Cbor::t("blob/invalid")),
+                        ("decision_handle", Cbor::t(decision_handle.clone())),
+                        ("deprecated_after", Cbor::U64(0)),
+                    ]),
+                ),
+            ]),
+        );
+        assert!(ready.is_err());
+
+        {
+            let mut t = node.trinity.lock().unwrap();
+            t.contract.register(
+                node.now(),
+                "shape.v3",
+                vec!["subject".into(), "mode".into()],
+            );
+        }
+
+        let decision_handle2 = {
+            let mut t = node.trinity.lock().unwrap();
+            t.decision_ledger.append(
+                node.now(),
+                88,
+                "contract.shape",
+                "shape.v2 migrates to shape.v3",
+                "operator",
+                "NATIVE_TRINITY.md§10.1",
+            )
+        };
+        admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("contract plan-migration")),
+                (
+                    "args",
+                    Cbor::map(vec![
+                        ("schema_id", Cbor::t("shape.v2")),
+                        ("target_schema_id", Cbor::t("shape.v3")),
+                        ("migration_plan_handle", Cbor::t("blob/shape-plan-2")),
+                        ("decision_handle", Cbor::t(decision_handle2)),
+                        ("deprecated_after", Cbor::U64(0)),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+        let applied = admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("contract apply-migration")),
+                ("args", Cbor::map(vec![("schema_id", Cbor::t("shape.v2"))])),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(applied.opt_str("status"), Some("applied".into()));
+        assert!(applied.opt_u64("applied_at").is_some());
+    }
+
+    #[test]
+    fn admin_status_surfaces_gap_policy_defaults() {
+        let report = dry_run().unwrap();
+        let node = report.node;
+
+        let status = admin_dispatch(
+            &node,
+            &Cbor::map(vec![("verb", Cbor::t("status")), ("args", Cbor::Null)]),
+        )
+        .unwrap();
+        assert_eq!(status.opt_u64("shards"), Some(node.shard_count));
+        assert_eq!(
+            status.opt_str("trinity_topology"),
+            Some("dedicated".to_string())
+        );
+        assert_eq!(
+            status.opt_str("curator_topology"),
+            Some("dedicated".to_string())
+        );
+
+        let quarantine = admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("quarantine list")),
+                ("args", Cbor::Null),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            quarantine.opt_u64("resolved_retention_logical"),
+            Some(1_000_000)
+        );
+        assert_eq!(quarantine.opt_bool("pending_never_pruned"), Some(true));
+
+        let curator = admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("curator status")),
+                ("args", Cbor::Null),
+            ]),
+        )
+        .unwrap();
+        let budget_defaults = admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("budget defaults")),
+                ("args", Cbor::Null),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(budget_defaults.opt_u64("default_grant"), Some(100_000));
+        let by_namespace = budget_defaults
+            .get("namespace_defaults")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .map(|item| {
+                (
+                    item.req_str("namespace").unwrap(),
+                    item.opt_u64("grant").unwrap_or(0),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(by_namespace.get("bootstrap").copied(), Some(1_000_000));
+        assert_eq!(by_namespace.get("curator").copied(), Some(10_000_000));
+        assert_eq!(by_namespace.get("admin").copied(), Some(250_000));
+        assert_eq!(
+            curator.get("probe_rate").and_then(|v| v.as_f64()),
+            Some(0.001)
+        );
+        assert_eq!(
+            curator
+                .get("probe_boost_on_suspicious")
+                .and_then(|v| v.as_f64()),
+            Some(PROBE_BOOST_ON_SUSPICIOUS)
+        );
+        assert_eq!(
+            curator.opt_str("kv_budget_profile"),
+            Some("reference".to_string())
+        );
+        assert_eq!(curator.opt_u64("librarian_kv_cache_mib"), Some(384));
+        assert_eq!(curator.opt_u64("warden_kv_cache_mib"), Some(384));
+        assert_eq!(curator.opt_u64("adjudicator_kv_cache_mib"), Some(256));
+        assert_eq!(curator.opt_u64("total_kv_cache_mib"), Some(1_024));
+        assert_eq!(
+            curator.get("blind_reaudit_rate").and_then(|v| v.as_f64()),
+            Some(0.01)
+        );
+        assert_eq!(curator.opt_str("topology"), Some("dedicated".to_string()));
+        assert_eq!(
+            curator.opt_str("cross_check_retention_policy"),
+            Some(CROSS_CHECK_RETENTION_POLICY.to_string())
+        );
+        assert_eq!(
+            curator.opt_u64("calibration_window"),
+            Some(CALIBRATION_WINDOW as u64)
+        );
+        assert_eq!(
+            curator.get("high_band_floor").and_then(|v| v.as_f64()),
+            Some(HIGH_BAND_FLOOR)
+        );
+        assert_eq!(
+            curator.get("medium_band_floor").and_then(|v| v.as_f64()),
+            Some(MEDIUM_BAND_FLOOR)
+        );
+        assert_eq!(curator.opt_bool("degraded"), Some(false));
+
+        let adjudicator = admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("adjudicator stats")),
+                ("args", Cbor::Null),
+            ]),
+        )
+        .unwrap();
+        let subscribers = adjudicator
+            .get("escalation_subscribers")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        assert!(subscribers.contains(&"operator"));
+    }
+
+    #[test]
+    fn topology_overrides_and_cross_check_policy_surface_cleanly() {
+        let mut cfg = Config::default();
+        cfg.data_dir = std::env::temp_dir().join(format!(
+            "ultracortex-topology-{}-{}",
+            std::process::id(),
+            DRY_RUN_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&cfg.data_dir);
+        cfg.uds_path = Some(cfg.data_dir.join("ultracortex.sock"));
+        cfg.trinity_topology = ShardTopology::CoTenantShard0;
+        cfg.curator.topology = ShardTopology::CoTenantShard0;
+        cfg.curator.kv_budget_profile = CuratorKvBudgetProfile::Small;
+
+        let report = boot(&cfg).unwrap();
+        let node = report.node;
+
+        let status = admin_dispatch(
+            &node,
+            &Cbor::map(vec![("verb", Cbor::t("status")), ("args", Cbor::Null)]),
+        )
+        .unwrap();
+        assert_eq!(
+            status.opt_str("trinity_topology"),
+            Some("co-tenant-shard-0".to_string())
+        );
+        assert_eq!(
+            status.opt_str("curator_topology"),
+            Some("co-tenant-shard-0".to_string())
+        );
+
+        let curator = admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("curator status")),
+                ("args", Cbor::Null),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            curator.opt_str("topology"),
+            Some("co-tenant-shard-0".to_string())
+        );
+        assert_eq!(
+            curator.opt_str("kv_budget_profile"),
+            Some("small".to_string())
+        );
+        assert_eq!(curator.opt_u64("librarian_kv_cache_mib"), Some(256));
+        assert_eq!(curator.opt_u64("warden_kv_cache_mib"), Some(256));
+        assert_eq!(curator.opt_u64("adjudicator_kv_cache_mib"), Some(128));
+        assert_eq!(curator.opt_u64("total_kv_cache_mib"), Some(640));
+        assert_eq!(
+            curator.opt_str("cross_check_retention_policy"),
+            Some(CROSS_CHECK_RETENTION_POLICY.to_string())
+        );
+
+        let tail = admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("cross-check tail")),
+                ("args", Cbor::Null),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            tail.opt_str("retention_policy"),
+            Some(CROSS_CHECK_RETENTION_POLICY.to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&cfg.data_dir);
+    }
+
+    #[test]
+    fn curator_kv_budget_profile_rejects_unknown_values() {
+        let mut cfg = Config::default();
+        apply_kv(&mut cfg, "curator.kv_budget_profile", "heavy").unwrap();
+        assert_eq!(
+            cfg.curator.kv_budget_profile.as_str(),
+            CuratorKvBudgetProfile::Heavy.as_str()
+        );
+        assert!(apply_kv(&mut cfg, "curator.kv_budget_profile", "gigantic").is_err());
+
+        let good = minitoml::parse("[curator]\nkv_budget_profile = \"small\"\n").unwrap();
+        cfg.apply_toml(&good).unwrap();
+        assert_eq!(
+            cfg.curator.kv_budget_profile.as_str(),
+            CuratorKvBudgetProfile::Small.as_str()
+        );
+
+        let bad = minitoml::parse("[curator]\nkv_budget_profile = \"tiny\"\n").unwrap();
+        assert!(cfg.apply_toml(&bad).is_err());
+    }
+
+    #[test]
+    fn tcp_listener_policy_rejects_non_loopback_config() {
+        let mut cfg = Config::default();
+        apply_kv(&mut cfg, "listen.tcp", "127.0.0.1:7741").unwrap();
+        assert_eq!(cfg.tcp_addr, Some("127.0.0.1:7741".to_string()));
+        assert!(apply_kv(&mut cfg, "listen.tcp", "0.0.0.0:7741").is_err());
+
+        let good = minitoml::parse("[listen]\ntcp = \"[::1]:7741\"\n").unwrap();
+        cfg.apply_toml(&good).unwrap();
+        assert_eq!(cfg.tcp_addr, Some("[::1]:7741".to_string()));
+
+        let bad = minitoml::parse("[listen]\ntcp = \"192.168.1.25:7741\"\n").unwrap();
+        assert!(cfg.apply_toml(&bad).is_err());
+    }
+
+    #[test]
+    fn congruence_admin_workflow_accepts_delta_and_unblocks_write() {
+        let report = dry_run().unwrap();
+        let node = report.node;
+        let token = issue_agent_token(&*node.signer, "congruence-agent", 0);
+        node.cells
+            .agent_registry
+            .lock()
+            .unwrap()
+            .register(node.now(), "congruence-agent", "agent");
+
+        let delta_payload = Cbor::map(vec![(
+            "note",
+            Cbor::t("introduce the TelepathyCell per GAP-999 and P42"),
+        )]);
+        let preview = admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("congruence preview")),
+                ("args", Cbor::map(vec![("payload", delta_payload.clone())])),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(preview.opt_bool("delta"), Some(true));
+        let detail = preview.opt_str("detail").unwrap_or_default();
+        assert!(detail.contains("TelepathyCell"));
+        assert!(detail.contains("GAP-999"));
+        assert!(detail.contains("P42"));
+
+        let write = selftest_env(
+            &node,
+            &token,
+            Intent::Write,
+            Cbor::map(vec![
+                ("subject", Cbor::t("congruence")),
+                ("predicate", Cbor::t("status")),
+                (
+                    "object",
+                    Cbor::t("introduce the TelepathyCell per GAP-999 and P42"),
+                ),
+            ]),
+            Some("Architecture.md\u{00a7}4"),
+            "task-congruence",
+            777,
+            false,
+        );
+        let blocked = handle_envelope(&node, &write);
+        assert!(!blocked.ok);
+        assert_eq!(blocked.err_code, Some(ErrCode::CongruenceDelta));
+
+        let accepted = admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("congruence accept")),
+                (
+                    "args",
+                    Cbor::map(vec![(
+                        "entities",
+                        Cbor::text_array(&[
+                            "TelepathyCell".to_string(),
+                            "GAP-999".to_string(),
+                            "P42".to_string(),
+                        ]),
+                    )]),
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(accepted.opt_u64("accepted_deltas"), Some(3));
+
+        let audit = admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("congruence audit")),
+                ("args", Cbor::Null),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(audit.opt_u64("accepted_deltas"), Some(3));
+
+        let preview_after = admin_dispatch(
+            &node,
+            &Cbor::map(vec![
+                ("verb", Cbor::t("congruence preview")),
+                ("args", Cbor::map(vec![("payload", delta_payload)])),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(preview_after.opt_bool("delta"), Some(false));
+
+        let allowed = handle_envelope(&node, &write);
+        assert!(allowed.ok);
+        assert!(allowed
+            .result
+            .opt_str("handle")
+            .unwrap_or_default()
+            .starts_with("fact/"));
+    }
+
+    #[test]
+    fn curator_spawn_severity_survives_into_trinity_quarantine() {
+        let report = dry_run().unwrap();
+        let node = report.node;
+
+        {
+            let mut t = node.trinity.lock().unwrap();
+            t.contract.deprecate("curator.librarian.output.v1").unwrap();
+        }
+
+        let token = issue_agent_token(&*node.signer, "severity-agent", 0);
+        node.cells
+            .agent_registry
+            .lock()
+            .unwrap()
+            .register(node.now(), "severity-agent", "agent");
+
+        let before: BTreeSet<String> = node
+            .trinity
+            .lock()
+            .unwrap()
+            .quarantine
+            .list()
+            .iter()
+            .map(|q| q.qid.clone())
+            .collect();
+
+        for (seed, severity) in [
+            (901_u64, Severity::P0),
+            (902, Severity::P1),
+            (903, Severity::P2),
+        ] {
+            let env = Envelope {
+                proto_version: PROTO_VERSION,
+                request_id: Ulid::from_parts(node.now(), &mut DetRng::new(seed ^ 0xC0)),
+                agent_id: token.agent_id.clone(),
+                capability: token.clone(),
+                work_budget: WorkBudget {
+                    task_id: format!("severity-{seed}"),
+                    units: 10_000,
+                },
+                intent: Intent::Write,
+                payload: Cbor::map(vec![
+                    ("subject", Cbor::t(format!("sev-{seed}"))),
+                    ("predicate", Cbor::t("status")),
+                    ("object", Cbor::t("trip curator contract failure")),
+                ]),
+                spec_anchor: Some("Architecture.md\u{00a7}4".into()),
+                severity,
+                gap_ref: None,
+                tier: Tier::L2,
+                seed,
+                flags: EnvelopeFlags {
+                    semantic_check: false,
+                    continuation: false,
+                },
+            };
+            let resp = handle_envelope(&node, &env);
+            assert!(
+                resp.ok,
+                "writer envelope should still succeed for {severity:?}"
+            );
+        }
+
+        let after = node.trinity.lock().unwrap();
+        let severities: BTreeSet<String> = after
+            .quarantine
+            .list()
+            .iter()
+            .filter(|q| !before.contains(&q.qid))
+            .filter(|q| {
+                q.payload.opt_str("schema_id").as_deref() == Some("curator.librarian.output.v1")
+            })
+            .filter_map(|q| q.payload.opt_str("severity"))
+            .collect();
+        assert_eq!(
+            severities,
+            BTreeSet::from(["P0".to_string(), "P1".to_string(), "P2".to_string(),])
+        );
     }
 }

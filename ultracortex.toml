@@ -36,6 +36,9 @@ disagreement_quota_high = 0.97
 probe_rate = 0.001
 # Fraction of passed audits re-run blind with permuted evidence order.
 blind_reaudit_rate = 0.01
+# Supported KV-cache planning profile. `reference` is the v1.0 default
+# (Librarian 384 MiB, Warden 384 MiB, Adjudicator 256 MiB).
+kv_budget_profile = "reference"
 # Rotating adjudication pool (judge = pool[envelope.seed % len]).
 pool = "phi-3.5-mini, llama-3.2-3b, smollm2-1.7b"
 # External llama.cpp-style CLI for GGUF-backed curators. Empty = the

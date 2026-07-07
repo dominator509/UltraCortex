@@ -24,6 +24,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Anti-fixation dispatch limit (NATIVE_TRINITY.md §9.2).
 pub const GAP_FIXATION_N: u64 = 8;
+const APPEND_SEQ_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
+fn sequenced_ulid(at: u64, seed: u64, domain: u64, seq: u64) -> Ulid {
+    let mixed = seed ^ at ^ domain ^ seq.wrapping_mul(APPEND_SEQ_MIX);
+    Ulid::from_parts(at, &mut DetRng::new(mixed))
+}
 
 // ---------------------------------------------------------------------------
 // ContractCell (§10)
@@ -37,6 +43,16 @@ pub struct Contract {
     pub registered_at: u64,
     /// Pinned curator weights: model -> sha256 hex (PersistenceLayer.md §7).
     pub pinned_weights: BTreeMap<String, String>,
+    /// Successor schema for a planned/applied breaking upgrade.
+    pub superseded_by: Option<String>,
+    /// Opaque handle describing the operator-authored migration steps.
+    pub migration_plan_handle: Option<String>,
+    /// DecisionLedger handle authorizing the migration.
+    pub decision_handle: Option<String>,
+    /// Logical time after which the old schema may be deprecated.
+    pub deprecated_after: Option<u64>,
+    /// Logical time when the old schema was actually deprecated.
+    pub migration_applied_at: Option<u64>,
 }
 
 pub struct ContractCell {
@@ -61,8 +77,37 @@ impl ContractCell {
                 deprecated: false,
                 registered_at: at,
                 pinned_weights: BTreeMap::new(),
+                superseded_by: None,
+                migration_plan_handle: None,
+                decision_handle: None,
+                deprecated_after: None,
+                migration_applied_at: None,
             },
         );
+    }
+
+    fn parse_version(schema_id: &str) -> Option<u64> {
+        let (_, raw) = schema_id.rsplit_once(".v")?;
+        raw.parse().ok()
+    }
+
+    fn ensure_upgrade(source_schema_id: &str, target_schema_id: &str) -> UcResult<()> {
+        if source_schema_id == target_schema_id {
+            return Err(UcError::schema(format!(
+                "migration target `{target_schema_id}` must differ from source"
+            )));
+        }
+        if let (Some(from), Some(to)) = (
+            Self::parse_version(source_schema_id),
+            Self::parse_version(target_schema_id),
+        ) {
+            if to <= from {
+                return Err(UcError::schema(format!(
+                    "migration target `{target_schema_id}` is not newer than `{source_schema_id}`"
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn pin_weights(&mut self, schema_id: &str, model: &str, sha_hex: &str) -> UcResult<()> {
@@ -86,6 +131,140 @@ impl ContractCell {
             .ok_or_else(|| UcError::not_found(format!("contract {schema_id}")))?;
         c.deprecated = true;
         Ok(())
+    }
+
+    pub fn plan_migration(
+        &mut self,
+        source_schema_id: &str,
+        target_schema_id: &str,
+        migration_plan_handle: &str,
+        decision_handle: &str,
+        deprecated_after: u64,
+    ) -> UcResult<()> {
+        if migration_plan_handle.trim().is_empty() {
+            return Err(UcError::schema("migration_plan_handle is required"));
+        }
+        if decision_handle.trim().is_empty() {
+            return Err(UcError::schema("decision_handle is required"));
+        }
+        Self::ensure_upgrade(source_schema_id, target_schema_id)?;
+        let target_deprecated = self
+            .contracts
+            .get(target_schema_id)
+            .ok_or_else(|| UcError::not_found(format!("contract {target_schema_id}")))?
+            .deprecated;
+        if target_deprecated {
+            return Err(UcError::schema(format!(
+                "migration target `{target_schema_id}` is deprecated"
+            )));
+        }
+        let source = self
+            .contracts
+            .get_mut(source_schema_id)
+            .ok_or_else(|| UcError::not_found(format!("contract {source_schema_id}")))?;
+        if source.deprecated {
+            return Err(UcError::schema(format!(
+                "source contract `{source_schema_id}` is already deprecated"
+            )));
+        }
+        if source.superseded_by.is_some() {
+            return Err(UcError::schema(format!(
+                "source contract `{source_schema_id}` already has a migration plan"
+            )));
+        }
+        source.superseded_by = Some(target_schema_id.to_string());
+        source.migration_plan_handle = Some(migration_plan_handle.to_string());
+        source.decision_handle = Some(decision_handle.to_string());
+        source.deprecated_after = Some(deprecated_after);
+        source.migration_applied_at = None;
+        Ok(())
+    }
+
+    pub fn apply_migration(&mut self, at: u64, source_schema_id: &str) -> UcResult<()> {
+        let source = self
+            .contracts
+            .get_mut(source_schema_id)
+            .ok_or_else(|| UcError::not_found(format!("contract {source_schema_id}")))?;
+        if source.deprecated {
+            return Err(UcError::schema(format!(
+                "source contract `{source_schema_id}` is already deprecated"
+            )));
+        }
+        if source.superseded_by.is_none()
+            || source.migration_plan_handle.is_none()
+            || source.decision_handle.is_none()
+        {
+            return Err(UcError::schema(format!(
+                "source contract `{source_schema_id}` has no planned migration"
+            )));
+        }
+        let deprecated_after = source
+            .deprecated_after
+            .ok_or_else(|| UcError::schema("planned migration is missing deprecated_after"))?;
+        if at < deprecated_after {
+            return Err(UcError::schema(format!(
+                "migration for `{source_schema_id}` cannot apply before logical {deprecated_after}"
+            )));
+        }
+        source.deprecated = true;
+        source.migration_applied_at = Some(at);
+        Ok(())
+    }
+
+    pub fn migration_status(&self, source_schema_id: &str) -> UcResult<Cbor> {
+        let source = self
+            .contracts
+            .get(source_schema_id)
+            .ok_or_else(|| UcError::not_found(format!("contract {source_schema_id}")))?;
+        let target = source
+            .superseded_by
+            .clone()
+            .ok_or_else(|| UcError::schema(format!(
+                "contract `{source_schema_id}` has no planned migration"
+            )))?;
+        Ok(Cbor::map(vec![
+            ("schema_id", Cbor::t(source.schema_id.clone())),
+            ("target_schema_id", Cbor::t(target)),
+            (
+                "migration_plan_handle",
+                source
+                    .migration_plan_handle
+                    .as_ref()
+                    .map(|s| Cbor::t(s.clone()))
+                    .unwrap_or(Cbor::Null),
+            ),
+            (
+                "decision_handle",
+                source
+                    .decision_handle
+                    .as_ref()
+                    .map(|s| Cbor::t(s.clone()))
+                    .unwrap_or(Cbor::Null),
+            ),
+            (
+                "deprecated_after",
+                source
+                    .deprecated_after
+                    .map(Cbor::U64)
+                    .unwrap_or(Cbor::Null),
+            ),
+            (
+                "applied_at",
+                source
+                    .migration_applied_at
+                    .map(Cbor::U64)
+                    .unwrap_or(Cbor::Null),
+            ),
+            ("deprecated", Cbor::Bool(source.deprecated)),
+            (
+                "status",
+                Cbor::t(if source.deprecated {
+                    "applied"
+                } else {
+                    "planned"
+                }),
+            ),
+        ]))
     }
 
     /// Chain step 1. Contracts are opt-in per schema: if none is registered
@@ -140,6 +319,37 @@ impl CellBehavior for ContractCell {
                             ("required_fields", Cbor::text_array(&c.required_fields)),
                             ("deprecated", Cbor::Bool(c.deprecated)),
                             (
+                                "superseded_by",
+                                c.superseded_by
+                                    .as_ref()
+                                    .map(|s| Cbor::t(s.clone()))
+                                    .unwrap_or(Cbor::Null),
+                            ),
+                            (
+                                "migration_plan_handle",
+                                c.migration_plan_handle
+                                    .as_ref()
+                                    .map(|s| Cbor::t(s.clone()))
+                                    .unwrap_or(Cbor::Null),
+                            ),
+                            (
+                                "decision_handle",
+                                c.decision_handle
+                                    .as_ref()
+                                    .map(|s| Cbor::t(s.clone()))
+                                    .unwrap_or(Cbor::Null),
+                            ),
+                            (
+                                "deprecated_after",
+                                c.deprecated_after.map(Cbor::U64).unwrap_or(Cbor::Null),
+                            ),
+                            (
+                                "migration_applied_at",
+                                c.migration_applied_at
+                                    .map(Cbor::U64)
+                                    .unwrap_or(Cbor::Null),
+                            ),
+                            (
                                 "pinned_weights",
                                 Cbor::map(
                                     c.pinned_weights
@@ -160,6 +370,10 @@ impl CellBehavior for ContractCell {
                     .ok_or_else(|| UcError::schema("contract validate: missing payload"))?;
                 self.validate_schema(&sid, payload)?;
                 Ok(Cbor::map(vec![("valid", Cbor::Bool(true))]))
+            }
+            Some("verify_migration") => {
+                let sid = query.req_str("schema_id")?;
+                self.migration_status(&sid)
             }
             _ => Err(UcError::schema("contract: unknown op")),
         }
@@ -182,6 +396,28 @@ impl CellBehavior for ContractCell {
                 self.deprecate(&sid)?;
                 Ok(Cbor::map(vec![("deprecated", Cbor::t(sid))]))
             }
+            Some("plan_migration") => {
+                let source_schema_id = update.req_str("schema_id")?;
+                let target_schema_id = update.req_str("target_schema_id")?;
+                let migration_plan_handle = update.req_str("migration_plan_handle")?;
+                let decision_handle = update.req_str("decision_handle")?;
+                let deprecated_after = update
+                    .opt_u64("deprecated_after")
+                    .ok_or_else(|| UcError::schema("plan_migration: missing deprecated_after"))?;
+                self.plan_migration(
+                    &source_schema_id,
+                    &target_schema_id,
+                    &migration_plan_handle,
+                    &decision_handle,
+                    deprecated_after,
+                )?;
+                self.migration_status(&source_schema_id)
+            }
+            Some("apply_migration") => {
+                let source_schema_id = update.req_str("schema_id")?;
+                self.apply_migration(at, &source_schema_id)?;
+                self.migration_status(&source_schema_id)
+            }
             Some("pin_weights") => {
                 let sid = update.req_str("schema_id")?;
                 let model = update.req_str("model")?;
@@ -203,6 +439,35 @@ impl CellBehavior for ContractCell {
                     ("required_fields", Cbor::text_array(&c.required_fields)),
                     ("deprecated", Cbor::Bool(c.deprecated)),
                     ("registered_at", Cbor::U64(c.registered_at)),
+                    (
+                        "superseded_by",
+                        c.superseded_by
+                            .as_ref()
+                            .map(|s| Cbor::t(s.clone()))
+                            .unwrap_or(Cbor::Null),
+                    ),
+                    (
+                        "migration_plan_handle",
+                        c.migration_plan_handle
+                            .as_ref()
+                            .map(|s| Cbor::t(s.clone()))
+                            .unwrap_or(Cbor::Null),
+                    ),
+                    (
+                        "decision_handle",
+                        c.decision_handle
+                            .as_ref()
+                            .map(|s| Cbor::t(s.clone()))
+                            .unwrap_or(Cbor::Null),
+                    ),
+                    (
+                        "deprecated_after",
+                        c.deprecated_after.map(Cbor::U64).unwrap_or(Cbor::Null),
+                    ),
+                    (
+                        "migration_applied_at",
+                        c.migration_applied_at.map(Cbor::U64).unwrap_or(Cbor::Null),
+                    ),
                     (
                         "pinned_weights",
                         Cbor::map(
@@ -242,6 +507,11 @@ impl CellBehavior for ContractCell {
                     deprecated: item.opt_bool("deprecated").unwrap_or(false),
                     registered_at: item.opt_u64("registered_at").unwrap_or(0),
                     pinned_weights: pinned,
+                    superseded_by: item.opt_str("superseded_by"),
+                    migration_plan_handle: item.opt_str("migration_plan_handle"),
+                    decision_handle: item.opt_str("decision_handle"),
+                    deprecated_after: item.opt_u64("deprecated_after"),
+                    migration_applied_at: item.opt_u64("migration_applied_at"),
                 };
                 self.contracts.insert(c.schema_id.clone(), c);
             }
@@ -415,14 +685,18 @@ pub struct DecisionLedgerCell {
     pub id: CellId,
     decisions: BTreeMap<String, Decision>,
     by_scope: BTreeMap<String, Vec<String>>,
+    next_seq: u64,
 }
 
 impl DecisionLedgerCell {
+    const WILDCARD_SCOPE: &'static str = "*";
+
     pub fn new(id: CellId) -> Self {
         DecisionLedgerCell {
             id,
             decisions: BTreeMap::new(),
             by_scope: BTreeMap::new(),
+            next_seq: 0,
         }
     }
 
@@ -435,9 +709,11 @@ impl DecisionLedgerCell {
         decided_by: &str,
         anchor: &str,
     ) -> String {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
         let handle = format!(
             "decision/{}",
-            Ulid::from_parts(at, &mut DetRng::new(seed ^ at ^ 0xD0))
+            sequenced_ulid(at, seed, 0xD0, seq)
         );
         let d = Decision {
             handle: handle.clone(),
@@ -456,7 +732,7 @@ impl DecisionLedgerCell {
         handle
     }
 
-    pub fn active_in_scope(&self, scope: &str) -> Vec<&Decision> {
+    fn active_exact_in_scope(&self, scope: &str) -> Vec<&Decision> {
         self.by_scope
             .get(scope)
             .map(|hs| {
@@ -466,6 +742,14 @@ impl DecisionLedgerCell {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub fn active_in_scope(&self, scope: &str) -> Vec<&Decision> {
+        let exact = self.active_exact_in_scope(scope);
+        if scope == Self::WILDCARD_SCOPE || !exact.is_empty() {
+            return exact;
+        }
+        self.active_exact_in_scope(Self::WILDCARD_SCOPE)
     }
 
     pub fn get(&self, handle: &str) -> Option<&Decision> {
@@ -589,7 +873,10 @@ impl CellBehavior for DecisionLedgerCell {
 
     fn snapshot_state(&self) -> Cbor {
         let items: Vec<Cbor> = self.decisions.values().map(decision_to_cbor).collect();
-        Cbor::map(vec![("decisions", Cbor::Array(items))])
+        Cbor::map(vec![
+            ("decisions", Cbor::Array(items)),
+            ("next_seq", Cbor::U64(self.next_seq)),
+        ])
     }
 
     fn restore_state(&mut self, state: &Cbor) -> UcResult<()> {
@@ -613,6 +900,10 @@ impl CellBehavior for DecisionLedgerCell {
                 self.decisions.insert(d.handle.clone(), d);
             }
         }
+        self.next_seq = state
+            .opt_u64("next_seq")
+            .unwrap_or(self.decisions.len() as u64)
+            .max(self.decisions.len() as u64);
         Ok(())
     }
 }
@@ -654,23 +945,49 @@ pub struct WorkBudgetCell {
     pub id: CellId,
     budgets: BTreeMap<String, Budget>,
     pub default_grant: u64,
+    namespace_defaults: BTreeMap<String, u64>,
 }
 
 impl WorkBudgetCell {
     pub fn new(id: CellId) -> Self {
+        let namespace_defaults = BTreeMap::from([
+            ("admin".to_string(), 250_000_u64),
+            ("bootstrap".to_string(), 1_000_000_u64),
+            ("curator".to_string(), 10_000_000_u64),
+        ]);
         WorkBudgetCell {
             id,
             budgets: BTreeMap::new(),
             default_grant: 100_000,
+            namespace_defaults,
         }
     }
 
+    pub fn task_namespace(task_id: &str) -> &str {
+        task_id
+            .split(|c: char| matches!(c, '.' | ':' | '/' | '-'))
+            .next()
+            .unwrap_or(task_id)
+    }
+
+    pub fn default_for_task(&self, task_id: &str) -> u64 {
+        self.namespace_defaults
+            .get(Self::task_namespace(task_id))
+            .copied()
+            .unwrap_or(self.default_grant)
+    }
+
+    pub fn namespace_defaults(&self) -> &BTreeMap<String, u64> {
+        &self.namespace_defaults
+    }
+
     pub fn ensure(&mut self, task_id: &str, grant: Option<u64>) -> &Budget {
+        let resolved_grant = grant.unwrap_or_else(|| self.default_for_task(task_id));
         self.budgets
             .entry(task_id.to_string())
             .or_insert_with(|| Budget {
                 task_id: task_id.to_string(),
-                granted: grant.unwrap_or(self.default_grant),
+                granted: resolved_grant,
                 reserved: 0,
                 spent: 0,
             })
@@ -731,11 +1048,28 @@ impl CellBehavior for WorkBudgetCell {
     }
 
     fn on_query(&self, _at: u64, query: &Cbor) -> UcResult<Cbor> {
+        if query.opt_str("op").as_deref() == Some("defaults") {
+            let items: Vec<Cbor> = self
+                .namespace_defaults
+                .iter()
+                .map(|(namespace, grant)| {
+                    Cbor::map(vec![
+                        ("namespace", Cbor::t(namespace.clone())),
+                        ("grant", Cbor::U64(*grant)),
+                    ])
+                })
+                .collect();
+            return Ok(Cbor::map(vec![
+                ("default_grant", Cbor::U64(self.default_grant)),
+                ("namespace_defaults", Cbor::Array(items)),
+            ]));
+        }
         let task = query.req_str("task_id")?;
         self.get(&task)
             .map(|b| {
                 Cbor::map(vec![
                     ("task_id", Cbor::t(b.task_id.clone())),
+                    ("namespace", Cbor::t(Self::task_namespace(&b.task_id))),
                     ("granted", Cbor::U64(b.granted)),
                     ("reserved", Cbor::U64(b.reserved)),
                     ("spent", Cbor::U64(b.spent)),
@@ -771,12 +1105,27 @@ impl CellBehavior for WorkBudgetCell {
         Cbor::map(vec![
             ("budgets", Cbor::Array(items)),
             ("default_grant", Cbor::U64(self.default_grant)),
+            (
+                "namespace_defaults",
+                Cbor::Array(
+                    self.namespace_defaults
+                        .iter()
+                        .map(|(namespace, grant)| {
+                            Cbor::map(vec![
+                                ("namespace", Cbor::t(namespace.clone())),
+                                ("grant", Cbor::U64(*grant)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
         ])
     }
 
     fn restore_state(&mut self, state: &Cbor) -> UcResult<()> {
         self.budgets.clear();
         self.default_grant = state.opt_u64("default_grant").unwrap_or(100_000);
+        self.namespace_defaults = Self::new(self.id).namespace_defaults;
         if let Some(arr) = state.get("budgets").and_then(|v| v.as_array()) {
             for item in arr {
                 let b = Budget {
@@ -786,6 +1135,15 @@ impl CellBehavior for WorkBudgetCell {
                     spent: item.opt_u64("spent").unwrap_or(0),
                 };
                 self.budgets.insert(b.task_id.clone(), b);
+            }
+        }
+        if let Some(arr) = state.get("namespace_defaults").and_then(|v| v.as_array()) {
+            self.namespace_defaults.clear();
+            for item in arr {
+                self.namespace_defaults.insert(
+                    item.req_str("namespace")?,
+                    item.opt_u64("grant").unwrap_or(self.default_grant),
+                );
             }
         }
         Ok(())
@@ -889,6 +1247,9 @@ impl CongruenceCell {
     }
     pub fn accepted_count(&self) -> usize {
         self.accepted.len()
+    }
+    pub fn accepted_entities(&self) -> Vec<String> {
+        self.accepted.iter().cloned().collect()
     }
 }
 
@@ -1242,6 +1603,7 @@ pub struct QuarantineCell {
     /// Resolved items older than this many logical ticks are pruned;
     /// PENDING items are NEVER dropped (no-silent-drop invariant, §11.2).
     pub resolved_retention: u64,
+    next_seq: u64,
 }
 
 impl QuarantineCell {
@@ -1250,6 +1612,7 @@ impl QuarantineCell {
             id,
             items: BTreeMap::new(),
             resolved_retention: 1_000_000,
+            next_seq: 0,
         }
     }
 
@@ -1263,9 +1626,11 @@ impl QuarantineCell {
         detail: &str,
         payload: Cbor,
     ) -> String {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
         let qid = format!(
             "quarantine/{}",
-            Ulid::from_parts(at, &mut DetRng::new(seed ^ at ^ 0x0A))
+            sequenced_ulid(at, seed, 0x0A, seq)
         );
         self.items.insert(
             qid.clone(),
@@ -1418,6 +1783,7 @@ impl CellBehavior for QuarantineCell {
         Cbor::map(vec![
             ("items", Cbor::Array(items)),
             ("resolved_retention", Cbor::U64(self.resolved_retention)),
+            ("next_seq", Cbor::U64(self.next_seq)),
         ])
     }
 
@@ -1447,6 +1813,10 @@ impl CellBehavior for QuarantineCell {
                 self.items.insert(q.qid.clone(), q);
             }
         }
+        self.next_seq = state
+            .opt_u64("next_seq")
+            .unwrap_or(self.items.len() as u64)
+            .max(self.items.len() as u64);
         Ok(())
     }
 }
@@ -1472,6 +1842,41 @@ mod tests {
         assert!(cc.validate_schema("never.registered", &missing).is_ok());
         cc.deprecate("fact.v1").unwrap();
         assert!(cc.validate_schema("fact.v1", &ok).is_err());
+    }
+
+    #[test]
+    fn contract_migration_plan_apply_and_downgrade_rejection() {
+        let mut cc = ContractCell::new(CellId(20));
+        cc.register(1, "shape.v1", vec!["subject".into()]);
+        cc.register(2, "shape.v2", vec!["subject".into(), "mode".into()]);
+
+        cc.plan_migration("shape.v1", "shape.v2", "blob/plan-01", "decision/01", 5)
+            .unwrap();
+        let planned = cc.migration_status("shape.v1").unwrap();
+        assert_eq!(planned.opt_str("target_schema_id"), Some("shape.v2".into()));
+        assert_eq!(planned.opt_str("migration_plan_handle"), Some("blob/plan-01".into()));
+        assert_eq!(planned.opt_str("decision_handle"), Some("decision/01".into()));
+        assert_eq!(planned.opt_u64("deprecated_after"), Some(5));
+        assert_eq!(planned.opt_str("status"), Some("planned".into()));
+
+        let too_early = cc.apply_migration(4, "shape.v1").unwrap_err();
+        assert_eq!(too_early.code, ErrCode::ContractViolation);
+
+        cc.apply_migration(5, "shape.v1").unwrap();
+        let applied = cc.migration_status("shape.v1").unwrap();
+        assert_eq!(applied.opt_str("status"), Some("applied".into()));
+        assert_eq!(applied.opt_u64("applied_at"), Some(5));
+
+        let v1_payload = Cbor::map(vec![("subject", Cbor::t("s"))]);
+        assert_eq!(
+            cc.validate_schema("shape.v1", &v1_payload).unwrap_err().code,
+            ErrCode::ContractViolation
+        );
+
+        let bad = cc
+            .plan_migration("shape.v2", "shape.v1", "blob/plan-02", "decision/02", 9)
+            .unwrap_err();
+        assert_eq!(bad.code, ErrCode::ContractViolation);
     }
 
     #[test]
@@ -1501,6 +1906,11 @@ mod tests {
             SpecAnchorCell::parse_anchor("Doc.md#3").unwrap(),
             AnchorRef::new("Doc.md", "3")
         );
+        // Section scope is the ratified identity; line-like fragments do not
+        // resolve unless explicitly registered as their own section.
+        let line_like = SpecAnchorCell::parse_anchor("Architecture.md#4:17").unwrap();
+        assert_eq!(line_like, AnchorRef::new("Architecture.md", "4:17"));
+        assert!(!sa.resolves(&line_like));
     }
 
     #[test]
@@ -1523,13 +1933,70 @@ mod tests {
         ]);
         assert!(dl.check_conflicts(&respects).is_ok());
         // Explicit supersede passes and then flips governance.
-        let d2 = dl.append(5, 9, "embedder.dim", "dim is 1536", "operator", "EmbeddingReranker.md§2");
+        let d2 = dl.append(1, 9, "embedder.dim", "dim is 1536", "operator", "EmbeddingReranker.md§2");
+        assert_ne!(d1, d2);
         dl.supersede(&d1, &d2).unwrap();
         let active = dl.active_in_scope("embedder.dim");
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].handle, d2);
         // Scope-free payloads pass.
         assert!(dl.check_conflicts(&Cbor::map(vec![("x", Cbor::U64(1))])).is_ok());
+    }
+
+    #[test]
+    fn wildcard_decisions_govern_until_shadowed() {
+        let mut dl = DecisionLedgerCell::new(CellId(22));
+        let global = dl.append(
+            1,
+            11,
+            "*",
+            "all embedder settings require operator sign-off",
+            "operator",
+            "Architecture.md§7",
+        );
+        let bare = Cbor::map(vec![
+            ("decision_scope", Cbor::t("embedder.metric")),
+            ("proposal", Cbor::t("switch to cosine")),
+        ]);
+        assert_eq!(
+            dl.check_conflicts(&bare).unwrap_err().code,
+            ErrCode::DecisionConflict
+        );
+        let respects_global = Cbor::map(vec![
+            ("decision_scope", Cbor::t("embedder.metric")),
+            ("respects_decision", Cbor::t(global.clone())),
+        ]);
+        assert!(dl.check_conflicts(&respects_global).is_ok());
+
+        let exact = dl.append(
+            2,
+            12,
+            "embedder.metric",
+            "metric is cosine",
+            "operator",
+            "EmbeddingReranker.md§2",
+        );
+        let exact_active = dl.active_in_scope("embedder.metric");
+        assert_eq!(exact_active.len(), 1);
+        assert_eq!(exact_active[0].handle, exact);
+
+        let wildcard_only_scope = dl.active_in_scope("retrieval.depth");
+        assert_eq!(wildcard_only_scope.len(), 1);
+        assert_eq!(wildcard_only_scope[0].handle, global.clone());
+
+        let stale_global_reference = Cbor::map(vec![
+            ("decision_scope", Cbor::t("embedder.metric")),
+            ("respects_decision", Cbor::t(global)),
+        ]);
+        assert_eq!(
+            dl.check_conflicts(&stale_global_reference).unwrap_err().code,
+            ErrCode::DecisionConflict
+        );
+        let respects_exact = Cbor::map(vec![
+            ("decision_scope", Cbor::t("embedder.metric")),
+            ("respects_decision", Cbor::t(exact)),
+        ]);
+        assert!(dl.check_conflicts(&respects_exact).is_ok());
     }
 
     #[test]
@@ -1554,6 +2021,39 @@ mod tests {
             wb.charge_pre("task-zero", 1).unwrap_err().code,
             ErrCode::BudgetExceeded
         );
+    }
+
+    #[test]
+    fn namespace_defaults_apply_and_roundtrip() {
+        let mut wb = WorkBudgetCell::new(CellId(23));
+        assert_eq!(wb.default_for_task("task-plain"), 100_000);
+        assert_eq!(wb.default_for_task("bootstrap.selftest"), 1_000_000);
+        assert_eq!(wb.default_for_task("curator.librarian"), 10_000_000);
+        assert_eq!(wb.default_for_task("admin.reinject"), 250_000);
+
+        assert_eq!(
+            wb.ensure("bootstrap.selftest", None).granted,
+            1_000_000
+        );
+        assert_eq!(
+            wb.ensure("curator.librarian", None).granted,
+            10_000_000
+        );
+        assert_eq!(wb.ensure("task-plain", None).granted, 100_000);
+
+        let snap = wb.snapshot_state();
+        let mut restored = WorkBudgetCell::new(CellId(23));
+        restored.restore_state(&snap).unwrap();
+        assert_eq!(
+            restored.namespace_defaults().get("bootstrap").copied(),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            restored.namespace_defaults().get("curator").copied(),
+            Some(10_000_000)
+        );
+        assert_eq!(restored.get("bootstrap.selftest").unwrap().granted, 1_000_000);
+        assert_eq!(restored.get("curator.librarian").unwrap().granted, 10_000_000);
     }
 
     #[test]
@@ -1609,7 +2109,8 @@ mod tests {
         let mut qc = QuarantineCell::new(CellId(26));
         qc.resolved_retention = 10;
         let q1 = qc.absorb(1, 7, ErrCode::AnchorMissing, "no anchor", Cbor::t("env-1"));
-        let q2 = qc.absorb(2, 7, ErrCode::BudgetExceeded, "broke", Cbor::t("env-2"));
+        let q2 = qc.absorb(1, 7, ErrCode::BudgetExceeded, "broke", Cbor::t("env-2"));
+        assert_ne!(q1, q2);
         assert_eq!(qc.pending_count(), 2);
         // Sweep never touches pending items, no matter how old.
         assert_eq!(qc.sweep(1_000_000), 0);

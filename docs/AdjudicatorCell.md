@@ -47,7 +47,7 @@ Output recorded in CrossCheckLedger with `adjudicator_id` populated.
 **[GAP-CU-007]** pool composition. **[GAP-CU-008]** rotation policy.
 
 ## §4 Human Escalation (~1-2%)
-Survives both deterministic + LLM adjudication → AgentRegistry escalation list. Substrate filters firehose down to cases that genuinely need human attention. **[GAP-CU-014]**.
+Survives both deterministic + LLM adjudication → queued in `AdjudicatorCell`, surfaced as `curator.adjudication`, and delivered to `AgentRegistry` escalation subscribers via the ALWAYS_DELIVER event path. In v1.0 there is no automatic timeout; acknowledgement is explicit operator resolution through `resolve(handle, uphold_auditor)`. Substrate filters firehose down to cases that genuinely need human attention.
 
 ## §5 State
 
@@ -102,7 +102,6 @@ Resolution recorded as a Decision in DecisionLedgerCell + CrossCheckRecord in Cr
 |---|---|
 | GAP-CU-007 | LLM pool composition (3 vs 5 models) |
 | GAP-CU-008 | Rotation policy details |
-| GAP-CU-014 | Human escalation routing |
 
 ## §12 Congruence Contract
 Congruent with: Architecture.md (§17), CURATOR_PAIR_PROTOCOL.md, LibrarianCell.md, WardenCell.md, CrossCheckLedgerCell.md, RouterScheduler.md (escalation dispatch).

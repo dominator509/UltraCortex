@@ -1,13 +1,21 @@
 # IMPLEMENTATION_STATUS — UltraCortex v1.0 Rust tree
 
-Status date: 2026-07-06. Sources of truth: the 22 spec documents in
+Status date: 2026-07-07. Sources of truth: the 22 spec documents in
 `docs/`; conflicts resolved in favor of CURATOR_PAIR_PROTOCOL.md and
 NATIVE_TRINITY.md per Architecture.md §1.
 
 ## 1. Verification status — read this first
 
 This tree was authored in a sandbox **without a Rust toolchain or
-network access**. It has **not been compiled**. Mitigations baked in:
+network access**. That was true during authoring, but this checkout has
+since been compiled and locally validated on **2026-07-07**:
+
+- `cargo test` now passes locally (`158 passed`, 7 suites);
+- the standard-vector and conformance coverage below still matters, but
+  the remaining work is no longer "first compile" uncertainty;
+- the audited open/closed gap register now lives in `docs/HANDOFF.md`.
+
+Mitigations baked in during authoring:
 
 - unit tests carry external standard vectors (FIPS 180-4 SHA-256,
   RFC 2202/4231 HMAC, CRC32C "123456789" → 0xE3069283, RFC 8949
@@ -19,8 +27,10 @@ network access**. It has **not been compiled**. Mitigations baked in:
 - the conformance suite (T1–T8, C1–C10) exercises the full stack
   through the public Router, not internals.
 
-Expect first-compile fixes (lifetimes, imports, the usual). Nothing in
-the design depends on anything unverifiable.
+The expected first-compile fixes (lifetimes, imports, and a few wire/doc
+alignment issues) have now been landed in this checkout. Nothing in the
+design depends on anything unverifiable, but several policy and
+deployment gaps remain open in `docs/HANDOFF.md`.
 
 ## 2. Structural deviations from the blueprint
 
@@ -30,10 +40,10 @@ the design depends on anything unverifiable.
 | D2 | External deps allowed (serde, tokio, ed25519-dalek…) | **Zero dependencies**, std only | Supply-chain surface = 0; determinism easier to prove. All primitives in-tree with test vectors. Costs: no async runtime (thread-per-conn), hand-rolled CBOR. |
 | D3 | Ed25519 capability-token signatures | HMAC-SHA256 behind the `Signer` trait | Single-node v0: issuer == verifier, HMAC is sound. Multi-node drops an Ed25519 `Signer` impl behind the same seam (router/captoken.rs). |
 | D4 | CBOR full numeric tower | Canonical CBOR with **f64-only floats**, u64/i64 ints | Sufficient for every spec schema; canonical-form rules (shortest int encoding, sorted map keys, definite lengths) fully implemented. |
-| D5 | Encryption tier T3 (external KMS wrap) | **Unimplemented — fails loudly** at `Kms::open` | No external KMS to integrate against; T0–T2 complete incl. per-stream subkeys and batch signing. |
+| D5 | Encryption tier T3 (external KMS wrap) | **Implemented via a persisted local keyring seam** | T3 now opens, stores custody state in `kms/keyring.cbor`, exposes audited `kms status` / `kms rotate` verbs, and verifies CrossCheck batch signatures on recovery. A real external KMS/HSM can still replace the local keyring behind the same seam later. |
 | D6 | Async curation consumer on `node.written` | **Synchronous curation** inside the write path | Deterministic, replay-exact, and makes B5 self-tests direct. Seam: `router::run_curation_cycle` — an async consumer is a drop-in (spawn + queue) at the cost of replay complexity. |
 | D7 | SIGTERM/SIGINT graceful shutdown | Admin `shutdown` verb over the socket; no signal handler | std has no signal API and libc is a dependency. `ultracortex shutdown` performs the identical snapshot → sync → clean-manifest sequence. Unclean kills are covered by WAL replay + torn-tail truncation. |
-| D8 | TLS on TCP | None; UDS 0600 preferred, TCP loopback-only by policy | Localhost substrate. Multi-host transport is out of v1.0 scope. |
+| D8 | TLS on TCP | None; UDS 0600 preferred, TCP loopback-only and fail-closed on non-loopback binds | The current v1.0 transport policy is explicit: local tooling may use plaintext loopback TCP, while LAN/multi-host TCP is out of scope until a future TLS-bearing transport lands. |
 | D9 | Curator models Gemma-2-2B / Qwen-2.5-1.5B / pool via llama.cpp FFI | `CuratorBackend` trait: deterministic backend default; `ExternalGgufBackend` shells out to a pinned, SHA-verified llama-cli with temp 0 + seed | No weights or toolchain in the authoring sandbox. The deterministic backend is *functional* (lexical-centrality extractive skeletons, evidence-tally adjudication), not a stub. GGUF path is config-only (`[curator] external_cmd` + `[curator.pinned]`). Inference failures fall back + `curator.backend_fallback`. |
 | D10 | Blob/Timeline/Scratchpad WAL replay | Snapshot-covered; WAL frames written for forensics but only Fact/Supersede/CuratorOutput frames re-applied on recovery | Bounded loss = one group-commit window between snapshots for those cells. Fact state — the governance-critical surface — replays fully. Extend `bootstrap::replay_frame` per cell to close. |
 | D11 | Group commit 250 µs / 256 KiB, epoch roll at 1 GiB | Implemented in `persist::wal` per spec constants | Not perf-validated (no runtime). |
@@ -46,14 +56,14 @@ the design depends on anything unverifiable.
 | CellTaxonomy.md | cells/, trinity/, curator/ | ✅ all 25 cell types, stable numeric ids, snapshot/restore each |
 | NATIVE_TRINITY.md | trinity/ | ✅ 7 cells, fixed 5-step chain + optional Warden step 6, absorption, reservation-release, fixation N=8 |
 | RouterScheduler.md | router/ | ✅ tokens, E1–E4, gap accounting, tier budgets + R1 truncation, built-in views, events w/ ALWAYS_DELIVER, facet gate |
-| PersistenceLayer.md | persist/ | ✅ WALF frames + CRC, group commit, epoch roll, CAS aa/bb layout + refcount GC, CoW snapshots, manifest atomic rename, KMS T0–T2, PrefixCacheStore ViewKey, weight pinning · ⚠️ T3 (D5) |
+| PersistenceLayer.md | persist/ | ✅ WALF frames + CRC, group commit, epoch roll, CAS aa/bb layout + refcount GC, CoW snapshots with measured/enforced `≤50 ms` pause target, manifest atomic rename, KMS T0–T3 with persisted keyring rotation + custody verification, PrefixCacheStore ViewKey, weight pinning |
 | McpProtocol.md | proto/, router/envelope.rs | ✅ u32-LE frames (16 MiB), hello capability bits, 6 verbs, error codes incl. quarantine ids · ⚠️ no TLS (D8) |
 | Bootstrap.md | bootstrap/ | ✅ B1 config merge, B2, B3a Trinity-first (fatal), B3b recovery (snapshot + replay + audit verify + weight verify), B5 ×11, B6 ready line · ⚠️ signals (D7) |
 | CURATOR_PAIR_PROTOCOL.md | curator/, router/ | ✅ P19 PUBLIC/PRIVATE split w/ token exclusions enforced at the Router, P20 chain on curator writes, disagreement flow, all nine guardrails (quota band, probes ×10 boost, blind re-audit, boundary probes, calibration degrade, weight pinning, prior-blind referee, sanity-not-veto, ledger forensics) |
 | LibrarianCell.md | curator/librarian.rs | ✅ skeleton ≤80 tok / supersede-proposal / archive-tag ops, PENDING→Active/Quarantined lifecycle, private facets in CAS · backend per D9 |
 | WardenCell.md | curator/warden.rs | ✅ envelope gate (hallucination + drift), independent grounding **or** hash-proof (never bare pass), blind re-audit, flags |
 | AdjudicatorCell.md | curator/adjudicator.rs | ✅ policy table (~70–80 % target), seeded pool rotation + per-judge salt, Uncertain→human queue + `resolve`, **structural prior-blindness** (no ledger param; token also excludes `cross_check/**`) |
-| CrossCheckLedgerCell.md | curator/ledger.rs | ✅ own WAL stream (FLAG_CROSS_CHECK), W=200 window, >0.99 suspicious / <0.92 miscalibration, batch HMAC every 256 @ T2+ |
+| CrossCheckLedgerCell.md | curator/ledger.rs | ✅ own WAL stream (FLAG_CROSS_CHECK), W=200 window, >0.99 suspicious / <0.92 miscalibration, batch HMAC every 256 @ T2+, persisted signature sidecar + recovery verification |
 | MemoryCells / IndexCells / CoordCells docs | cells/ | ✅ Fact s-p-o w/ supersession, Timeline, Scratchpad TTL, Playbook, Blob→CAS, Cache; HNSW (seeded, rebuild-identical), BM25, Graph, Reranker; AgentRegistry (revocation, escalation), Proposal quorum, Subscription globs |
 | DeepSeekOptimization.md | deepseek.rs, router/view.rs | ✅ prefix-stable view layout, FIM wrap, R1 strip, flat lowercase tools manifest |
 | ObservabilitySpec.md | obs.rs | ✅ counters/gauges/histograms, structured JSONL log, hash-chained audit log + verify |

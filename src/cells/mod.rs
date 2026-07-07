@@ -112,7 +112,7 @@ impl CellType {
             "Scratchpad" => CellType::Scratchpad,
             "Vector" => CellType::Vector,
             "Graph" => CellType::Graph,
-            "Bm25" => CellType::Bm25,
+            "BM25" | "Bm25" => CellType::Bm25,
             "Blob" => CellType::Blob,
             "Cache" => CellType::Cache,
             "AgentRegistry" => CellType::AgentRegistry,

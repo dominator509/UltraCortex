@@ -217,6 +217,28 @@ impl Tier {
     }
 }
 
+/// Bootstrap/runtime shard-placement policy surfaced to operators.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ShardTopology {
+    Dedicated,
+    CoTenantShard0,
+}
+impl ShardTopology {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShardTopology::Dedicated => "dedicated",
+            ShardTopology::CoTenantShard0 => "co-tenant-shard-0",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "dedicated" => Some(ShardTopology::Dedicated),
+            "co-tenant-shard-0" => Some(ShardTopology::CoTenantShard0),
+            _ => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error model — SPEC-DERIVED-§8 (McpProtocol.md) + UltraCortex §A.2 codes.
 // ---------------------------------------------------------------------------

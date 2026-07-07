@@ -35,7 +35,7 @@
 | Phase | Theme | Batches | Closes GAPs | Target Window |
 |-------|-------|---------|-------------|---------------|
 | **0**  | Scaffolding & Cell primitive | B0.1 – B0.4 | partial GAP-002 | Days 1–10 |
-| **1A** | Core Cells + **4 foundational Trinity Cells** | B1A.1 – B1A.5 | GAP-NT-002, GAP-NT-008, GAP-NT-009 (partial) | Days 11–28 |
+| **1A** | Core Cells + **4 foundational Trinity Cells** | B1A.1 – B1A.5 | GAP-NT-002, GAP-NT-008, GAP-NT-009 | Days 11–28 |
 | **1B** | Index Cells + Reranker + Quarantine + WorkBudget + **DeepSeek prefix-cache bench** | B1B.1 – B1B.6 | GAP-004, GAP-NT-005, GAP-NT-007, GAP-NT-010, GAP-NT-014, GAP-DS-001 | Days 29–56 |
 | **1C** | Protocol surface + MCP transport + **DeepSeek FIM/R1 extensions** | B1C.1 – B1C.4 | GAP-006, GAP-DS-002, GAP-DS-003, GAP-DS-004 | Days 57–72 |
 | **1D** | Multi-agent: Subscription / AgentRegistry / Proposal / Playbook / Scratchpad | B1D.1 – B1D.4 | GAP-011 | Days 73–90 |
@@ -88,6 +88,7 @@
 **SPEC-DERIVED:** CellTaxonomy.md §22, NATIVE_TRINITY.md §10.
 **Deliverables:** ContractCell impl; schema registry; `pre_validate(schema)`.
 **Exit:** all bootstrap schemas register; non-conforming writes are quarantined.
+Local status: the live checkout now also includes ContractCell plan/apply/verify migration tooling with Decision linkage and deadline-gated deprecation for breaking schema upgrades.
 
 **HALT — B1A.1 → B1A.2**
 
@@ -147,7 +148,7 @@
 
 **HALT — B1B.4 → B1B.5**
 
-### B1B.5 — SummarizerCell (proposed; **[GAP-NT-013]**)
+### B1B.5 — SummarizerCell (closed in UltraCortex v1.0; **[GAP-NT-013]**)
 **SPEC-DERIVED:** EmbeddingReranker.md §6.
 **Exit:** skeleton-from-body deterministic; conformance test passes.
 
@@ -163,6 +164,8 @@
 
 **Exit:** all three targets met or formally deferred with a recorded Decision.
 
+Local status: `tests/acceptance_bench.rs` now satisfies this gate in the current checkout; see `docs/benchmarks/deepseek_acceptance_2026-07-07.json`.
+
 **HALT — Phase 1B → Phase 1C**
 
 ---
@@ -176,6 +179,7 @@
 ### B1C.2 — MCP-over-TCP + mTLS
 **SPEC-DERIVED:** McpProtocol.md §2.2.
 **Closes:** GAP-006.
+Local status: closed in the current checkout by a fail-closed transport policy. Plaintext TCP is allowed only on loopback, and bootstrap/proto tests now reject non-loopback listener addresses before the node serves.
 
 ### B1C.3 — DeepSeek FIM framing + function-call grammar
 **SPEC-DERIVED:** McpProtocol.md §6.1, §6.3.
@@ -205,12 +209,15 @@
 
 ### B1E.1 — Encryption tiers T0–T3
 **Closes:** GAP-009.
+Local status: closed in the current checkout. T3 now opens with a persisted local keyring, surfaces audited `kms status` / `kms rotate` admin verbs, and the rotation drill proves pre/post-roll seal/unseal continuity plus retained-key verification.
 ### B1E.2 — Snapshot pause-window bound
 **Closes:** GAP-012.
+Local status: closed in the current checkout. `ultracortex snapshot` now reports the checkpoint pause window plus the slower post-pause phases separately and raises `snapshot.pause_target_exceeded` above `50_000 µs`; the representative bench artifact `docs/benchmarks/snapshot_pause_2026-07-07.json` recorded `562 µs` max.
 ### B1E.3 — Quarantine retention horizon
 **Closes:** GAP-NT-006.
 ### B1E.4 — Audit signing key custody
 **Closes:** GAP-NT-012.
+Local status: closed in the current checkout. CrossCheck batch signatures now persist key ids plus sidecar metadata, recovery verifies every completed batch before MCP open, and `audit verify` reports the expected/verified batch counts plus signature integrity.
 
 **HALT — Phase 1E → Phase 1F**
 
@@ -220,6 +227,7 @@
 
 ### B1F.1 — OTel exporter defaults
 **Closes:** GAP-013.
+Local status: docs name OTLP export, but `src/obs.rs` still stops at in-process Metrics/Logger/AuditChain, so this gap remains open.
 ### B1F.2 — Congruence delta acceptance UI
 **Closes:** GAP-NT-004.
 ### B1F.3 — Severity tag propagation across cross-cell calls
@@ -227,6 +235,8 @@
 ### B1F.4 — Final token-efficiency acceptance + DeepSeek hit-rate gate
 **SPEC-DERIVED:** DeepSeekOptimization.md §11, Architecture.md §14.7.
 **Closes:** GAP-010.
+
+Local status: the same acceptance bench now clears the final v1.0 token-efficiency gate in this checkout; see `docs/benchmarks/deepseek_acceptance_2026-07-07.json`.
 
 **HALT — v1.0 RELEASE**
 
@@ -277,12 +287,14 @@ The HyperCortex roadmap above (Phases 0 → 1F) remains normative for UltraCorte
 **SPEC-DERIVED:** LibrarianCell.md.
 **Deliverables:** Gemma 2 2B Q4_K_M mmap + RAM KV cache; async on `node.written`; PUBLIC/PRIVATE output split; subject to Trinity governance.
 **Closes:** **GAP-NT-013** (SummarizerCell subsumed), GAP-CU-001.
+Local status: Librarian behavior closes GAP-NT-013 locally, but the production Gemma default remains open because this checkout still uses `DeterministicBackend` unless operators configure and pin the optional GGUF seam.
 **Exit:** Skeleton generation deterministic under WAL replay; ~180 ms p50 CPU.
 
 ### B1G.5 — WardenCell (Qwen 2.5 Coder 1.5B)
 **SPEC-DERIVED:** WardenCell.md.
 **Deliverables:** Qwen 2.5 Coder 1.5B Q4_K_M mmap + RAM KV cache (different family verified); opt-in sync via `flags.semantic_check`; auto-sync on `severity=P0`; async audit of Librarian outputs.
 **Closes:** GAP-CU-002.
+Local status: Warden behavior exists locally, but the production Qwen default remains open because the live Warden path is still deterministic evidence checks and no Qwen/GGUF backend is wired into `WardenCell` yet.
 **Exit:** Audit-the-Librarian and sanity-check-the-Warden flows pass conformance tests.
 
 ### B1G.6 — AdjudicatorCell + Rotating LLM Pool
@@ -319,7 +331,7 @@ The HyperCortex roadmap above (Phases 0 → 1F) remains normative for UltraCorte
 
 ## §A.3 New GAPs Closed in Phase 1G
 
-GAP-NT-013 · GAP-CU-001 · GAP-CU-002 · GAP-CU-007 · GAP-CU-008 · GAP-CU-009 · GAP-CU-012
+GAP-NT-013 · GAP-CU-007 · GAP-CU-008 · GAP-CU-009 · GAP-CU-012
 
 ## §A.4 Congruence Contract (Updated)
 

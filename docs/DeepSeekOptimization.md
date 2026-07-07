@@ -16,9 +16,11 @@ Canonical order: header → handles[] → skeletons[] → bodies[] → footer. L
 
 ## §3 PrefixCacheStore Integration
 ViewKey = (view_id, namespace_id, view_version, params_canonical_hash). Lookup on every `view` request.
+Readers that pin an older `view_version` must opt into forward migration explicitly; otherwise stale and future version requests fail with `ContractViolation`.
 
 ## §4 FIM Framing
 DeepSeek-Coder: `<|fim_begin|>{prefix}<|fim_hole|>{suffix}<|fim_end|>`.
+DeepSeek-V3 and DeepSeek-R1: plain `prefix + suffix` splice (no coder-only tokens).
 
 ## §5 R1 `<think>` Strip Mode
 Default strip; opt-in `include_reasoning: true`.
@@ -48,6 +50,8 @@ Vector, BM25, Graph, Reranker, **Librarian** — all do reasoning the LLM doesn'
 | Hydration ratio | ≤0.25 | ≤0.25 |
 | Skeleton quality | regex-extracted | **Librarian-generated** (semantically richer) |
 
+Measured local artifact: `tests/acceptance_bench.rs` produced `856` bytes p50, `1052` bytes p99, `84.21%` prefix-cache hit rate, and hydrate/recall `0.25`; the recorded output is `docs/benchmarks/deepseek_acceptance_2026-07-07.json`.
+
 ## §12 Conformance Tests
 1. Prefix stability — byte-identical bytes on identical requests.
 2. Append stability — long shared prefix preserved.
@@ -64,7 +68,7 @@ The Curator Pair operates **in parallel** with DeepSeek optimization, not in con
 - **R1 `<think>` strip** still applies. Warden does NOT see agent `<think>` blocks (they're stripped before envelope arrives).
 
 ## §14 GAPs
-GAP-DS-001..004 unchanged.
+All DeepSeek-specific v1.0 gaps are closed in the current checkout.
 
 ## §15 Congruence
 Congruent with Architecture.md (§14), McpProtocol.md, RouterScheduler.md, PersistenceLayer.md, EmbeddingReranker.md, NATIVE_TRINITY.md, **CURATOR_PAIR_PROTOCOL.md** (does not contradict P19/P20).

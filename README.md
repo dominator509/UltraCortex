@@ -28,11 +28,9 @@ Implementation coverage, deviations, and known gaps are tracked in
 - Package: `ultracortex`
 - Toolchain target: Rust `1.75+`
 - License field: `LicenseRef-TBD`
-
-> Honesty note: this tree was authored in an environment without a Rust
-> toolchain, so it has not been compile-verified here yet. The included
-> tests use known vectors for hashing, HMAC, CRC32C, and canonical CBOR,
-> so the first real `cargo test` run is a meaningful readiness gate.
+- Local validation: `cargo test` passes (`158 passed`, 7 suites).
+- Acceptance bench: [`tests/acceptance_bench.rs`](tests/acceptance_bench.rs) records `856` bytes p50, `1052` bytes p99, `84.21%` prefix-cache hit rate, and `0.25` hydrate/recall ratio; the measured artifact lives at [`docs/benchmarks/deepseek_acceptance_2026-07-07.json`](docs/benchmarks/deepseek_acceptance_2026-07-07.json).
+- Snapshot bench: [`tests/acceptance_bench.rs`](tests/acceptance_bench.rs) records `392 µs` p50 and `562 µs` p99/max for the admin snapshot pause window on a seeded Router workload; the measured artifact lives at [`docs/benchmarks/snapshot_pause_2026-07-07.json`](docs/benchmarks/snapshot_pause_2026-07-07.json).
 
 ## Build and test
 
@@ -49,6 +47,10 @@ cargo fmt --check
 ./target/release/ultracortex run --config path.toml --set listen.tcp=127.0.0.1:7741
 ./target/release/ultracortex run --dry-run
 ```
+
+TCP is intentionally loopback-only in the current checkout. Non-loopback
+`listen.tcp` addresses are rejected before bind; UDS remains the preferred
+transport.
 
 A healthy boot prints:
 
@@ -88,6 +90,8 @@ ultracortex snapshot
 ultracortex quarantine list
 ultracortex gap list
 ultracortex audit verify
+ultracortex kms status
+ultracortex kms rotate [--emergency]
 ultracortex congruence audit
 ultracortex contract list
 ultracortex curator status
@@ -100,13 +104,16 @@ ultracortex shutdown
 `curator status` is the collusion dashboard. The Librarian/Warden
 agreement band should stay in the documented range, `rationale_access_denied`
 should remain non-zero, and `probe_missed` should stay at zero.
+`audit verify` now checks the audit hash chain plus completed CrossCheck
+batch signatures, and the `kms` verbs expose the local T3 custody /
+rotation seam.
 
 ## Repository layout
 
 ```text
 src/core        ids, errors, ULID, canonical CBOR, glob, TOML subset, crypto
 src/obs         metrics, structured log, hash-chained audit log
-src/persist     sharded WAL, CAS blobs, CoW snapshots, KMS T0-T2, view cache
+src/persist     sharded WAL, CAS blobs, CoW snapshots, KMS T0-T3, view cache
 src/cells       memory, index, and coordination cells
 src/trinity     governance cells and pre-validation chain
 src/curator     Librarian, Warden, Adjudicator, guardrails, cross-check ledger

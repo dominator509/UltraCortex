@@ -121,7 +121,7 @@ Tier policy (default):
 
 Scheduler MAY return `BudgetInsufficient` with recommended tier; agent MAY re-issue with explicit override (audited).
 
-**[GAP-NT-007]** namespace defaults. **[GAP-NT-010]** acceptance bench.
+Namespace default grants are `admin=250_000`, `bootstrap=1_000_000`, `curator=10_000_000`, with fallback `100_000`, surfaced through `budget defaults`. The checked-in acceptance bench (`tests/acceptance_bench.rs`) records `856` bytes p50 and `1052` bytes p99 on the representative DeepSeek workload.
 
 ---
 
@@ -134,10 +134,8 @@ Scheduler MAY return `BudgetInsufficient` with recommended tier; agent MAY re-is
 | **P2**   | Best-effort                       | Bulk class; preemptable; coalescable |
 
 - **S1** — P0 envelope bypasses priority queue.
-- **S2** — P0 propagates to cross-Cell spawns (`spawn_severity = parent_severity` unless explicitly demoted with Decision).
+- **S2** — cross-Cell spawns preserve the parent severity by default (`spawn_severity = parent_severity` unless explicitly demoted with Decision).
 - **S3** — P2 envelopes MAY be coalesced (same `(cell_id, op_kind)` within 1 ms).
-
-**[GAP-NT-011]** severity-tag propagation.
 
 ---
 
@@ -154,7 +152,7 @@ on dispatch(env):
     else:
         gap_dispatch_counter[env.gap_ref] += 1
         cnt = gap_dispatch_counter[env.gap_ref]
-        if cnt - last_tx_seq[env.gap_ref] >= N:    // N default 8, [GAP-NT-005]
+        if cnt - last_tx_seq[env.gap_ref] >= N:    // N default 8
             emit("task.no_progress", env.gap_ref, env.task_id)
             quarantine(env, cause = NoForwardProgress)
             return Quarantined
@@ -210,7 +208,7 @@ Lex-sorting at every level guarantees a long shared prefix on re-emission.
 - Prefix-cache hit rate **≥ 80%**.
 - View assembly latency: ≤ 100 μs p99 cache miss; ≤ 5 μs p99 cache hit.
 
-**[GAP-DS-001]** measurement bench. **[GAP-NT-014]** eviction policy.
+The checked-in acceptance bench records an `84.21%` prefix-cache hit rate on the representative workload. **[GAP-NT-014]** eviction policy.
 
 ---
 
@@ -240,11 +238,11 @@ Any failure → `QuarantineCell.absorb(env, cause)` — never silent reject.
 
 ## §11 — Trinity Shard Co-Location
 
-All 7 Trinity Cells on a single dedicated shard (default; configurable to co-tenant on shard 0). Rationale: every state-changing envelope touches all 7; co-location → same-shard mmap reads, not network hops.
+All 7 Trinity Cells default to a single dedicated shard. The only supported small-deployment override is `co-tenant-shard-0`, surfaced by bootstrap as `trinity_topology`. Rationale: every state-changing envelope touches all 7; co-location → same-shard mmap reads, not network hops.
 
 Saturation → backpressure + `trinity.saturated` event. Remedy: per-namespace Trinity sharding (Phase 2).
 
-**[GAP-NT-001]** topology default.
+For Curator placement, small deployments follow the same policy surface: bootstrap defaults to dedicated placement and accepts `co-tenant-shard-0` as the supported override via `curator.topology`.
 
 ---
 
@@ -291,14 +289,6 @@ The Scheduler MUST be deterministic given identical WAL + envelope order + `seed
 
 | ID | Description |
 |----|-------------|
-| GAP-NT-001 | Trinity shard topology |
-| GAP-NT-005 | Gap dispatch counter window N |
-| GAP-NT-007 | Namespace budget defaults |
-| GAP-NT-010 | Token-injected-per-step bench |
-| GAP-NT-011 | Severity-tag propagation |
-| GAP-NT-014 | PrefixCacheStore eviction policy |
-| GAP-DS-001 | DeepSeek prefix-cache hit-rate measurement |
-| GAP-006    | MCP-over-tcp TLS termination defaults |
 
 ---
 
@@ -374,7 +364,6 @@ Router rejects `hydrate` requests matching exclude globs → emits `curator.rati
 |---|---|
 | GAP-CU-008 | Adjudicator rotation policy |
 | GAP-CU-012 | Negation glob canonicalization |
-| GAP-CU-013 | Curator shard topology for small deployments |
 
 ## §A.8 Congruence Contract (Updated)
 

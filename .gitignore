@@ -11,6 +11,3 @@
 .vscode/
 .DS_Store
 Thumbs.db
-
-# Accidental local artifact from a brace-expansion-style mkdir
-/{src/

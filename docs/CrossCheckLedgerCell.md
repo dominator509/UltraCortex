@@ -34,7 +34,7 @@ pub struct CrossCheckRecord {
 ## §3 Invariants
 - **L1** — Append-only. No in-place mutation.
 - **L2** — WAL-backed; durable.
-- **L3** — KMS-signed at encryption tier T2+ (Ed25519, every 256-record batch).
+- **L3** — Current checkout appends a T2+ batch HMAC every 256 records; at T3 the batch signature stores the active key id and recovery verifies every completed batch before the node serves traffic again.
 - **L4** — Records cite Decisions via `resolution_handle` rather than embedding decisions.
 - **L5** — Sequence number monotonic per record; gaps detected on replay.
 
@@ -64,7 +64,7 @@ recall(adjudicator_id=Phi-3.5, since=T0)
 All queries are read-only; the ledger is append-only.
 
 ## §7 Retention Policy
-Audit-grade. Months-to-years. KMS-signed batches make retention forensically robust. **[GAP-CU-009]** retention horizon.
+v1.0 policy: CrossCheck records are retained indefinitely in-process and are never age-pruned by the runtime. The current checkout's batch-HMAC evidence, persisted `batch-signatures.cbor` sidecar, and snapshot/restore path preserve the full record set and its replay-verifiable signing metadata.
 
 ## §8 Mandatory Disagreement Quota Detection
 Per CURATOR_PAIR_PROTOCOL.md §5.5:
@@ -84,10 +84,7 @@ Append-only — no PreValidator. Pre-validated by ContractCell schema check + De
 | WAL fsync (group-committed) | <500 μs | <2 ms |
 
 ## §11 GAPs
-| ID | Description |
-|---|---|
-| GAP-CU-009 | Retention horizon |
-| GAP-NT-012 | Audit signing key custody (inherited) |
+No open CrossCheckLedger-specific gaps remain in the current checkout.
 
 ## §12 Congruence Contract
 Congruent with: Architecture.md (§18), CURATOR_PAIR_PROTOCOL.md (§6), LibrarianCell.md, WardenCell.md, AdjudicatorCell.md, PersistenceLayer.md (own WAL stream), ObservabilityAudit.md (metrics derivation).

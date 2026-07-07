@@ -200,7 +200,7 @@ Identity + capability-token issuance/revocation.
 
 ## §13 — ProposalCell
 
-Multi-agent proposal/quorum log. **[GAP-011]** quorum defaults.
+Multi-agent proposal/quorum log. Default quorum behavior is implemented in the current checkout.
 
 ---
 
@@ -230,7 +230,7 @@ pub trait PreValidator: Cell {
 
 ## §16 — SpecAnchorCell
 
-**SPEC-DERIVED-§15.2.** **GAPs:** GAP-NT-002, GAP-NT-009.
+**SPEC-DERIVED-§15.2.** Anchor identity is section-scoped in the current checkout.
 
 ```rust
 pub struct SpecAnchorState {
@@ -254,13 +254,15 @@ pub struct AnchorNode {
 - **A2** — every SoT-ten doc section has ≥1 anchor (or explicit `no_implementation_required` facet).
 - **A3** — orphaned anchors emit `anchor.orphaned` and block HALT.
 
+**Anchor identity:** exact `doc§section`; line fragments are not separate anchors unless explicitly registered as their own section.
+
 **`pre_validate`:** rejects writes whose target lacks an anchor (unless the write creates it).
 
 ---
 
 ## §17 — DecisionLedgerCell
 
-**SPEC-DERIVED-§15.3.** **GAPs:** GAP-NT-003.
+**SPEC-DERIVED-§15.3.**
 
 ```rust
 pub struct DecisionLedgerState {
@@ -286,13 +288,13 @@ pub struct DecisionRecord {
 - **D2** — `supersede(old, new)` is the only invalidation path.
 - **D3** — `by_scope` lookup O(log n); conflict detection O(1) amortized.
 
-**`pre_validate`:** rejects scope-conflicting writes unless `supersedes:` is provided.
+**`pre_validate`:** exact-scope decisions govern first; if none are active, an active `scope=*` decision is the wildcard fallback. Writes must reference or supersede the governing decision.
 
 ---
 
 ## §18 — CongruenceCell
 
-**SPEC-DERIVED-§15.4.** **GAPs:** GAP-NT-004.
+**SPEC-DERIVED-§15.4.**
 
 ```rust
 pub struct CongruenceState {
@@ -308,11 +310,13 @@ pub struct CongruenceState {
 
 **`pre_validate`:** previews post-write symdiff; rejects unaccepted deltas.
 
+Accepted deltas are operator-managed through admin preview/audit/accept flows.
+
 ---
 
 ## §19 — GapCell
 
-**SPEC-DERIVED-§15.5.** **GAPs:** GAP-NT-005.
+**SPEC-DERIVED-§15.5.**
 
 ```rust
 pub struct GapState {
@@ -336,7 +340,7 @@ pub enum GapStatus { Open, InProgress, Blocked, Resolved, Quarantined }
 
 ## §20 — QuarantineCell
 
-**SPEC-DERIVED-§15.6.** **GAPs:** GAP-NT-006.
+**SPEC-DERIVED-§15.6.**
 
 ```rust
 pub struct QuarantineState {
@@ -362,11 +366,13 @@ pub struct QuarantineRecord {
 
 ## §21 — WorkBudgetCell
 
-**SPEC-DERIVED-§15.7.** **GAPs:** GAP-NT-007, GAP-NT-010.
+**SPEC-DERIVED-§15.7.**
 
 ```rust
 pub struct WorkBudgetState {
-    envelopes: HashMap<TaskId, BudgetEnvelope>,
+    envelopes:          HashMap<TaskId, BudgetEnvelope>,
+    default_grant:      u64,
+    namespace_defaults: BTreeMap<NamespaceId, u64>,
 }
 
 pub struct BudgetEnvelope {
@@ -388,11 +394,14 @@ pub struct BudgetEnvelope {
 
 **`pre_validate`:** rejects writes exceeding `tokens_remaining`.
 
+v1.0 namespace defaults: `admin=250_000`, `bootstrap=1_000_000`, `curator=10_000_000`, fallback `100_000`.
+The checked-in acceptance bench proves the read-path budget surface stays inside the documented DeepSeek thresholds (`856` bytes p50, `1052` bytes p99; see `docs/benchmarks/deepseek_acceptance_2026-07-07.json`).
+
 ---
 
 ## §22 — ContractCell
 
-**SPEC-DERIVED-§15.8.** **GAPs:** GAP-NT-008.
+**SPEC-DERIVED-§15.8.** Contract migration tooling is live in the current checkout.
 
 ```rust
 pub struct ContractState {
@@ -405,6 +414,8 @@ pub struct ContractState {
 **Invariants:**
 - **K1** — breaking changes require a `migration_plan_handle` referencing a Decision record.
 - **K2** — writes against deprecated contracts are quarantined.
+
+**Operator surface:** `contract plan-migration` records the target schema, plan handle, Decision handle, and deprecation deadline; `contract verify-migration` reports the stored linkage; `contract apply-migration` rejects pre-deadline calls and deprecates the source schema once the cutoff is reached.
 
 **`pre_validate`:** rejects schema-noncompliant messages (hook #1 in the chain).
 
@@ -446,20 +457,6 @@ R = read via message; W = write via message; — = no direct interaction.
 |------------|------------------|----------------------------------------------|
 | GAP-002    | all              | Final allocator selection                    |
 | GAP-004    | Vec/BM25/Graph   | Hybrid retrieval ranking weights             |
-| GAP-NT-002 | SpecAnchor       | Anchor edge granularity                      |
-| GAP-NT-003 | DecisionLedger   | Decision conflict policy for scope=*         |
-| GAP-NT-004 | Congruence       | Delta acceptance UI                          |
-| GAP-NT-005 | Gap              | Dispatch counter window N                    |
-| GAP-NT-006 | Quarantine       | Retention horizon                            |
-| GAP-NT-007 | WorkBudget       | Per-namespace defaults                       |
-| GAP-NT-008 | Contract         | Schema migration tooling                     |
-| GAP-NT-009 | all Trinity      | Pre-validation chain ordering proof          |
-| GAP-NT-013 | (proposed)       | SummarizerCell                               |
-| GAP-NT-014 | Cache + L0       | PrefixCacheStore eviction policy             |
-| GAP-DS-004 | Contract         | View-schema versioning for prefix stability  |
-
----
-
 ## §25 — Congruence Contract
 
 Congruent with: Architecture.md (Cell trait §5, hook chain §15.9, GAP register §19), RouterScheduler.md (severity, gap-aware, budget), PersistenceLayer.md (per-cell snapshot, schema-id persistence), McpProtocol.md (envelope shape, work-budget), NATIVE_TRINITY.md, DeepSeekOptimization.md (prefix-stable view emission). Live enforcement by `CongruenceCell`.
@@ -475,7 +472,7 @@ This document's HyperCortex content above remains normative for Cells 1–21. Ul
 
 ## §22 LibrarianCell
 
-**Category:** Curator · **Persistence:** mmap weights + RAM-only KV · **Phase:** 1G · **GAPs:** GAP-CU-001, GAP-CU-003, GAP-CU-005, GAP-CU-006, GAP-CU-010, GAP-CU-013
+**Category:** Curator · **Persistence:** mmap weights + RAM-only KV · **Phase:** 1G · **GAPs:** GAP-CU-001, GAP-CU-003
 
 Memory Archive Librarian. Default model: **Gemma 2 2B Q4_K_M**, pinned by SHA-256 in `ContractCell`. Async-only on `node.written`. Operations: `Skeleton | SupersedeProposal | ArchiveTag`. PUBLIC fields: operation, target_handle, grounded_in, confidence_band, schema_id, spec_anchor, logical_at. PRIVATE fields: rationale_handle, considered_alts, confidence_precise, reasoning_trace, private_seed. **Closes GAP-NT-013.**
 
@@ -491,7 +488,7 @@ Full spec: `WardenCell.md`.
 
 ## §24 AdjudicatorCell
 
-**Category:** Curator · **Persistence:** mmap pool + policy table · **Phase:** 1G · **GAPs:** GAP-CU-007, GAP-CU-008, GAP-CU-014
+**Category:** Curator · **Persistence:** mmap pool + policy table · **Phase:** 1G · **GAPs:** GAP-CU-007, GAP-CU-008
 
 Tie-breaker. Two-stage policy:
 1. **Deterministic adjudication** (~70–80%): Rust policy table, no LLM call, ≤200 μs p99.
@@ -504,7 +501,7 @@ Full spec: `AdjudicatorCell.md`.
 
 ## §25 CrossCheckLedgerCell
 
-**Category:** Curator · **Persistence:** strict WAL + KMS-signed at T2+ · **Phase:** 1G · **GAPs:** GAP-CU-009, GAP-NT-012
+**Category:** Curator · **Persistence:** strict WAL + KMS-signed at T2+ · **Phase:** 1G · **GAPs:** none
 
 Append-only forensic ledger of every cross-check + adjudication. Schema: `CrossCheckRecord { record_id, initiator, auditor, audit_kind, initiator_output (PUBLIC only), auditor_judgment, auditor_grounding, independent_handle, outcome, adjudicator_id, resolution_handle, logical_at }`. Derived metrics: agreement rate, suspicious-agreement signal (>99%), escalation rate, calibration drift.
 
@@ -516,7 +513,10 @@ Full spec: `CrossCheckLedgerCell.md`.
 
 ## §27 GAP Updates
 
+- **GAP-NT-002 (Anchor edge granularity): CLOSED** — anchors are section-scoped `doc§section`; line fragments are not separate anchor IDs.
+- **GAP-NT-008 (ContractCell migration tooling): CLOSED** — plan/apply/verify migration tooling now stores migration handles plus Decision linkage and enforces deadline-gated deprecation.
 - **GAP-NT-013 (SummarizerCell): CLOSED** — subsumed by LibrarianCell.
+- **GAP-CU-010 (Per-Cell KV cache size budget): CLOSED** — curator KV-budget profiles are now explicit (`small` / `reference` / `heavy`) and surfaced through bootstrap + `curator status`.
 - New namespace **GAP-CU-001..014** (full table in HANDOFF.md).
 
 ## §28 Congruence Contract (Updated)

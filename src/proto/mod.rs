@@ -22,7 +22,7 @@ use crate::core::{UcError, UcResult};
 use crate::node::Node;
 use crate::router::envelope::{Envelope, ResponseEnvelope, PROTO_VERSION};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -79,7 +79,10 @@ pub fn hello_ack(node: &Node) -> Cbor {
             "capability_bits",
             Cbor::map(vec![
                 ("semantic_check_supported", Cbor::Bool(true)),
-                ("tiers", Cbor::text_array(&["L0", "L1", "L2", "L3"].map(String::from))),
+                (
+                    "tiers",
+                    Cbor::text_array(&["L0", "L1", "L2", "L3"].map(String::from)),
+                ),
                 ("views_builtin", Cbor::Bool(true)),
                 ("cross_check_ledger", Cbor::Bool(true)),
             ]),
@@ -90,6 +93,24 @@ pub fn hello_ack(node: &Node) -> Cbor {
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
+
+pub fn validate_tcp_listen_addr(addr: &str) -> UcResult<()> {
+    let addrs: Vec<_> = addr
+        .to_socket_addrs()
+        .map_err(|e| UcError::schema(format!("bad listen.tcp address `{addr}`: {e}")))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(UcError::schema(format!(
+            "listen.tcp address `{addr}` resolved to no socket addresses"
+        )));
+    }
+    if addrs.iter().any(|sock| !sock.ip().is_loopback()) {
+        return Err(UcError::schema(format!(
+            "listen.tcp `{addr}` is non-loopback; this checkout only permits plaintext TCP on loopback"
+        )));
+    }
+    Ok(())
+}
 
 fn handle_message(node: &Arc<Node>, msg: &Cbor) -> Cbor {
     match msg.opt_str("type").as_deref() {
@@ -105,11 +126,8 @@ fn handle_message(node: &Arc<Node>, msg: &Cbor) -> Cbor {
                     ])
                 }
                 Err(e) => {
-                    let resp = ResponseEnvelope::err(
-                        crate::core::ulid::Ulid::nil(),
-                        node.now(),
-                        &e,
-                    );
+                    let resp =
+                        ResponseEnvelope::err(crate::core::ulid::Ulid::nil(), node.now(), &e);
                     Cbor::map(vec![
                         ("type", Cbor::t("response")),
                         ("response", resp.to_cbor()),
@@ -173,26 +191,37 @@ fn serve_stream(node: Arc<Node>, mut stream: impl Read + Write) {
 
 /// Start the TCP listener thread (127.0.0.1 only by policy).
 pub fn serve_tcp(node: Arc<Node>, addr: &str) -> UcResult<JoinHandle<()>> {
+    validate_tcp_listen_addr(addr)?;
     let listener = TcpListener::bind(addr).map_err(UcError::from)?;
     listener.set_nonblocking(true).map_err(UcError::from)?;
-    node.logger
-        .info(node.now(), "proto.tcp_listening", &[("addr", addr.to_string())]);
-    let handle = std::thread::spawn(move || {
-        loop {
-            if node.shutting_down.load(Ordering::SeqCst) {
-                return;
-            }
-            match listener.accept() {
-                Ok((stream, _peer)) => {
-                    let _ = stream.set_nonblocking(false);
-                    let node2 = node.clone();
-                    std::thread::spawn(move || serve_stream(node2, stream));
+    node.logger.info(
+        node.now(),
+        "proto.tcp_listening",
+        &[("addr", addr.to_string())],
+    );
+    let handle = std::thread::spawn(move || loop {
+        if node.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                if !peer.ip().is_loopback() {
+                    node.metrics.inc("proto.tcp_non_loopback_rejected");
+                    node.logger.warn(
+                        node.now(),
+                        "proto.tcp_non_loopback_rejected",
+                        &[("peer", peer.to_string())],
+                    );
+                    continue;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Err(_) => return,
+                let _ = stream.set_nonblocking(false);
+                let node2 = node.clone();
+                std::thread::spawn(move || serve_stream(node2, stream));
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return,
         }
     });
     Ok(handle)
@@ -217,22 +246,20 @@ pub fn serve_uds(node: Arc<Node>, path: &Path) -> UcResult<JoinHandle<()>> {
         "proto.uds_listening",
         &[("path", path.display().to_string())],
     );
-    let handle = std::thread::spawn(move || {
-        loop {
-            if node.shutting_down.load(Ordering::SeqCst) {
-                return;
+    let handle = std::thread::spawn(move || loop {
+        if node.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let _ = stream.set_nonblocking(false);
+                let node2 = node.clone();
+                std::thread::spawn(move || serve_stream(node2, stream));
             }
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let _ = stream.set_nonblocking(false);
-                    let node2 = node.clone();
-                    std::thread::spawn(move || serve_stream(node2, stream));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Err(_) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
+            Err(_) => return,
         }
     });
     Ok(handle)
@@ -360,7 +387,7 @@ mod tests {
         assert_eq!(read_frame(&mut r).unwrap().unwrap(), b"hello");
         assert_eq!(read_frame(&mut r).unwrap().unwrap(), b"");
         assert!(read_frame(&mut r).unwrap().is_none()); // clean EOF
-        // Oversize write rejected.
+                                                        // Oversize write rejected.
         let mut sink: Vec<u8> = Vec::new();
         let big = vec![0u8; MAX_FRAME + 1];
         assert!(write_frame(&mut sink, &big).is_err());
@@ -376,5 +403,14 @@ mod tests {
         let mut buf = 100u32.to_le_bytes().to_vec();
         buf.extend_from_slice(b"abc");
         assert!(read_frame(&mut std::io::Cursor::new(buf)).is_err());
+    }
+
+    #[test]
+    fn tcp_listener_policy_is_loopback_only() {
+        assert!(validate_tcp_listen_addr("127.0.0.1:7741").is_ok());
+        assert!(validate_tcp_listen_addr("[::1]:7741").is_ok());
+        assert!(validate_tcp_listen_addr("0.0.0.0:7741").is_err());
+        assert!(validate_tcp_listen_addr("192.168.1.25:7741").is_err());
+        assert!(validate_tcp_listen_addr("[::]:7741").is_err());
     }
 }

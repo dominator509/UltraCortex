@@ -113,7 +113,9 @@ Trinity Cells (DecisionLedger, SpecAnchor, GapCell, ContractCell, QuarantineCell
 
 - Each Cell's stable region = mmap'd file divided into 64 KiB pages.
 - On trigger, dirty pages → new file; clean pages referenced by offset.
-- Snapshot pause window ≤ 50 ms target. **[GAP-012]** upper bound.
+- Snapshot pause window ≤ 50 ms target.
+- The live checkout measures `pause_us` as the in-memory checkpoint cut, returns `total_us` plus capture/write/manifest breakdown from `ultracortex snapshot`, and increments `snapshot.pause_target_exceeded` if the pause window exceeds `50_000 µs`.
+- Representative local proof: `tests/acceptance_bench.rs::snapshot_pause_bench_meets_target` with artifact `docs/benchmarks/snapshot_pause_2026-07-07.json` (`392 µs` p50, `562 µs` p99/max).
 
 ### §4.2 Triggers
 
@@ -168,9 +170,10 @@ trait KmsProvider {
 | T0   | plaintext disk | none |
 | T1   | disk-encryption only | local key file |
 | T2   | envelope encryption per namespace | KmsProvider per ns |
-| T3   | per-namespace + remote rotation | cloud KMS / HSM |
+| T3   | per-namespace + auditable rotation | persisted local keyring (upgrade seam to external KMS / HSM) |
 
-**[GAP-009]** T3 rotation cadence. KMS ops are themselves audited (ObservabilityAudit.md §5).
+**[GAP-009]** closed in the current checkout. KMS ops are themselves audited (ObservabilityAudit.md §5).
+Current-checkout note: T3 now opens locally, persists custody state in `kms/keyring.cbor`, exposes `ultracortex kms status` / `ultracortex kms rotate [--emergency]`, and retains prior key versions so pre-rotation payloads and batch signatures remain verifiable after a roll.
 
 ---
 
@@ -188,6 +191,7 @@ Bit-deterministic sequence:
 8. Emit `bootstrap.recovery_complete` audit event.
 
 Recovery successful iff post-replay hash of every Cell's stable region equals the hash recorded at last clean shutdown.
+Current-checkout note: boot-time verification now covers both the audit hash chain and completed CrossCheck batch signatures; recovery refuses MCP open if either check fails.
 
 ---
 
@@ -239,7 +243,7 @@ Given identical WAL replay + identical view request, bytes MUST be byte-identica
 | DecisionLedgerCell| strict; append-only WAL; snapshot is CoW shadow preserving full log | every Decision replayable in WAL order |
 | CongruenceCell    | lazy; regenerated from FactCell + SpecAnchorCell on boot | matrix recomputed O(N) |
 | GapCell           | strict; WAL + snapshot | counters + last-transition restored |
-| QuarantineCell    | strict; WAL + retention-horizon GC | records preserved to horizon ([GAP-NT-006]) |
+| QuarantineCell    | strict; WAL + retention-horizon GC | resolved records retained for `1_000_000` logical ticks; pending records never pruned |
 | WorkBudgetCell    | lazy; in-memory envelopes; rebuilt from in-flight task list on boot | active envelopes resumed |
 | ContractCell      | strict; WAL + snapshot; every active version mmapped | all live contracts available |
 
@@ -250,11 +254,6 @@ Given identical WAL replay + identical view request, bytes MUST be byte-identica
 | ID | Description |
 |----|-------------|
 | GAP-002    | Final allocator selection |
-| GAP-009    | T3 key-rotation cadence |
-| GAP-012    | Snapshot pause-window upper bound |
-| GAP-NT-006 | Quarantine retention horizon |
-| GAP-NT-012 | Audit signing key custody |
-| GAP-NT-014 | PrefixCacheStore eviction policy |
 
 ---
 
@@ -300,8 +299,8 @@ wal/cross_check/<epoch>.wal
 
 - Same group-commit fsync semantics as Trinity WAL.
 - Frames carry `flags.cross_check = true` → AuditSubsystem hash-chains them (ObservabilityAudit §5.2).
-- KMS-signed at T2+ in 256-record batches (Ed25519).
-- Retention: months-to-years (audit-grade). **[GAP-CU-009]** retention horizon.
+- Current checkout: batch-HMAC-signed at T2+ in 256-record batches; at T3 the signing key id is persisted alongside the batch HMAC in `wal/cross_check/batch-signatures.cbor` and replay-verified before service resumes.
+- Retention: v1.0 keeps CrossCheck records indefinitely in the live snapshot/WAL state; there is no age-based pruning path for this ledger.
 
 ## §A.3 Curator KV Caches: RAM-Only (NORMATIVE)
 
@@ -313,6 +312,11 @@ Curator Cell KV caches are **ephemeral, RAM-only, NEVER persisted to disk**.
 - **Recovery** — boots are bit-deterministic because there's no KV-cache state to reconcile.
 
 **Invariant K-1:** Snapshot writers MUST NOT include Curator KV cache pages.
+v1.0 now fixes the operator planning budgets behind `[curator].kv_budget_profile`:
+- `small` = Librarian `256 MiB`, Warden `256 MiB`, Adjudicator `128 MiB` (`640 MiB` total)
+- `reference` = Librarian `384 MiB`, Warden `384 MiB`, Adjudicator `256 MiB` (`1_024 MiB` total, default)
+- `heavy` = Librarian `768 MiB`, Warden `768 MiB`, Adjudicator `512 MiB` (`2_048 MiB` total)
+Bootstrap validates the profile name and `curator status` surfaces the derived per-Cell MiB values.
 
 ## §A.4 Manifest Updates (NEW Fields)
 
@@ -333,12 +337,9 @@ The bit-deterministic recovery sequence (PersistenceLayer §8) gets one new step
 >
 > **Step 4b (NEW):** Initialize Curator Cells with empty KV caches. Weight files mmap'd.
 
-## §A.6 New GAPs (Persistence-scoped)
+## §A.6 KV Budget Profiles (Closed GAP-CU-010)
 
-| ID | Description |
-|---|---|
-| GAP-CU-009 | CrossCheckLedger retention horizon |
-| GAP-CU-010 | Per-Cell KV cache size budget |
+The unresolved budget-policy gap is now closed by the supported `small` / `reference` / `heavy` profiles above. The current checkout still treats these as operator planning limits rather than sampled live cache telemetry; the open curator-runtime gaps are the default model seams in `GAP-CU-001` and `GAP-CU-002`.
 
 ## §A.7 Congruence Contract (Updated)
 

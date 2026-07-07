@@ -107,10 +107,9 @@ pub struct AnchorNode {
 
 **Invariants A1–A3:** see CellTaxonomy.md §16.
 
-**`pre_validate` behavior:** rejects writes whose target has no anchor, unless the write itself creates the anchor.
+**Anchor identity:** v1.0 ratifies section-scoped anchors. The live key is exact `doc§section`; line fragments are not separate anchor identities unless explicitly registered as their own section.
 
-**`[GAP-NT-002]`** anchor edge granularity (line vs section).
-**`[GAP-NT-009]`** pre-validation chain ordering proof.
+**`pre_validate` behavior:** rejects writes whose target has no anchor, unless the write itself creates the anchor.
 
 ---
 
@@ -120,11 +119,9 @@ pub struct AnchorNode {
 
 See CellTaxonomy.md §17 for state structure and invariants D1–D3.
 
-**`pre_validate` behavior:** rejects scope-conflicting writes unless `supersedes:` is provided.
+**`pre_validate` behavior:** exact-scope decisions govern first; if no active exact-scope decision exists, an active `scope=*` decision acts as the wildcard fallback. Writes must reference or supersede whichever decision is active.
 
 **Event emission:** `decision.applied`, `decision.conflict`, `decision.superseded` — all audited.
-
-**`[GAP-NT-003]`** policy for `scope=*` (cross-cutting) decisions.
 
 ---
 
@@ -138,7 +135,7 @@ See CellTaxonomy.md §18 for invariants C1–C2.
 
 **Event emission:** `congruence.delta`, `congruence.delta_accepted`.
 
-**`[GAP-NT-004]`** delta acceptance UI.
+**Operator path:** the admin plane supports `congruence preview`, `congruence audit`, and `congruence accept`; the CLI exposes `ultracortex congruence audit` plus `ultracortex congruence accept <entity...>`.
 
 ---
 
@@ -160,7 +157,7 @@ on dispatch_increment(gap_id):
 
 **Event emission:** `gap.transition`, `task.no_progress`.
 
-**`[GAP-NT-005]`** counter window N.
+Counter window `N = 8` in v1.0.
 
 ---
 
@@ -174,7 +171,7 @@ See CellTaxonomy.md §20 for invariants Q1–Q2.
 
 **Admin path:** `ultracortex quarantine list` / `reinject` / `reject` (BootstrapOperator.md §5).
 
-**`[GAP-NT-006]`** retention horizon.
+v1.0 retention policy: resolved quarantine items are retained for `1_000_000` logical ticks; pending items are never pruned.
 
 ---
 
@@ -203,7 +200,7 @@ On exhaustion:
 
 The WorkBudgetCell coordinates with GapCell: when budget approaches exhaustion AND `gap_dispatch_counter` is non-zero, the scheduler preemptively triggers `task.no_progress` rather than waiting for the explicit fixation threshold.
 
-**`[GAP-NT-007]`** namespace defaults. **`[GAP-NT-010]`** acceptance bench.
+Namespace defaults are `admin=250_000`, `bootstrap=1_000_000`, `curator=10_000_000`, with a fallback grant of `100_000`; the admin plane exposes them through `budget defaults`. The acceptance bench in `tests/acceptance_bench.rs` records `856` bytes p50 and `1052` bytes p99 on the representative workload.
 
 ---
 
@@ -223,9 +220,9 @@ Breaking changes require:
 4. a deprecation deadline (logical),
 5. quarantined writes against the old version after the deadline.
 
-**`pre_validate` behavior:** rejects schema-noncompliant messages (this is hook #1 in the chain).
+Current checkout: `ContractCell` now exposes `contract plan-migration`, `contract verify-migration`, and `contract apply-migration`. Planning stores the migration handle plus Decision linkage, `apply` rejects pre-deadline attempts, and applying the migration deprecates the source schema so the hot-path validator rejects it thereafter.
 
-**`[GAP-NT-008]`** migration tooling.
+**`pre_validate` behavior:** rejects schema-noncompliant messages (this is hook #1 in the chain).
 
 ---
 
@@ -245,11 +242,11 @@ In order (and rationale):
 
 Failures route to `QuarantineCell.absorb()`. Each step short-circuits the chain.
 
-**Proof-of-correctness sketch (informal):** Each hook is monotone with respect to the substrate invariants it guards; ordering by ascending cost minimizes wasted work; routing failures to Quarantine guarantees no envelope is silently lost. Formal proof: **[GAP-NT-009]**.
+**Proof-of-correctness sketch (informal):** Each hook is monotone with respect to the substrate invariants it guards; ordering by ascending cost minimizes wasted work; routing failures to Quarantine guarantees no envelope is silently lost. The regression `fixed_chain_order_short_circuits_before_later_steps` in `src/trinity/chain.rs` locks this short-circuit ordering against accidental reordering.
 
 ### §11.2 Severity-Aware Routing
 
-P0 / P1 / P2 routing per RouterScheduler.md §6. Severity propagates to spawned cross-Cell calls. **[GAP-NT-011]**.
+P0 / P1 / P2 routing per RouterScheduler.md §6. Spawned cross-Cell work preserves parent severity unless an explicit Decision records a demotion.
 
 ### §11.3 Gap-Aware Loop Detection
 
@@ -288,7 +285,7 @@ For a steady-state DeepSeek multi-step coding agent benchmark (target):
 | Budget overruns (silent prompt inflation) | typical 1.5–3× | hard-bounded by WorkBudgetCell |
 | Token waste from quarantine-eligible work | full token cost, dropped silently | rejected pre-write, ~0 tokens spent |
 
-Net effect: **tokens-injected-per-step reduction ≥ 40%** vs an equivalent Cortex-v0.1 path on the same workload. **[GAP-NT-010]** acceptance bench.
+Net effect: **tokens-injected-per-step reduction ≥ 40%** vs an equivalent Cortex-v0.1 path on the same workload. The checked-in artifact `docs/benchmarks/deepseek_acceptance_2026-07-07.json` clears the v1.0 target locally.
 
 ### §13.3 Failure Mode if Trinity Disabled
 
@@ -325,22 +322,7 @@ Every release MUST pass:
 
 ## §16 — GAPs (Trinity)
 
-| ID | Description |
-|----|-------------|
-| GAP-NT-001 | Trinity-shard topology (dedicated vs co-tenant) |
-| GAP-NT-002 | Anchor edge granularity (line vs section) |
-| GAP-NT-003 | Decision conflict policy for scope=* |
-| GAP-NT-004 | Congruence delta acceptance UI |
-| GAP-NT-005 | Gap dispatch counter window N |
-| GAP-NT-006 | Quarantine retention horizon |
-| GAP-NT-007 | WorkBudget defaults per namespace |
-| GAP-NT-008 | ContractCell migration tooling |
-| GAP-NT-009 | Pre-validation chain ordering proof |
-| GAP-NT-010 | Token-injected-per-step acceptance bench |
-| GAP-NT-011 | Severity-tag propagation across cross-cell calls |
-| GAP-NT-012 | Audit signing key custody |
-| GAP-NT-013 | SummarizerCell |
-| GAP-NT-014 | PrefixCacheStore eviction policy |
+No open Native Trinity gaps remain in the current checkout. `GAP-NT-012` closed once T3 custody, rotation, and replay verification landed locally.
 
 ---
 
@@ -420,6 +402,8 @@ The Trinity remains a performance multiplier, not a tax. UltraCortex extends thi
 
 ## §A.8 GAPs Updated
 
+- **GAP-NT-002 CLOSED** (anchors are section-scoped `doc§section`; line fragments are not separate anchor IDs).
+- **GAP-NT-008 CLOSED** (ContractCell plan/apply/verify migration tooling with Decision linkage is live).
 - **GAP-NT-013 CLOSED** (subsumed by LibrarianCell).
 - New namespace **GAP-CU-001..014** (full list in HANDOFF.md).
 

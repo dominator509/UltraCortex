@@ -22,7 +22,7 @@ use crate::cells::CatalogCell;
 use crate::core::cbor::Cbor;
 use crate::core::crypto::sha256;
 use crate::core::ulid::DetRng;
-use crate::core::{fnv1a64, CellId, LogicalClock, UcError, UcResult};
+use crate::core::{fnv1a64, LogicalClock, ShardTopology, UcError, UcResult};
 use crate::curator::adjudicator::AdjudicatorCell;
 use crate::curator::guardrails::{BlindReauditScheduler, CalibrationTracker, ProbeScheduler};
 use crate::curator::ledger::CrossCheckLedgerCell;
@@ -33,9 +33,7 @@ use crate::curator::{
 };
 use crate::obs::{AuditChain, Logger, Metrics};
 use crate::persist::wal::WalWriter;
-use crate::persist::{
-    CasStore, EncryptionTier, Kms, Manifest, PrefixCacheStore, SnapshotStore,
-};
+use crate::persist::{CasStore, EncryptionTier, Kms, Manifest, PrefixCacheStore, SnapshotStore};
 use crate::router::captoken::{HmacSigner, Signer};
 use crate::router::events::EventBus;
 use crate::trinity::cells::{
@@ -47,6 +45,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 // Stable numeric cell ids (WAL frames key on these; renumbering breaks
 // replay — treat as append-only).
@@ -77,6 +76,21 @@ pub mod ids {
     pub const WARDEN: CellId = CellId(31);
     pub const ADJUDICATOR: CellId = CellId(32);
     pub const CROSS_CHECK: CellId = CellId(33);
+}
+
+pub const SNAPSHOT_PAUSE_TARGET_US: u64 = 50_000;
+
+#[derive(Clone, Debug)]
+pub struct SnapshotOutcome {
+    pub name: String,
+    pub cells: usize,
+    pub pause_us: u64,
+    pub total_us: u64,
+    pub capture_us: u64,
+    pub hash_us: u64,
+    pub write_us: u64,
+    pub manifest_us: u64,
+    pub within_target: bool,
 }
 
 /// Memory / index / coordination cells behind one lock group each.
@@ -115,6 +129,7 @@ pub struct Node {
     pub clock: LogicalClock,
     pub boot_seed: u64,
     pub shard_count: u64,
+    pub trinity_topology: ShardTopology,
     pub view_version: Mutex<u64>,
 
     pub cells: Cells,
@@ -157,6 +172,7 @@ impl Node {
         shard_count: u64,
         tier: EncryptionTier,
         boot_seed: u64,
+        trinity_topology: ShardTopology,
         curator_cfg: CuratorConfig,
         embedder_dim: usize,
     ) -> UcResult<Node> {
@@ -175,14 +191,11 @@ impl Node {
         let cross_check_wal =
             WalWriter::open(&data_dir.join("wal/cross_check")).map_err(UcError::internal)?;
 
-        let audit =
-            AuditChain::open(&data_dir.join("audit.chain")).map_err(UcError::internal)?;
-        let logger = Logger::new(Some(&data_dir.join("node.log")), false)
-            .map_err(UcError::from)?;
+        let audit = AuditChain::open(&data_dir.join("audit.chain")).map_err(UcError::internal)?;
+        let logger = Logger::new(Some(&data_dir.join("node.log")), false).map_err(UcError::from)?;
 
         // Node key doubles as the HMAC token key (Kms derives a subkey).
-        let signer: Arc<dyn Signer> =
-            Arc::new(HmacSigner::new(kms.subkey("captoken")));
+        let signer: Arc<dyn Signer> = Arc::new(HmacSigner::new(kms.subkey("captoken")));
 
         // Curator backends: pinned GGUF when configured + present, else the
         // deterministic backend. A missing/unverifiable weight file is a
@@ -246,6 +259,7 @@ impl Node {
             clock: LogicalClock::new(1),
             boot_seed,
             shard_count,
+            trinity_topology,
             view_version: Mutex::new(1),
             cells: Cells {
                 catalog: Mutex::new(CatalogCell::new(ids::CATALOG)),
@@ -317,6 +331,7 @@ impl Node {
             2,
             EncryptionTier::T1,
             42,
+            ShardTopology::Dedicated,
             CuratorConfig::default(),
             256,
         )
@@ -472,18 +487,116 @@ impl Node {
 
     /// State hashes for the manifest (clean-shutdown integrity record).
     pub fn state_hashes(&self) -> BTreeMap<u64, [u8; 32]> {
-        self.snapshot_all()
-            .into_iter()
-            .map(|(id, state)| (id, sha256(&state.encode())))
+        Self::state_hashes_for(&self.snapshot_all())
+    }
+
+    fn state_hashes_for(states: &BTreeMap<u64, Cbor>) -> BTreeMap<u64, [u8; 32]> {
+        states
+            .iter()
+            .map(|(id, state)| (*id, sha256(&state.encode())))
             .collect()
+    }
+
+    /// Write a snapshot, update the manifest, and record the operator-visible
+    /// pause window.
+    pub fn write_snapshot(&self, at: u64) -> UcResult<SnapshotOutcome> {
+        self.write_snapshot_internal(at, false)
+    }
+
+    fn write_snapshot_internal(
+        &self,
+        at: u64,
+        update_state_hashes: bool,
+    ) -> UcResult<SnapshotOutcome> {
+        let total_started = Instant::now();
+
+        let capture_started = Instant::now();
+        let states = self.snapshot_all();
+        let capture_us = capture_started.elapsed().as_micros() as u64;
+
+        let (state_hashes, hash_us) = if update_state_hashes {
+            let hash_started = Instant::now();
+            let hashes = Self::state_hashes_for(&states);
+            (Some(hashes), hash_started.elapsed().as_micros() as u64)
+        } else {
+            (None, 0)
+        };
+
+        let write_started = Instant::now();
+        let snap_name = self.snapshots.write(at, &states)?;
+        let write_us = write_started.elapsed().as_micros() as u64;
+
+        let manifest_started = Instant::now();
+        {
+            let mut m = self.manifest.lock().unwrap();
+            m.logical_at = at;
+            m.last_snapshot = Some(snap_name.clone());
+            if let Some(hashes) = state_hashes {
+                m.state_hashes = hashes;
+            }
+            m.save(&self.data_dir)?;
+        }
+        let manifest_us = manifest_started.elapsed().as_micros() as u64;
+
+        let total_us = total_started.elapsed().as_micros() as u64;
+        let pause_us = capture_us;
+        let within_target = pause_us <= SNAPSHOT_PAUSE_TARGET_US;
+        self.metrics.observe("snapshot.pause_us", pause_us);
+        self.metrics.observe("snapshot.total_us", total_us);
+        self.metrics.observe("snapshot.capture_us", capture_us);
+        self.metrics.observe("snapshot.hash_us", hash_us);
+        self.metrics.observe("snapshot.write_us", write_us);
+        self.metrics.observe("snapshot.manifest_us", manifest_us);
+        self.metrics
+            .gauge_set("snapshot.last_pause_us", pause_us as i64);
+        self.metrics
+            .gauge_set("snapshot.last_total_us", total_us as i64);
+        self.metrics
+            .gauge_set("snapshot.last_cells", states.len() as i64);
+        if !within_target {
+            self.metrics.inc("snapshot.pause_target_exceeded");
+            self.logger.warn(
+                at,
+                "snapshot.pause_target_exceeded",
+                &[
+                    ("pause_us", pause_us.to_string()),
+                    ("total_us", total_us.to_string()),
+                    ("pause_target_us", SNAPSHOT_PAUSE_TARGET_US.to_string()),
+                    ("cells", states.len().to_string()),
+                ],
+            );
+        } else {
+            self.logger.info(
+                at,
+                "snapshot.completed",
+                &[
+                    ("pause_us", pause_us.to_string()),
+                    ("total_us", total_us.to_string()),
+                    ("pause_target_us", SNAPSHOT_PAUSE_TARGET_US.to_string()),
+                    ("cells", states.len().to_string()),
+                    ("snapshot", snap_name.clone()),
+                ],
+            );
+        }
+
+        Ok(SnapshotOutcome {
+            name: snap_name,
+            cells: states.len(),
+            pause_us,
+            total_us,
+            capture_us,
+            hash_us,
+            write_us,
+            manifest_us,
+            within_target,
+        })
     }
 
     /// Clean shutdown: snapshot → WAL sync → manifest(clean=true).
     pub fn shutdown(&self) -> UcResult<()> {
         self.shutting_down.store(true, Ordering::SeqCst);
         let at = self.now();
-        let states = self.snapshot_all();
-        let snap_name = self.snapshots.write(at, &states)?;
+        let snap = self.write_snapshot_internal(at, true)?;
         for w in &self.shard_wals {
             let _ = w.sync();
         }
@@ -492,11 +605,17 @@ impl Node {
             let mut m = self.manifest.lock().unwrap();
             m.logical_at = at;
             m.clean_shutdown = true;
-            m.state_hashes = self.state_hashes();
-            m.last_snapshot = Some(snap_name);
             m.save(&self.data_dir)?;
         }
-        self.logger.info(at, "node.shutdown", &[("clean", "true".into())]);
+        self.logger.info(
+            at,
+            "node.shutdown",
+            &[
+                ("clean", "true".into()),
+                ("snapshot", snap.name),
+                ("pause_us", snap.pause_us.to_string()),
+            ],
+        );
         Ok(())
     }
 }
@@ -563,7 +682,12 @@ impl SubstrateView for Node {
         if (handle.starts_with("librarian/output/") || handle.starts_with("warden/judgment/"))
             && !crate::curator::is_private_facet(handle)
         {
-            return self.curator_public_index.lock().unwrap().get(handle).cloned();
+            return self
+                .curator_public_index
+                .lock()
+                .unwrap()
+                .get(handle)
+                .cloned();
         }
         if handle.starts_with("decision/") {
             return self
@@ -620,5 +744,25 @@ mod tests {
         let a = node.wal_for("fact/AAAA").dir().to_path_buf();
         let b = node.wal_for("fact/AAAA").dir().to_path_buf();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn snapshot_outcome_surfaces_pause_measurement() {
+        let node = Node::ephemeral("snapshot-outcome").unwrap();
+        let at = node.now();
+        let snap = node.write_snapshot(at).unwrap();
+        assert!(snap.name.starts_with("snap-"));
+        assert!(snap.cells >= 25);
+        assert_eq!(
+            snap.within_target,
+            snap.pause_us <= SNAPSHOT_PAUSE_TARGET_US
+        );
+        let metrics = node.metrics.snapshot();
+        assert!(metrics.get("snapshot.pause_us.count").copied().unwrap_or(0) > 0);
+        assert_eq!(
+            node.metrics.gauge("snapshot.last_pause_us"),
+            snap.pause_us as i64
+        );
+        assert_eq!(node.metrics.gauge("snapshot.last_cells"), snap.cells as i64);
     }
 }
