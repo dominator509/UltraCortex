@@ -472,7 +472,7 @@ This document's HyperCortex content above remains normative for Cells 1–21. Ul
 
 ## §22 LibrarianCell
 
-**Category:** Curator · **Persistence:** mmap weights + RAM-only KV · **Phase:** 1G · **GAPs:** GAP-CU-001, GAP-CU-003
+**Category:** Curator · **Persistence:** mmap weights + RAM-only KV · **Phase:** 1G · **GAPs:** GAP-CU-003
 
 Memory Archive Librarian. Default model: **Gemma 2 2B Q4_K_M**, pinned by SHA-256 in `ContractCell`. Async-only on `node.written`. Operations: `Skeleton | SupersedeProposal | ArchiveTag`. PUBLIC fields: operation, target_handle, grounded_in, confidence_band, schema_id, spec_anchor, logical_at. PRIVATE fields: rationale_handle, considered_alts, confidence_precise, reasoning_trace, private_seed. **Closes GAP-NT-013.**
 
@@ -480,7 +480,7 @@ Full spec: `LibrarianCell.md`.
 
 ## §23 WardenCell
 
-**Category:** Curator · **Persistence:** mmap weights + RAM-only KV · **Phase:** 1G · **GAPs:** GAP-CU-002, GAP-CU-004, GAP-CU-007, GAP-CU-008, GAP-CU-011, GAP-CU-012
+**Category:** Curator · **Persistence:** mmap weights + RAM-only KV · **Phase:** 1G · **GAPs:** GAP-CU-004, GAP-CU-007, GAP-CU-008, GAP-CU-011, GAP-CU-012
 
 Drift/Hallucination Warden. Default model: **Qwen 2.5 Coder 1.5B Q4_K_M** — **MUST be a different model family than Librarian**. Pinned by SHA-256. Opt-in sync via `flags.semantic_check`; auto-sync on `severity=P0`; async audit of every Librarian output. Output variants: `Pass | FlagDrift | FlagHallucination`. PUBLIC + PRIVATE split per P19.
 

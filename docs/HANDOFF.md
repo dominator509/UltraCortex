@@ -1,12 +1,12 @@
 # HANDOFF.md — UltraCortex v1.0 Live GAP Register
 
-**Status:** v1.0 | Live tracking | Update cadence: every HALT | Audited against current checkout on 2026-07-07 (`cargo test`: 158 passed)
+**Status:** v1.0 | Live tracking | Update cadence: every HALT | Audited against current checkout on 2026-08-13 (`cargo test`: 162 passed)
 
 ## §0 Conventions
 Four GAP namespaces: `GAP-NNN` (carryover), `GAP-NT-NNN` (Trinity), `GAP-DS-NNN` (DeepSeek), `GAP-CU-NNN` (Curator pair — NEW v1.0). Status: open / in_progress / blocked / resolved / quarantined / deferred / closed.
 
 Rows marked `closed` below are gaps whose implementation now exists in the current checkout and is covered by local code/tests. Rows marked `in_progress` have concrete behavior implemented but lack a full benchmark/closure proof. Rows left `open` or `deferred` remain real policy, benchmark, deployment, or runtime-environment gaps even if some supporting code already exists.
-Second-pass checklist audit on 2026-07-07 found no stale open/deferred rows; the remaining notes below were tightened to match the live checkout.
+Second-pass checklist audit on 2026-08-13 found no stale open/deferred rows; the remaining notes below were tightened to match the live checkout.
 
 ## §1 Carryover GAPs
 | ID | Description | Phase | Status | Audit note |
@@ -21,7 +21,7 @@ Second-pass checklist audit on 2026-07-07 found no stale open/deferred rows; the
 | GAP-010 | Final token-efficiency acceptance bench | 1B/1F | closed | `tests/acceptance_bench.rs` now drives a deterministic multi-step Router workload and the recorded artifact `docs/benchmarks/deepseek_acceptance_2026-07-07.json` clears the v1.0 gate (`856` bytes p50, `1052` bytes p99, `84.21%` cache-hit rate, hydrate/recall `0.25`). |
 | GAP-011 | Proposal quorum defaults | 1D | closed | `ProposalCell` quorum behavior is implemented and unit-tested in the current checkout. |
 | GAP-012 | Snapshot pause-window upper bound | 1E | closed | The live snapshot path now measures the checkpoint cut as `pause_us`, surfaces `total_us` plus capture/write/manifest breakdown through `ultracortex snapshot`, alerts via `snapshot.pause_target_exceeded` above `50_000 µs`, and the recorded artifact `docs/benchmarks/snapshot_pause_2026-07-07.json` proves the representative workload stayed within bound (`562 µs` max). |
-| GAP-013 | OTel exporter default endpoints | 1F | open | `src/obs.rs` stops at in-process Metrics/Logger/AuditChain; there is no OTLP exporter path or default collector configuration in the live runtime. |
+| GAP-013 | OTel exporter default endpoints | 1F | closed | `OtlpConfig` provides conventional localhost OTLP/HTTP JSON endpoints (`4318/v1/{metrics,traces,logs}`), TOML/env/CLI overrides, explicit `metrics export`, and a loopback collector smoke test. |
 | GAP-014 | Federation | 2+ | deferred | No federation/runtime multi-host substrate is implemented. |
 
 ## §2 Native Trinity GAPs
@@ -54,8 +54,8 @@ Second-pass checklist audit on 2026-07-07 found no stale open/deferred rows; the
 
 | ID | Description | Phase | Status | Audit note |
 |---|---|---|---|---|
-| GAP-CU-001 | Librarian default model (Gemma 2 2B vs Gemma 3) | 1G | open | The Librarian has an optional GGUF seam, but the default config still leaves it on `DeterministicBackend` unless operators pin and configure `librarian`. |
-| GAP-CU-002 | Warden default model (Qwen 2.5 Coder 1.5B vs alternates) | 1G | open | The live Warden path is still deterministic evidence checks; no pinned Qwen/GGUF backend is wired into `WardenCell` yet. |
+| GAP-CU-001 | Librarian default model (Gemma 2 2B vs Gemma 3) | 1G | closed | Production `CuratorConfig` pins `gemma-2-2b-it-q4_k_m`, verifies its SHA-256 file at boot, and wires the backend through `LibrarianCell`; missing deployment artifacts fail closed. |
+| GAP-CU-002 | Warden default model (Qwen 2.5 Coder 1.5B vs alternates) | 1G | closed | Production `CuratorConfig` pins the distinct `qwen2.5-coder-1.5b-q4_k_m` family, verifies it at boot, wires it through `WardenCell`, and self-test rejects a non-GGUF production backend. |
 | GAP-CU-003 | Confidence-band threshold defaults | 1G | closed | `ConfidenceBand::from_precise` fixes visible defaults (`<0.45`, `0.45..0.8`, `>=0.8`) and policy defaults are part of current curator behavior. |
 | GAP-CU-004 | Disagreement quota bounds (default 92–97%) | 1G | closed | Quota defaults are implemented (`0.92`/`0.97`) in `CuratorConfig`, loaded from TOML/env, and enforced in `CrossCheckLedgerCell::health`. |
 | GAP-CU-005 | Adversarial probe schedule + corpus | 1G | closed | v1.0 ratifies deterministic fabricated-handle probes at base rate `0.001`, with `x10` boost under suspicious agreement; scheduler and probe-path coverage exist locally and the admin plane surfaces the defaults. |
@@ -81,6 +81,6 @@ After Phase 1A.3 (CongruenceCell live): every pair (doc_i, doc_j) in the SoT-13 
 ## §8 Next Actions
 - Per-gap closure criteria now live in `GAP_CLOSURE_CHECKLIST.md`.
 - Assign owners to all `Owner: TBD` rows.
-- Ratify actual Librarian/Warden model runtimes beyond the deterministic fallback.
+- Provision the operator-owned `llama-cli` and the two SHA-pinned GGUF files before a production (non-`--dry-run`) boot; no software credential is required.
 
 _End of HANDOFF.md v1.0 (UltraCortex)._

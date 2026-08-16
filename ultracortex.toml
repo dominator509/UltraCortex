@@ -16,8 +16,7 @@ embedder_dim = 256
 
 [persist]
 # T0 = plaintext (dev), T1 = node-key sealed values, T2 = per-stream keys +
-# batch-signed CrossCheckLedger, T3 = external KMS wrap (unimplemented —
-# fails loudly, see IMPLEMENTATION_STATUS.md).
+# batch-signed CrossCheckLedger, T3 = locally persisted rotating keyring.
 encryption_tier = "T1"
 
 [listen]
@@ -41,14 +40,24 @@ blind_reaudit_rate = 0.01
 kv_budget_profile = "reference"
 # Rotating adjudication pool (judge = pool[envelope.seed % len]).
 pool = "phi-3.5-mini, llama-3.2-3b, smollm2-1.7b"
-# External llama.cpp-style CLI for GGUF-backed curators. Empty = the
-# built-in deterministic backend (extractive skeletons, evidence-tally
-# adjudication) — fully functional and replay-exact.
-external_cmd = ""
+# Production Curator defaults require a local llama.cpp-style CLI and the
+# SHA-pinned GGUF files below. `--dry-run` uses explicit development mode.
+external_cmd = "llama-cli"
+librarian_model = "gemma-2-2b-it-q4_k_m"
+warden_model = "qwen2.5-coder-1.5b-q4_k_m"
 
 # Pinned curator weights: model name -> sha256 of
 # <data_dir>/weights/<model>/<sha>.gguf. Verified at boot and on
 # `ultracortex curator verify-weights`. Uncomment to enable GGUF backends:
-# [curator.pinned]
-# librarian = "0000000000000000000000000000000000000000000000000000000000000000"
-# phi-3.5-mini = "…"
+[curator.pinned]
+librarian = "e0aee85060f168f0f2d8473d7ea41ce2f3230c1bc1374847505ea599288a7787"
+warden = "0c3c38b9d1e2d6fa227b321b4d30ba921e1f7694a42a0ba207020cc58576fccc"
+
+[observability]
+# OTLP/HTTP JSON export is explicit and best-effort. Defaults target the
+# conventional local OpenTelemetry Collector on port 4318.
+otlp_enabled = true
+otlp_metrics_endpoint = "http://127.0.0.1:4318/v1/metrics"
+otlp_traces_endpoint = "http://127.0.0.1:4318/v1/traces"
+otlp_logs_endpoint = "http://127.0.0.1:4318/v1/logs"
+otlp_timeout_ms = 1000

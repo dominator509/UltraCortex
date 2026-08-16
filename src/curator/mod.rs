@@ -403,6 +403,7 @@ fn split_sentences(text: &str) -> Vec<String> {
 /// and increments `curator.backend_fallback` — an LLM hiccup must never
 /// stall the curation pipeline (LibrarianCell.md §6.4).
 pub struct ExternalGgufBackend {
+    pub slot: String,
     pub model_name: String,
     pub weight_path: PathBuf,
     pub cmd: String, // e.g. "llama-cli"
@@ -418,8 +419,31 @@ impl ExternalGgufBackend {
         cmd: &str,
         metrics: Option<std::sync::Arc<crate::obs::Metrics>>,
     ) -> UcResult<ExternalGgufBackend> {
-        let weight_path = crate::persist::verify_weight_file(data_dir, model_name, sha_hex)?;
+        Self::new_for_slot(data_dir, model_name, model_name, sha_hex, cmd, metrics)
+    }
+
+    pub fn new_for_slot(
+        data_dir: &std::path::Path,
+        slot: &str,
+        model_name: &str,
+        sha_hex: &str,
+        cmd: &str,
+        metrics: Option<std::sync::Arc<crate::obs::Metrics>>,
+    ) -> UcResult<ExternalGgufBackend> {
+        let weight_path = crate::persist::verify_weight_file(data_dir, slot, sha_hex)?;
+        // Production bootstrap must not accept a configured model whose
+        // runner will only fail later inside the curation path.
+        if std::process::Command::new(cmd)
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return Err(UcError::not_found(format!(
+                "GGUF runner not found on PATH: {cmd}"
+            )));
+        }
         Ok(ExternalGgufBackend {
+            slot: slot.to_string(),
             model_name: model_name.to_string(),
             weight_path,
             cmd: cmd.to_string(),
@@ -574,7 +598,20 @@ pub struct CuratorConfig {
     /// model -> sha256 hex, for external backends.
     pub pinned: BTreeMap<String, String>,
     pub external_cmd: Option<String>,
+    /// Production model identities. The slots are deliberately separate so
+    /// Librarian and Warden cannot silently converge on one model family.
+    pub librarian_model: String,
+    pub warden_model: String,
+    /// Production boots fail closed when these pins or the runner are absent.
+    pub strict_model_pins: bool,
 }
+
+pub const DEFAULT_LIBRARIAN_MODEL: &str = "gemma-2-2b-it-q4_k_m";
+pub const DEFAULT_LIBRARIAN_SHA256: &str =
+    "e0aee85060f168f0f2d8473d7ea41ce2f3230c1bc1374847505ea599288a7787";
+pub const DEFAULT_WARDEN_MODEL: &str = "qwen2.5-coder-1.5b-q4_k_m";
+pub const DEFAULT_WARDEN_SHA256: &str =
+    "0c3c38b9d1e2d6fa227b321b4d30ba921e1f7694a42a0ba207020cc58576fccc";
 
 impl Default for CuratorConfig {
     fn default() -> Self {
@@ -590,8 +627,14 @@ impl Default for CuratorConfig {
                 "llama-3.2-3b".into(),
                 "smollm2-1.7b".into(),
             ],
-            pinned: BTreeMap::new(),
-            external_cmd: None,
+            pinned: BTreeMap::from([
+                ("librarian".into(), DEFAULT_LIBRARIAN_SHA256.into()),
+                ("warden".into(), DEFAULT_WARDEN_SHA256.into()),
+            ]),
+            external_cmd: Some("llama-cli".into()),
+            librarian_model: DEFAULT_LIBRARIAN_MODEL.into(),
+            warden_model: DEFAULT_WARDEN_MODEL.into(),
+            strict_model_pins: true,
         }
     }
 }
@@ -599,6 +642,46 @@ impl Default for CuratorConfig {
 impl CuratorConfig {
     pub fn kv_budgets(&self) -> CuratorKvBudgets {
         self.kv_budget_profile.budgets()
+    }
+
+    /// Development/test mode is explicit so production configuration cannot
+    /// silently downgrade a missing pinned model to deterministic behavior.
+    pub fn development() -> Self {
+        let mut cfg = Self::default();
+        cfg.external_cmd = None;
+        cfg.pinned.clear();
+        cfg.strict_model_pins = false;
+        cfg
+    }
+
+    pub fn validate_model_pair(&self) -> UcResult<()> {
+        if self.librarian_model.is_empty() || self.warden_model.is_empty() {
+            return Err(UcError::schema("curator model names must not be empty"));
+        }
+        if self.librarian_model == self.warden_model {
+            return Err(UcError::schema(
+                "librarian and warden must use different model families",
+            ));
+        }
+        if self.strict_model_pins {
+            for slot in ["librarian", "warden"] {
+                let sha = self
+                    .pinned
+                    .get(slot)
+                    .ok_or_else(|| UcError::schema(format!("missing curator pin: {slot}")))?;
+                if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(UcError::schema(format!(
+                        "curator pin for {slot} must be a 64-character SHA-256"
+                    )));
+                }
+            }
+            if self.external_cmd.as_deref().unwrap_or("").is_empty() {
+                return Err(UcError::unsupported(
+                    "production curator defaults require a local GGUF runner",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -692,5 +775,17 @@ mod tests {
 
         let heavy = CuratorKvBudgetProfile::Heavy.budgets();
         assert_eq!(heavy.total_mib(), 2_048);
+    }
+
+    #[test]
+    fn production_curator_defaults_are_pinned_and_family_distinct() {
+        let cfg = CuratorConfig::default();
+        cfg.validate_model_pair().unwrap();
+        assert_eq!(cfg.librarian_model, DEFAULT_LIBRARIAN_MODEL);
+        assert_eq!(cfg.warden_model, DEFAULT_WARDEN_MODEL);
+        assert_ne!(cfg.librarian_model, cfg.warden_model);
+        assert_eq!(cfg.pinned["librarian"], DEFAULT_LIBRARIAN_SHA256);
+        assert_eq!(cfg.pinned["warden"], DEFAULT_WARDEN_SHA256);
+        assert!(!CuratorConfig::development().strict_model_pins);
     }
 }

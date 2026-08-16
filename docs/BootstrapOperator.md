@@ -231,14 +231,23 @@ blind_reaudit_rate      = 0.01
 kv_budget_profile       = "reference"  # "small" | "reference" | "heavy"
 pool                    = "phi-3.5-mini, llama-3.2-3b, smollm2-1.7b"
 topology                = "dedicated"  # "dedicated" | "co-tenant-shard-0"
-external_cmd            = ""
+external_cmd            = "llama-cli"
+librarian_model         = "gemma-2-2b-it-q4_k_m"
+warden_model            = "qwen2.5-coder-1.5b-q4_k_m"
 
-# [curator.pinned]
-# librarian = "..."       # current checkout can pin the Librarian GGUF backend
-# phi-3.5-mini = "..."    # adjudicator pool members pin individually
+[curator.pinned]
+librarian = "e0aee85060f168f0f2d8473d7ea41ce2f3230c1bc1374847505ea599288a7787"
+warden = "0c3c38b9d1e2d6fa227b321b4d30ba921e1f7694a42a0ba207020cc58576fccc"
 ```
 
-Current-checkout note: `GAP-CU-001` remains open because the Librarian defaults to `DeterministicBackend` unless operators configure the optional GGUF seam. `GAP-CU-002` remains open because the Warden still runs deterministic evidence checks and no pinned GGUF/Qwen backend is wired into `WardenCell` yet.
+Current-checkout note: production defaults are now fail-closed and SHA-pinned:
+Gemma 2 2B Instruct Q4_K_M for the Librarian and the distinct Qwen 2.5 Coder
+1.5B Q4_K_M family for the Warden. Put the verified files under
+`<data_dir>/weights/librarian/<sha256>.gguf` and
+`<data_dir>/weights/warden/<sha256>.gguf`, put `llama-cli` on PATH, and run
+`ultracortex curator verify-weights`. No software credential is required;
+model files are operator-owned deployment artifacts. `--dry-run` and tests
+select explicit development mode.
 
 ## §A.2 Phase B3 — Provisioning Order (Updated)
 
@@ -312,8 +321,7 @@ Clean shutdown now includes:
 
 | ID | Description |
 |---|---|
-| GAP-CU-001 | Librarian default model (Gemma 2 2B vs Gemma 3) |
-| GAP-CU-002 | Warden default model (Qwen 2.5 Coder 1.5B vs alternates) |
+No bootstrap-scoped Curator default-model gaps remain in the current checkout.
 
 ## §A.7 Congruence Contract (Updated)
 

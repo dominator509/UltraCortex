@@ -1,11 +1,11 @@
 # GAP_CLOSURE_CHECKLIST.md — UltraCortex v1.0 Remaining Gap Closure Checklist
 
-**Status date:** 2026-07-07
+**Status date:** 2026-08-13
 **Scope:** Every `open`, `deferred`, or `in_progress` row in `docs/HANDOFF.md`.
 
 This document translates the remaining gap register into the minimum evidence needed to move a gap to `closed`.
 
-Second-pass audit note (2026-07-07):
+Second-pass audit note (2026-08-13):
 - The DeepSeek section is intentionally empty because every `GAP-DS-*` row is now closed in `docs/HANDOFF.md`.
 - The remaining entries below were re-checked against the current checkout; they are real open gaps, not stale notes.
 - One stale wording issue was corrected during this pass: the current checkout records T2+ CrossCheck batch HMACs, not externally custodied Ed25519 audit signatures.
@@ -62,12 +62,12 @@ Audit evidence (2026-07-07): T3 now opens locally, persists custody state in `km
 - [x] Proof: add a rotation drill showing seal/unseal continuity and auditable key-roll events.
 - [x] Docs: update `PersistenceLayer.md`, `ObservabilityAudit.md`, `Roadmap.md`, `BootstrapOperator.md`, and `HANDOFF.md`.
 
-### GAP-013 — OTel exporter default endpoints (open)
-Audit evidence (2026-07-07): `src/obs.rs` implements only in-process Metrics/Logger/AuditChain; there is no OTLP exporter or default collector seam in the runtime.
-- [ ] Decision: choose the supported default collector/exporter endpoints and override behavior.
-- [ ] Code: implement the OTel exporter path rather than documentation-only references.
-- [ ] Proof: add a smoke/integration test that emits telemetry to the default collector configuration.
-- [ ] Docs: update `ObservabilityAudit.md`, `README.md`, and `HANDOFF.md`.
+### GAP-013 — OTel exporter default endpoints (closed)
+Audit evidence (2026-08-13): `OtlpConfig` and `OtlpExporter` implement dependency-free OTLP/HTTP JSON export with conventional localhost defaults, config/env/CLI overrides, and `metrics export` operator wiring; the evidence artifact is `docs/benchmarks/curator_observability_defaults_2026-08-13.json`.
+- [x] Decision: default to `http://127.0.0.1:4318/v1/{metrics,traces,logs}` with explicit override and best-effort export semantics.
+- [x] Code: implement the exporter path in `src/obs.rs` and wire it through bootstrap, config, and the admin CLI.
+- [x] Proof: `otlp_metrics_smoke_posts_json_to_loopback_collector` emits and receives a real HTTP request on a loopback collector.
+- [x] Docs: update `ObservabilityAudit.md`, `README.md`, and `HANDOFF.md`.
 
 ### GAP-014 — Federation (deferred)
 Audit evidence (2026-07-07): no multi-host state exchange or federation transport exists in `src/`; the feature remains deferred in the roadmap only.
@@ -89,18 +89,18 @@ Audit evidence (2026-07-07): CrossCheck batch signatures now persist key ids and
 
 ## Curator Pair Gaps
 
-### GAP-CU-001 — Librarian default model (open)
-Audit evidence (2026-07-07): `Node::new` uses `DeterministicBackend` unless operators configure both `[curator].external_cmd` and `pinned.librarian`.
-- [ ] Decision: ratify the production default Librarian model family/size.
-- [ ] Code: make the pinned default runtime real in bootstrap/config rather than falling back to deterministic-only default behavior.
-- [ ] Proof: add startup/self-test coverage that verifies the default weight pin and model-family assumptions.
-- [ ] Docs: update `LibrarianCell.md`, `BootstrapOperator.md`, and `HANDOFF.md`.
+### GAP-CU-001 — Librarian default model (closed)
+Audit evidence (2026-08-13): production config selects `gemma-2-2b-it-q4_k_m`, verifies the pinned SHA-256 weight file, and wires the GGUF backend through `LibrarianCell`; development mode is explicit. The evidence artifact is `docs/benchmarks/curator_observability_defaults_2026-08-13.json`.
+- [x] Decision: ratify Gemma 2 2B Instruct Q4_K_M as the production Librarian default.
+- [x] Code: make the pinned default runtime real in bootstrap/config; missing runner or weights fails closed instead of silently selecting deterministic mode.
+- [x] Proof: `production_curator_defaults_are_pinned_and_family_distinct` plus bootstrap self-test model-selection validation cover the pin and runtime mode.
+- [x] Docs: update `LibrarianCell.md`, `BootstrapOperator.md`, and `HANDOFF.md`.
 
-### GAP-CU-002 — Warden default model (open)
-Audit evidence (2026-07-07): `WardenCell::new` takes no backend/model configuration, so the live Warden path is still deterministic evidence checks rather than a pinned Qwen runtime.
-- [ ] Decision: ratify the production default Warden model family/size.
-- [ ] Code: make the pinned default runtime real in bootstrap/config rather than deterministic fallback only.
-- [ ] Proof: add startup/self-test coverage that verifies the Warden default and the model-family difference from the Librarian.
-- [ ] Docs: update `WardenCell.md`, `BootstrapOperator.md`, and `HANDOFF.md`.
+### GAP-CU-002 — Warden default model (closed)
+Audit evidence (2026-08-13): production config selects the distinct `qwen2.5-coder-1.5b-q4_k_m` family, verifies its pinned SHA-256 weight file, and injects the backend into `WardenCell`; the bootstrap self-test rejects a non-GGUF production backend. The evidence artifact is `docs/benchmarks/curator_observability_defaults_2026-08-13.json`.
+- [x] Decision: ratify Qwen 2.5 Coder 1.5B Q4_K_M as the production Warden default.
+- [x] Code: make the pinned default runtime real in bootstrap/config and use the configured backend for the semantic Librarian audit pass.
+- [x] Proof: `production_curator_defaults_are_pinned_and_family_distinct`, `WardenCell` backend wiring, and bootstrap self-test model-selection validation cover the family distinction and runtime mode.
+- [x] Docs: update `WardenCell.md`, `BootstrapOperator.md`, and `HANDOFF.md`.
 
 _End of GAP_CLOSURE_CHECKLIST.md._

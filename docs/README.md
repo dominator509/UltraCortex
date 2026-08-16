@@ -80,7 +80,7 @@ $ ultracortex congruence audit     # check the 13 docs in sync
 
 ## Status
 
-v1.0 specification complete. The current checkout now compiles and passes `cargo test` locally, but it is not gap-complete: the audited open/closed register lives in `HANDOFF.md`, and Phase 1G remains the final Curator Pair + Adjudication acceptance gate.
+v1.0 specification complete. The current checkout compiles and passes `cargo test` locally, and the second-pass in-scope gap checklist is closed. The audited register lives in `HANDOFF.md`; GAP-001 through GAP-005 and GAP-014 remain intentionally deferred product-scope work. Production Curator boot still requires the operator-owned `llama-cli` runner and the two pinned GGUF files, with no software credential required.
 
 ## License
 

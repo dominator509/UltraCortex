@@ -86,6 +86,10 @@ impl LibrarianCell {
         }
     }
 
+    pub fn backend_id(&self) -> String {
+        self.backend.backend_id()
+    }
+
     /// Process one curation job. Returns the produced output (for the
     /// Router to WAL-persist, store private facets in CAS, and enqueue the
     /// Warden audit).

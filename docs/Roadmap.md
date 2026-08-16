@@ -227,7 +227,10 @@ Local status: closed in the current checkout. CrossCheck batch signatures now pe
 
 ### B1F.1 — OTel exporter defaults
 **Closes:** GAP-013.
-Local status: docs name OTLP export, but `src/obs.rs` still stops at in-process Metrics/Logger/AuditChain, so this gap remains open.
+Local status: closed in the current checkout. `OtlpConfig` and `OtlpExporter`
+provide conventional localhost OTLP/HTTP JSON endpoints with TOML/env/CLI
+overrides; `ultracortex metrics export` and the loopback smoke test exercise
+the path.
 ### B1F.2 — Congruence delta acceptance UI
 **Closes:** GAP-NT-004.
 ### B1F.3 — Severity tag propagation across cross-cell calls
@@ -287,14 +290,18 @@ The HyperCortex roadmap above (Phases 0 → 1F) remains normative for UltraCorte
 **SPEC-DERIVED:** LibrarianCell.md.
 **Deliverables:** Gemma 2 2B Q4_K_M mmap + RAM KV cache; async on `node.written`; PUBLIC/PRIVATE output split; subject to Trinity governance.
 **Closes:** **GAP-NT-013** (SummarizerCell subsumed), GAP-CU-001.
-Local status: Librarian behavior closes GAP-NT-013 locally, but the production Gemma default remains open because this checkout still uses `DeterministicBackend` unless operators configure and pin the optional GGUF seam.
+Local status: closed in the current checkout. Production bootstrap pins and
+verifies the Gemma 2 2B Instruct GGUF slot and fails closed if the runner or
+weight artifact is missing; development mode is explicit.
 **Exit:** Skeleton generation deterministic under WAL replay; ~180 ms p50 CPU.
 
 ### B1G.5 — WardenCell (Qwen 2.5 Coder 1.5B)
 **SPEC-DERIVED:** WardenCell.md.
 **Deliverables:** Qwen 2.5 Coder 1.5B Q4_K_M mmap + RAM KV cache (different family verified); opt-in sync via `flags.semantic_check`; auto-sync on `severity=P0`; async audit of Librarian outputs.
 **Closes:** GAP-CU-002.
-Local status: Warden behavior exists locally, but the production Qwen default remains open because the live Warden path is still deterministic evidence checks and no Qwen/GGUF backend is wired into `WardenCell` yet.
+Local status: closed in the current checkout. Production bootstrap pins and
+verifies the distinct Qwen 2.5 Coder 1.5B GGUF slot, injects it into
+`WardenCell`, and self-test rejects a non-GGUF production backend.
 **Exit:** Audit-the-Librarian and sanity-check-the-Warden flows pass conformance tests.
 
 ### B1G.6 — AdjudicatorCell + Rotating LLM Pool

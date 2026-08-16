@@ -1,0 +1,27 @@
+{
+  "name": "curator_observability_defaults",
+  "recorded_at": "2026-08-13",
+  "command": "cargo test",
+  "suite_result": "162 passed (7 suites, 11.04s)",
+  "checks": [
+    "src/curator/mod.rs::tests::production_curator_defaults_are_pinned_and_family_distinct",
+    "src/bootstrap/mod.rs::self_test model-selection validation",
+    "src/obs.rs::tests::otlp_defaults_are_conventional_and_overrideable",
+    "src/obs.rs::tests::otlp_metrics_smoke_posts_json_to_loopback_collector"
+  ],
+  "defaults": {
+    "librarian_model": "gemma-2-2b-it-q4_k_m",
+    "librarian_sha256": "e0aee85060f168f0f2d8473d7ea41ce2f3230c1bc1374847505ea599288a7787",
+    "warden_model": "qwen2.5-coder-1.5b-q4_k_m",
+    "warden_sha256": "0c3c38b9d1e2d6fa227b321b4d30ba921e1f7694a42a0ba207020cc58576fccc",
+    "otlp_metrics_endpoint": "http://127.0.0.1:4318/v1/metrics",
+    "otlp_traces_endpoint": "http://127.0.0.1:4318/v1/traces",
+    "otlp_logs_endpoint": "http://127.0.0.1:4318/v1/logs"
+  },
+  "notes": [
+    "Production Curator boot fails closed when llama-cli or either pinned GGUF file is absent or has the wrong SHA-256.",
+    "--dry-run and the conformance suite use explicit development mode and do not require model files or software credentials.",
+    "OTLP export is explicit and best-effort; metric increments never perform collector network I/O."
+  ],
+  "status": "pass"
+}

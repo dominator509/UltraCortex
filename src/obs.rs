@@ -17,10 +17,12 @@ use crate::core::cbor::Cbor;
 use crate::core::crypto::{hex, sha256};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Metrics
@@ -113,6 +115,191 @@ impl Metrics {
         }
         out
     }
+
+    /// Encode the current in-process registry as OTLP/HTTP JSON. The exporter
+    /// is intentionally explicit: metric increments never perform network IO.
+    pub fn otlp_json(&self) -> String {
+        let snapshot = self.snapshot();
+        let mut metrics = String::new();
+        for (idx, (name, value)) in snapshot.iter().enumerate() {
+            if idx > 0 {
+                metrics.push(',');
+            }
+            let (metric_name, kind) = if let Some(name) = name.strip_suffix("(gauge)") {
+                (name, "gauge")
+            } else {
+                (name.as_str(), "sum")
+            };
+            metrics.push('{');
+            push_json_kv(&mut metrics, "name", metric_name, true);
+            metrics.push(',');
+            if kind == "gauge" {
+                metrics.push_str("\"gauge\":{\"dataPoints\":[{\"asInt\":");
+                metrics.push_str(&value.to_string());
+                metrics.push_str("}]}");
+            } else {
+                metrics.push_str("\"sum\":{\"aggregationTemporality\":2,\"isMonotonic\":true,\"dataPoints\":[{\"asInt\":");
+                metrics.push_str(&value.to_string());
+                metrics.push_str("}]}");
+            }
+            metrics.push('}');
+        }
+        format!(
+            "{{\"resourceMetrics\":[{{\"resource\":{{\"attributes\":[{{\"key\":\"service.name\",\"value\":{{\"stringValue\":\"ultracortex\"}}}}]}},\"scopeMetrics\":[{{\"scope\":{{\"name\":\"ultracortex.obs\"}},\"metrics\":[{metrics}]}}]}}]}}"
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OTLP/HTTP exporter
+// ---------------------------------------------------------------------------
+
+/// Dependency-free OTLP/HTTP JSON configuration. The endpoints match the
+/// OpenTelemetry Collector defaults and can be overridden per node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OtlpConfig {
+    pub enabled: bool,
+    pub metrics_endpoint: String,
+    pub traces_endpoint: String,
+    pub logs_endpoint: String,
+    pub timeout_ms: u64,
+}
+
+impl Default for OtlpConfig {
+    fn default() -> Self {
+        OtlpConfig {
+            enabled: true,
+            metrics_endpoint: "http://127.0.0.1:4318/v1/metrics".into(),
+            traces_endpoint: "http://127.0.0.1:4318/v1/traces".into(),
+            logs_endpoint: "http://127.0.0.1:4318/v1/logs".into(),
+            timeout_ms: 1_000,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OtlpExportReceipt {
+    pub endpoint: String,
+    pub status_code: Option<u16>,
+    pub bytes: usize,
+    pub skipped: bool,
+}
+
+pub struct OtlpExporter {
+    config: Mutex<OtlpConfig>,
+}
+
+impl OtlpExporter {
+    pub fn new(config: OtlpConfig) -> OtlpExporter {
+        OtlpExporter {
+            config: Mutex::new(config),
+        }
+    }
+
+    pub fn config(&self) -> OtlpConfig {
+        self.config.lock().unwrap().clone()
+    }
+
+    pub fn configure(&self, config: OtlpConfig) {
+        *self.config.lock().unwrap() = config;
+    }
+
+    /// Export a point-in-time metric snapshot. This is a best-effort,
+    /// operator-triggered path so a collector outage cannot stall the Router.
+    pub fn export_metrics(&self, metrics: &Metrics) -> Result<OtlpExportReceipt, String> {
+        let config = self.config();
+        if !config.enabled {
+            return Ok(OtlpExportReceipt {
+                endpoint: config.metrics_endpoint,
+                status_code: None,
+                bytes: 0,
+                skipped: true,
+            });
+        }
+        let body = metrics.otlp_json();
+        let (status_code, bytes) = post_json(
+            &config.metrics_endpoint,
+            &body,
+            Duration::from_millis(config.timeout_ms.max(1)),
+        )?;
+        if !(200..300).contains(&status_code) {
+            return Err(format!(
+                "OTLP metrics endpoint {} returned HTTP {status_code}",
+                config.metrics_endpoint
+            ));
+        }
+        Ok(OtlpExportReceipt {
+            endpoint: config.metrics_endpoint,
+            status_code: Some(status_code),
+            bytes,
+            skipped: false,
+        })
+    }
+}
+
+fn post_json(endpoint: &str, body: &str, timeout: Duration) -> Result<(u16, usize), String> {
+    let (host, port, path) = parse_http_endpoint(endpoint)?;
+    let mut addrs = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|e| format!("OTLP endpoint {endpoint}: resolve failed: {e}"))?;
+    let addr = addrs
+        .next()
+        .ok_or_else(|| format!("OTLP endpoint {endpoint}: no resolved address"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, timeout)
+        .map_err(|e| format!("OTLP endpoint {endpoint}: connect failed: {e}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| format!("OTLP endpoint {endpoint}: read timeout failed: {e}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| format!("OTLP endpoint {endpoint}: write timeout failed: {e}"))?;
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("OTLP endpoint {endpoint}: write failed: {e}"))?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|e| format!("OTLP endpoint {endpoint}: read failed: {e}"))?;
+    let status_line = response
+        .split(|b| *b == b'\n')
+        .next()
+        .ok_or_else(|| format!("OTLP endpoint {endpoint}: empty response"))?;
+    let status_code = status_line
+        .split(|b| *b == b' ')
+        .nth(1)
+        .and_then(|raw| std::str::from_utf8(raw).ok())
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .ok_or_else(|| format!("OTLP endpoint {endpoint}: malformed HTTP status"))?;
+    Ok((status_code, body.len()))
+}
+
+fn parse_http_endpoint(endpoint: &str) -> Result<(String, u16, String), String> {
+    let rest = endpoint
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("OTLP endpoint must use http://: {endpoint}"))?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let path = if path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{path}")
+    };
+    let (host, port) = if let Some((host, port)) = authority.rsplit_once(':') {
+        (
+            host.trim_matches(['[', ']']).to_string(),
+            port.parse::<u16>()
+                .map_err(|_| format!("OTLP endpoint has invalid port: {endpoint}"))?,
+        )
+    } else {
+        (authority.to_string(), 80)
+    };
+    if host.is_empty() {
+        return Err(format!("OTLP endpoint has empty host: {endpoint}"));
+    }
+    Ok((host, port, path))
 }
 
 // ---------------------------------------------------------------------------
@@ -452,5 +639,73 @@ mod tests {
         assert!(content.contains("\"at\":42"));
         assert!(content.contains("\\\"q"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn otlp_defaults_are_conventional_and_overrideable() {
+        let cfg = OtlpConfig::default();
+        assert_eq!(cfg.metrics_endpoint, "http://127.0.0.1:4318/v1/metrics");
+        assert_eq!(cfg.traces_endpoint, "http://127.0.0.1:4318/v1/traces");
+        assert_eq!(cfg.logs_endpoint, "http://127.0.0.1:4318/v1/logs");
+        assert!(cfg.enabled);
+        assert!(parse_http_endpoint("http://localhost:4318/v1/metrics").is_ok());
+        assert!(parse_http_endpoint("https://localhost:4318/v1/metrics").is_err());
+    }
+
+    #[test]
+    fn otlp_metrics_smoke_posts_json_to_loopback_collector() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            let mut expected = None;
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if expected.is_none() {
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        expected = headers.lines().find_map(|line| {
+                            line.strip_prefix("Content-Length: ")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        });
+                    }
+                }
+                if let Some(body_len) = expected {
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        if request.len() >= end + 4 + body_len {
+                            break;
+                        }
+                    }
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+
+        let cfg = OtlpConfig {
+            metrics_endpoint: format!("http://{addr}/v1/metrics"),
+            ..OtlpConfig::default()
+        };
+        let exporter = OtlpExporter::new(cfg);
+        let metrics = Metrics::new();
+        metrics.inc("ultracortex.test");
+        let receipt = exporter.export_metrics(&metrics).unwrap();
+        assert_eq!(receipt.status_code, Some(200));
+        assert!(!receipt.skipped);
+        let request = server.join().unwrap();
+        assert!(request.contains("POST /v1/metrics HTTP/1.1"));
+        assert!(request.contains("\"resourceMetrics\""));
+        assert!(request.contains("ultracortex.test"));
     }
 }

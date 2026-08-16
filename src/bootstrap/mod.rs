@@ -30,7 +30,7 @@ use crate::curator::ledger::{
 };
 use crate::curator::{CuratorConfig, CuratorKvBudgetProfile};
 use crate::node::{ids, Node};
-use crate::obs::AuditChain;
+use crate::obs::{AuditChain, OtlpConfig};
 use crate::persist::wal::{replay_dir, WalOp};
 use crate::persist::{EncryptionTier, Manifest};
 use crate::router::captoken::{
@@ -60,6 +60,7 @@ pub struct Config {
     pub uds_path: Option<PathBuf>,
     pub tcp_addr: Option<String>,
     pub curator: CuratorConfig,
+    pub observability: OtlpConfig,
 }
 
 impl Default for Config {
@@ -78,6 +79,7 @@ impl Default for Config {
             uds_path: None, // defaults to <data_dir>/ultracortex.sock
             tcp_addr: None, // "127.0.0.1:7741" when enabled
             curator: CuratorConfig::default(),
+            observability: OtlpConfig::default(),
         }
     }
 }
@@ -190,15 +192,48 @@ impl Config {
         if let Some(v) = get("curator", "external_cmd").and_then(|v| v.as_str().map(String::from)) {
             self.curator.external_cmd = if v.is_empty() { None } else { Some(v) };
         }
+        if let Some(v) = get("curator", "librarian_model")
+            .and_then(|v| v.as_str().map(String::from))
+        {
+            self.curator.librarian_model = v;
+        }
+        if let Some(v) = get("curator", "warden_model")
+            .and_then(|v| v.as_str().map(String::from))
+        {
+            self.curator.warden_model = v;
+        }
         if let Some(v) = get("curator", "pool").and_then(|v| v.as_str().map(String::from)) {
             let pool: Vec<String> = v
                 .split(',')
                 .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            .filter(|s| !s.is_empty())
+            .collect();
             if !pool.is_empty() {
                 self.curator.adjudicator_pool = pool;
             }
+        }
+
+        // [observability]
+        if let Some(v) = get("observability", "otlp_enabled").and_then(|v| v.as_bool()) {
+            self.observability.enabled = v;
+        }
+        if let Some(v) = get("observability", "otlp_metrics_endpoint")
+            .and_then(|v| v.as_str().map(String::from))
+        {
+            self.observability.metrics_endpoint = v;
+        }
+        if let Some(v) = get("observability", "otlp_traces_endpoint")
+            .and_then(|v| v.as_str().map(String::from))
+        {
+            self.observability.traces_endpoint = v;
+        }
+        if let Some(v) = get("observability", "otlp_logs_endpoint")
+            .and_then(|v| v.as_str().map(String::from))
+        {
+            self.observability.logs_endpoint = v;
+        }
+        if let Some(v) = get("observability", "otlp_timeout_ms").and_then(|v| v.as_int()) {
+            self.observability.timeout_ms = v.max(1) as u64;
         }
         // [curator.pinned]: model = "sha256hex"
         if let Some(section) = doc.get("curator.pinned") {
@@ -213,7 +248,7 @@ impl Config {
 }
 
 type EnvSetter = fn(&mut Config, &str) -> UcResult<()>;
-const ENV_KEYS: [(&str, EnvSetter); 9] = [
+const ENV_KEYS: [(&str, EnvSetter); 14] = [
     ("UC_NODE_ID", |c, v| {
         c.node_id = v.to_string();
         Ok(())
@@ -253,6 +288,33 @@ const ENV_KEYS: [(&str, EnvSetter); 9] = [
             crate::proto::validate_tcp_listen_addr(v)?;
             Some(v.to_string())
         };
+        Ok(())
+    }),
+    ("UC_OTLP_ENABLED", |c, v| {
+        c.observability.enabled = match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => true,
+            "0" | "false" | "no" => false,
+            _ => return Err(UcError::schema("bad UC_OTLP_ENABLED")),
+        };
+        Ok(())
+    }),
+    ("UC_OTLP_METRICS_ENDPOINT", |c, v| {
+        c.observability.metrics_endpoint = v.to_string();
+        Ok(())
+    }),
+    ("UC_OTLP_TRACES_ENDPOINT", |c, v| {
+        c.observability.traces_endpoint = v.to_string();
+        Ok(())
+    }),
+    ("UC_OTLP_LOGS_ENDPOINT", |c, v| {
+        c.observability.logs_endpoint = v.to_string();
+        Ok(())
+    }),
+    ("UC_OTLP_TIMEOUT_MS", |c, v| {
+        c.observability.timeout_ms = v
+            .parse::<u64>()
+            .map_err(|_| UcError::schema("bad UC_OTLP_TIMEOUT_MS"))?
+            .max(1);
         Ok(())
     }),
     ("UC_CURATOR_TOPOLOGY", |c, v| {
@@ -299,6 +361,28 @@ fn apply_kv(cfg: &mut Config, k: &str, v: &str) -> UcResult<()> {
                 crate::proto::validate_tcp_listen_addr(v)?;
                 Some(v.to_string())
             }
+        }
+        "observability.otlp_enabled" => {
+            cfg.observability.enabled = match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" => true,
+                "0" | "false" | "no" => false,
+                _ => return Err(UcError::schema("bad observability.otlp_enabled")),
+            };
+        }
+        "observability.otlp_metrics_endpoint" => {
+            cfg.observability.metrics_endpoint = v.to_string();
+        }
+        "observability.otlp_traces_endpoint" => {
+            cfg.observability.traces_endpoint = v.to_string();
+        }
+        "observability.otlp_logs_endpoint" => {
+            cfg.observability.logs_endpoint = v.to_string();
+        }
+        "observability.otlp_timeout_ms" => {
+            cfg.observability.timeout_ms = v
+                .parse::<u64>()
+                .map_err(|_| UcError::schema("bad observability.otlp_timeout_ms"))?
+                .max(1);
         }
         "curator.kv_budget_profile" => {
             cfg.curator.kv_budget_profile = CuratorKvBudgetProfile::from_str(v)
@@ -354,6 +438,7 @@ pub fn boot(cfg: &Config) -> UcResult<BootReport> {
         cfg.curator.clone(),
         cfg.embedder_dim,
     )?);
+    node.otlp.configure(cfg.observability.clone());
 
     // B3 — provision (fresh) or recover, Trinity-first.
     let prior = Manifest::load(&cfg.data_dir)?;
@@ -718,6 +803,21 @@ pub fn self_test(node: &Arc<Node>) -> UcResult<u32> {
             )))
         }
     };
+
+    // Model defaults are part of the boot contract, even though this guard
+    // is not a separate numbered Router check. Node::open already verifies
+    // the SHA pins and weight files; self-test also confirms the selected
+    // runtime backends match the configured production/development mode.
+    node.curator_cfg.validate_model_pair()?;
+    let librarian_backend = node.curators.librarian.lock().unwrap().backend_id();
+    let warden_backend = node.curators.warden.lock().unwrap().backend_id();
+    if node.curator_cfg.strict_model_pins
+        && (!librarian_backend.starts_with("gguf.") || !warden_backend.starts_with("gguf."))
+    {
+        return Err(UcError::internal(
+            "self-test B5 model selection: production Curator backend is not GGUF",
+        ));
+    }
 
     let operator = issue_operator_token(&*node.signer, "operator");
     let agent = issue_agent_token(&*node.signer, "selftest-agent", 0);
@@ -1461,7 +1561,10 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
         }
         "curator status" => {
             let (p, a, q) = node.curators.librarian.lock().unwrap().counts();
-            let audits = node.curators.warden.lock().unwrap().audit_count();
+            let warden = node.curators.warden.lock().unwrap();
+            let audits = warden.audit_count();
+            let warden_backend = warden.backend_id();
+            let librarian_backend = node.curators.librarian.lock().unwrap().backend_id();
             let ledger = node.cross_check.lock().unwrap();
             let kv_budgets = node.curator_cfg.kv_budgets();
             Ok(Cbor::map(vec![
@@ -1469,6 +1572,20 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
                 ("librarian_active", Cbor::U64(a as u64)),
                 ("librarian_quarantined", Cbor::U64(q as u64)),
                 ("warden_audits", Cbor::U64(audits as u64)),
+                (
+                    "librarian_model",
+                    Cbor::t(node.curator_cfg.librarian_model.clone()),
+                ),
+                (
+                    "warden_model",
+                    Cbor::t(node.curator_cfg.warden_model.clone()),
+                ),
+                ("librarian_backend", Cbor::t(librarian_backend)),
+                ("warden_backend", Cbor::t(warden_backend)),
+                (
+                    "strict_model_pins",
+                    Cbor::Bool(node.curator_cfg.strict_model_pins),
+                ),
                 (
                     "agreement_rate",
                     ledger.agreement_rate().map(Cbor::F64).unwrap_or(Cbor::Null),
@@ -1606,6 +1723,24 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
                 .collect();
             Ok(Cbor::map(vec![("metrics", Cbor::Array(items))]))
         }
+        "metrics export" => {
+            let receipt = node
+                .otlp
+                .export_metrics(&node.metrics)
+                .map_err(UcError::internal)?;
+            Ok(Cbor::map(vec![
+                ("endpoint", Cbor::t(receipt.endpoint)),
+                (
+                    "status_code",
+                    receipt
+                        .status_code
+                        .map(|v| Cbor::U64(v as u64))
+                        .unwrap_or(Cbor::Null),
+                ),
+                ("bytes", Cbor::U64(receipt.bytes as u64)),
+                ("skipped", Cbor::Bool(receipt.skipped)),
+            ]))
+        }
         "shutdown" => {
             node.shutdown()?;
             Ok(Cbor::map(vec![("shutdown", Cbor::Bool(true))]))
@@ -1670,6 +1805,7 @@ pub fn run(cfg: &Config) -> UcResult<()> {
 /// boot in a temp dir, no listeners.
 pub fn dry_run() -> UcResult<BootReport> {
     let mut cfg = Config::default();
+    cfg.curator = CuratorConfig::development();
     let seq = DRY_RUN_SEQ.fetch_add(1, Ordering::Relaxed);
     cfg.data_dir = std::env::temp_dir().join(format!(
         "ultracortex-dryrun-{}-{}-{}",
@@ -1702,6 +1838,7 @@ mod tests {
     #[test]
     fn recovery_restores_written_facts() {
         let mut cfg = Config::default();
+        cfg.curator = CuratorConfig::development();
         cfg.data_dir =
             std::env::temp_dir().join(format!("ultracortex-recover-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cfg.data_dir);
@@ -1735,6 +1872,10 @@ mod tests {
     fn admin_verbs_respond() {
         let report = dry_run().unwrap();
         let node = report.node;
+        node.otlp.configure(OtlpConfig {
+            enabled: false,
+            ..OtlpConfig::default()
+        });
         let verbs = [
             "status",
             "budget defaults",
@@ -1747,6 +1888,7 @@ mod tests {
             "cross-check tail",
             "adjudicator stats",
             "metrics",
+            "metrics export",
             "audit verify",
         ];
         for v in verbs {
@@ -1802,7 +1944,7 @@ mod tests {
             EncryptionTier::T3,
             7,
             ShardTopology::Dedicated,
-            CuratorConfig::default(),
+            CuratorConfig::development(),
             256,
         )
         .unwrap());
@@ -2142,6 +2284,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cfg.data_dir);
         cfg.uds_path = Some(cfg.data_dir.join("ultracortex.sock"));
         cfg.trinity_topology = ShardTopology::CoTenantShard0;
+        cfg.curator = CuratorConfig::development();
         cfg.curator.topology = ShardTopology::CoTenantShard0;
         cfg.curator.kv_budget_profile = CuratorKvBudgetProfile::Small;
 
@@ -2237,6 +2380,36 @@ mod tests {
 
         let bad = minitoml::parse("[listen]\ntcp = \"192.168.1.25:7741\"\n").unwrap();
         assert!(cfg.apply_toml(&bad).is_err());
+    }
+
+    #[test]
+    fn otlp_config_override_surface_roundtrips() {
+        let mut cfg = Config::default();
+        apply_kv(
+            &mut cfg,
+            "observability.otlp_metrics_endpoint",
+            "http://127.0.0.1:9999/v1/metrics",
+        )
+        .unwrap();
+        apply_kv(&mut cfg, "observability.otlp_enabled", "false").unwrap();
+        apply_kv(&mut cfg, "observability.otlp_timeout_ms", "2500").unwrap();
+        assert!(!cfg.observability.enabled);
+        assert_eq!(
+            cfg.observability.metrics_endpoint,
+            "http://127.0.0.1:9999/v1/metrics"
+        );
+        assert_eq!(cfg.observability.timeout_ms, 2500);
+
+        let doc = minitoml::parse(
+            "[observability]\notlp_enabled = true\notlp_logs_endpoint = \"http://localhost:4318/v1/logs\"\n",
+        )
+        .unwrap();
+        cfg.apply_toml(&doc).unwrap();
+        assert!(cfg.observability.enabled);
+        assert_eq!(
+            cfg.observability.logs_endpoint,
+            "http://localhost:4318/v1/logs"
+        );
     }
 
     #[test]

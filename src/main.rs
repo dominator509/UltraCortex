@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! ultracortex run [--config PATH] [--set key=value]... [--dry-run]
-//! ultracortex status | snapshot | metrics | shutdown
+//! ultracortex status | snapshot | metrics [export] | shutdown
 //! ultracortex quarantine list | reinject <qid> | reject <qid>
 //! ultracortex gap list
 //! ultracortex audit verify
@@ -108,6 +108,7 @@ fn cmd_admin(args: &[String]) -> Result<(), String> {
         [v] if matches!(v.as_str(), "status" | "snapshot" | "metrics" | "shutdown") => {
             (v.clone(), Cbor::Null)
         }
+        [m, sub] if m == "metrics" && sub == "export" => ("metrics export".into(), Cbor::Null),
         [g, sub] if g == "gap" && sub == "list" => ("gap list".into(), Cbor::Null),
         [b, sub] if b == "budget" && sub == "defaults" => ("budget defaults".into(), Cbor::Null),
         [g, sub] if g == "quarantine" && sub == "list" => ("quarantine list".into(), Cbor::Null),

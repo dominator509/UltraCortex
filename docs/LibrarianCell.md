@@ -19,7 +19,10 @@ Async-only. Never in the default pre-validation hot path. Subject to mutual acco
 - Apache 2.0 license. Proven on-device deployment (Chrome).
 - Pinned by SHA-256 in `ContractCell`. Swapping = a Decision record, never silent merge.
 
-**Alternates:** Gemma 3, SmolLM-2 1.7B (smaller deployments). **[GAP-CU-001]**.
+**Alternates:** Gemma 3, SmolLM-2 1.7B (smaller deployments). Production
+configuration pins the default model identity and SHA-256; missing local
+weights or runner fail closed. `--dry-run` uses an explicit deterministic
+development backend.
 
 ## §3 State
 
@@ -93,7 +96,9 @@ The proposed SummarizerCell from HyperCortex is subsumed. Skeleton generation is
 ## §11 GAPs
 | ID | Description |
 |---|---|
-| GAP-CU-001 | Librarian default model |
+No open Librarian default-model gap remains. `CuratorConfig::default()` pins
+Gemma 2 2B Instruct Q4_K_M; `CuratorConfig::development()` is the only path
+that selects the deterministic backend.
 | GAP-CU-003 | Confidence-band threshold defaults |
 
 ## §12 Congruence Contract

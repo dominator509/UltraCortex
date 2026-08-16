@@ -87,8 +87,11 @@ OTel-compatible. Every Envelope opens a root span at the Router; child spans for
 
 ### §3.4 Export
 
-OTLP/gRPC to configurable collector. **[GAP-013]** default endpoint.
-Current-checkout note: `src/obs.rs` still implements only in-process Metrics/Logger/AuditChain; the exporter path itself has not been wired yet.
+OTLP/HTTP JSON to a configurable collector. The current checkout defaults to
+`http://127.0.0.1:4318/v1/metrics`, `/v1/traces`, and `/v1/logs`, with
+`[observability]`, `UC_OTLP_*`, and `--set observability.*` overrides. Export is
+explicit and best-effort through `ultracortex metrics export`; the Router never
+performs collector network I/O on a metric increment.
 
 ---
 
@@ -235,7 +238,7 @@ Every release MUST pass:
 
 | ID | Description |
 |----|-------------|
-| GAP-013    | OTel exporter default endpoints |
+| GAP-013    | OTel exporter default endpoints — closed by `OtlpConfig`/`OtlpExporter` and the loopback smoke test |
 
 ---
 

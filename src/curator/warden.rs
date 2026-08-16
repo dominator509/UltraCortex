@@ -23,7 +23,8 @@
 
 use super::librarian::CurationJob;
 use super::{
-    ConfidenceBand, CuratorOperation, CuratorOutput, CuratorPrivate, CuratorPublic, SubstrateView,
+    ConfidenceBand, CuratorBackend, CuratorOperation, CuratorOutput, CuratorPrivate, CuratorPublic,
+    DeterministicBackend, SubstrateView, Verdict,
 };
 use crate::cells::{CellBehavior, CellType};
 use crate::core::cbor::Cbor;
@@ -62,17 +63,27 @@ pub struct AuditRecord {
 
 pub struct WardenCell {
     pub id: CellId,
+    backend: std::sync::Arc<dyn CuratorBackend>,
     audits: BTreeMap<String, AuditRecord>,
     seq_by_target: BTreeMap<String, String>, // target_output -> judgment
 }
 
 impl WardenCell {
     pub fn new(id: CellId) -> Self {
+        Self::with_backend(id, std::sync::Arc::new(DeterministicBackend))
+    }
+
+    pub fn with_backend(id: CellId, backend: std::sync::Arc<dyn CuratorBackend>) -> Self {
         WardenCell {
             id,
+            backend,
             audits: BTreeMap::new(),
             seq_by_target: BTreeMap::new(),
         }
+    }
+
+    pub fn backend_id(&self) -> String {
+        self.backend.backend_id()
     }
 
     /// Harvest handle-shaped substrings from every text value in a payload.
@@ -256,7 +267,7 @@ impl WardenCell {
         //    - skeleton must be non-empty and grounded;
         //    - supersede proposal must cite both sides;
         //    - the body must not itself hallucinate handles.
-        let verdict = (|| {
+        let structural_verdict = (|| {
             for h in Self::harvest_handles(&Cbor::t(output.body.clone())) {
                 if !view.handle_exists(&h) {
                     return AuditVerdict::Fail {
@@ -276,6 +287,27 @@ impl WardenCell {
                 _ => AuditVerdict::Pass,
             }
         })();
+        // Structural checks remain fail-closed. A configured model gets a
+        // second, independent semantic pass; it may reject a structurally
+        // valid output, but never turns a hard grounding failure into a pass.
+        let verdict = match structural_verdict {
+            AuditVerdict::Pass if self.backend.backend_id() != "deterministic.v1" => {
+                let evidence = vec![
+                    "supports_initiator: structural grounding and schema checks passed".into(),
+                    format!(
+                        "supports_initiator: target={} is auditable",
+                        output.target_handle
+                    ),
+                ];
+                match self.backend.adjudicate(seed, &output.body, &evidence) {
+                    Verdict::AuditorCorrect => AuditVerdict::Fail {
+                        reason: "configured Warden model rejected the Librarian output".into(),
+                    },
+                    _ => AuditVerdict::Pass,
+                }
+            }
+            other => other,
+        };
 
         let rec = AuditRecord {
             judgment_handle,
@@ -350,10 +382,10 @@ impl CellBehavior for WardenCell {
                     .map(audit_to_cbor)
                     .ok_or_else(|| UcError::not_found(format!("no audit for {target}")))
             }
-            Some("status") | None => Ok(Cbor::map(vec![(
-                "audits",
-                Cbor::U64(self.audits.len() as u64),
-            )])),
+            Some("status") | None => Ok(Cbor::map(vec![
+                ("audits", Cbor::U64(self.audits.len() as u64)),
+                ("backend", Cbor::t(self.backend_id())),
+            ])),
             _ => Err(UcError::schema("warden: unknown op")),
         }
     }

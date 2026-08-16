@@ -31,7 +31,7 @@ use crate::curator::warden::WardenCell;
 use crate::curator::{
     CuratorBackend, CuratorConfig, DeterministicBackend, ExternalGgufBackend, SubstrateView,
 };
-use crate::obs::{AuditChain, Logger, Metrics};
+use crate::obs::{AuditChain, Logger, Metrics, OtlpConfig, OtlpExporter};
 use crate::persist::wal::WalWriter;
 use crate::persist::{CasStore, EncryptionTier, Kms, Manifest, PrefixCacheStore, SnapshotStore};
 use crate::router::captoken::{HmacSigner, Signer};
@@ -79,6 +79,31 @@ pub mod ids {
 }
 
 pub const SNAPSHOT_PAUSE_TARGET_US: u64 = 50_000;
+
+fn configured_curator_backend(
+    data_dir: &Path,
+    slot: &str,
+    model_name: &str,
+    sha: Option<&String>,
+    external_cmd: Option<&String>,
+    strict: bool,
+    metrics: &Arc<Metrics>,
+) -> UcResult<Arc<dyn CuratorBackend>> {
+    match (external_cmd, sha) {
+        (Some(cmd), Some(sha)) => Ok(Arc::new(ExternalGgufBackend::new_for_slot(
+            data_dir,
+            slot,
+            model_name,
+            sha,
+            cmd,
+            Some(metrics.clone()),
+        )?)),
+        _ if strict => Err(UcError::unsupported(format!(
+            "curator {slot} default requires pinned {model_name} weights and a local GGUF runner"
+        ))),
+        _ => Ok(Arc::new(DeterministicBackend)),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SnapshotOutcome {
@@ -155,6 +180,7 @@ pub struct Node {
 
     // Observability + wiring.
     pub metrics: Arc<Metrics>,
+    pub otlp: OtlpExporter,
     pub logger: Logger,
     pub audit: Mutex<AuditChain>,
     pub events: Mutex<EventBus>,
@@ -178,6 +204,7 @@ impl Node {
     ) -> UcResult<Node> {
         std::fs::create_dir_all(data_dir).map_err(UcError::from)?;
         let metrics = Arc::new(Metrics::new());
+        curator_cfg.validate_model_pair()?;
         let kms = Arc::new(Kms::open(data_dir, tier)?);
         let cas = Arc::new(CasStore::open(data_dir)?);
         let snapshots = SnapshotStore::open(data_dir)?;
@@ -200,19 +227,24 @@ impl Node {
         // Curator backends: pinned GGUF when configured + present, else the
         // deterministic backend. A missing/unverifiable weight file is a
         // hard error only when explicitly pinned (Bootstrap B3 fail-fast).
-        let lib_backend: Arc<dyn CuratorBackend> = match (
-            curator_cfg.external_cmd.as_ref(),
+        let lib_backend = configured_curator_backend(
+            data_dir,
+            "librarian",
+            &curator_cfg.librarian_model,
             curator_cfg.pinned.get("librarian"),
-        ) {
-            (Some(cmd), Some(sha)) => Arc::new(ExternalGgufBackend::new(
-                data_dir,
-                "librarian",
-                sha,
-                cmd,
-                Some(metrics.clone()),
-            )?),
-            _ => Arc::new(DeterministicBackend),
-        };
+            curator_cfg.external_cmd.as_ref(),
+            curator_cfg.strict_model_pins,
+            &metrics,
+        )?;
+        let warden_backend = configured_curator_backend(
+            data_dir,
+            "warden",
+            &curator_cfg.warden_model,
+            curator_cfg.pinned.get("warden"),
+            curator_cfg.external_cmd.as_ref(),
+            curator_cfg.strict_model_pins,
+            &metrics,
+        )?;
         let pool: Vec<(String, Arc<dyn CuratorBackend>)> = curator_cfg
             .adjudicator_pool
             .iter()
@@ -288,7 +320,7 @@ impl Node {
             }),
             curators: Curators {
                 librarian: Mutex::new(LibrarianCell::new(ids::LIBRARIAN, lib_backend)),
-                warden: Mutex::new(WardenCell::new(ids::WARDEN)),
+                warden: Mutex::new(WardenCell::with_backend(ids::WARDEN, warden_backend)),
                 adjudicator: Mutex::new(AdjudicatorCell::new(ids::ADJUDICATOR, pool)),
             },
             cross_check: Mutex::new(cross_check),
@@ -310,6 +342,7 @@ impl Node {
             view_cache,
             manifest: Mutex::new(manifest),
             metrics,
+            otlp: OtlpExporter::new(OtlpConfig::default()),
             logger,
             audit: Mutex::new(audit),
             events: Mutex::new(EventBus::new()),
@@ -332,7 +365,7 @@ impl Node {
             EncryptionTier::T1,
             42,
             ShardTopology::Dedicated,
-            CuratorConfig::default(),
+            CuratorConfig::development(),
             256,
         )
     }

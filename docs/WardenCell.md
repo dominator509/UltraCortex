@@ -20,7 +20,11 @@ Opt-in sync on `flags.semantic_check`. Auto-sync on `severity=P0`. Async on Libr
 - **MUST be a different model family than Librarian.** (CURATOR_PAIR_PROTOCOL.md §5.2)
 - Pinned by SHA-256 in `ContractCell`. Swap = Decision.
 
-**Alternates:** Phi-3.5 Mini (heavier reasoning), Qwen 2.5 Coder 3B (larger deployments). **[GAP-CU-002]**.
+**Alternates:** Phi-3.5 Mini (heavier reasoning), Qwen 2.5 Coder 3B (larger deployments).
+Production configuration pins Qwen 2.5 Coder 1.5B Q4_K_M and injects its
+backend into `WardenCell`; the family must differ from the Librarian. Missing
+local weights or runner fail closed, while `--dry-run` uses explicit
+development mode.
 
 ## §3 State
 
@@ -106,7 +110,9 @@ On every Warden flag (`FlagDrift` | `FlagHallucination`):
 ## §11 GAPs
 | ID | Description |
 |---|---|
-| GAP-CU-002 | Warden default model |
+No open Warden default-model gap remains. Production `WardenCell` receives the
+SHA-verified Qwen backend from bootstrap and uses it for the semantic audit
+pass after fail-closed structural grounding checks.
 | GAP-CU-004 | Disagreement quota bounds |
 | GAP-CU-007 | Adjudicator pool composition |
 | GAP-CU-008 | Adjudicator rotation policy |

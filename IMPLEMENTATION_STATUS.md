@@ -1,6 +1,6 @@
 # IMPLEMENTATION_STATUS — UltraCortex v1.0 Rust tree
 
-Status date: 2026-07-07. Sources of truth: the 22 spec documents in
+Status date: 2026-08-13. Sources of truth: the 22 spec documents in
 `docs/`; conflicts resolved in favor of CURATOR_PAIR_PROTOCOL.md and
 NATIVE_TRINITY.md per Architecture.md §1.
 
@@ -10,7 +10,7 @@ This tree was authored in a sandbox **without a Rust toolchain or
 network access**. That was true during authoring, but this checkout has
 since been compiled and locally validated on **2026-07-07**:
 
-- `cargo test` now passes locally (`158 passed`, 7 suites);
+- `cargo test` now passes locally (`162 passed`, 7 suites);
 - the standard-vector and conformance coverage below still matters, but
   the remaining work is no longer "first compile" uncertainty;
 - the audited open/closed gap register now lives in `docs/HANDOFF.md`.
@@ -44,7 +44,7 @@ deployment gaps remain open in `docs/HANDOFF.md`.
 | D6 | Async curation consumer on `node.written` | **Synchronous curation** inside the write path | Deterministic, replay-exact, and makes B5 self-tests direct. Seam: `router::run_curation_cycle` — an async consumer is a drop-in (spawn + queue) at the cost of replay complexity. |
 | D7 | SIGTERM/SIGINT graceful shutdown | Admin `shutdown` verb over the socket; no signal handler | std has no signal API and libc is a dependency. `ultracortex shutdown` performs the identical snapshot → sync → clean-manifest sequence. Unclean kills are covered by WAL replay + torn-tail truncation. |
 | D8 | TLS on TCP | None; UDS 0600 preferred, TCP loopback-only and fail-closed on non-loopback binds | The current v1.0 transport policy is explicit: local tooling may use plaintext loopback TCP, while LAN/multi-host TCP is out of scope until a future TLS-bearing transport lands. |
-| D9 | Curator models Gemma-2-2B / Qwen-2.5-1.5B / pool via llama.cpp FFI | `CuratorBackend` trait: deterministic backend default; `ExternalGgufBackend` shells out to a pinned, SHA-verified llama-cli with temp 0 + seed | No weights or toolchain in the authoring sandbox. The deterministic backend is *functional* (lexical-centrality extractive skeletons, evidence-tally adjudication), not a stub. GGUF path is config-only (`[curator] external_cmd` + `[curator.pinned]`). Inference failures fall back + `curator.backend_fallback`. |
+| D9 | Curator models Gemma-2-2B / Qwen-2.5-1.5B / pool via llama.cpp FFI | Production config now selects distinct SHA-pinned Gemma 2 2B and Qwen 2.5 Coder 1.5B GGUF slots; `ExternalGgufBackend` and `WardenCell` are wired to the pinned runner. | Large GGUF files and `llama-cli` remain operator-owned deployment artifacts, not repository contents. Missing or unverifiable production artifacts fail closed; only explicit `--dry-run`/test development mode uses the deterministic backend. |
 | D10 | Blob/Timeline/Scratchpad WAL replay | Snapshot-covered; WAL frames written for forensics but only Fact/Supersede/CuratorOutput frames re-applied on recovery | Bounded loss = one group-commit window between snapshots for those cells. Fact state — the governance-critical surface — replays fully. Extend `bootstrap::replay_frame` per cell to close. |
 | D11 | Group commit 250 µs / 256 KiB, epoch roll at 1 GiB | Implemented in `persist::wal` per spec constants | Not perf-validated (no runtime). |
 
@@ -66,7 +66,7 @@ deployment gaps remain open in `docs/HANDOFF.md`.
 | CrossCheckLedgerCell.md | curator/ledger.rs | ✅ own WAL stream (FLAG_CROSS_CHECK), W=200 window, >0.99 suspicious / <0.92 miscalibration, batch HMAC every 256 @ T2+, persisted signature sidecar + recovery verification |
 | MemoryCells / IndexCells / CoordCells docs | cells/ | ✅ Fact s-p-o w/ supersession, Timeline, Scratchpad TTL, Playbook, Blob→CAS, Cache; HNSW (seeded, rebuild-identical), BM25, Graph, Reranker; AgentRegistry (revocation, escalation), Proposal quorum, Subscription globs |
 | DeepSeekOptimization.md | deepseek.rs, router/view.rs | ✅ prefix-stable view layout, FIM wrap, R1 strip, flat lowercase tools manifest |
-| ObservabilitySpec.md | obs.rs | ✅ counters/gauges/histograms, structured JSONL log, hash-chained audit log + verify |
+| ObservabilitySpec.md | obs.rs | ✅ counters/gauges/histograms, structured JSONL log, hash-chained audit log + verify, dependency-free OTLP/HTTP JSON exporter with localhost defaults and override config |
 | ConformanceSuite.md | tests/conformance.rs | ✅ T1–T8, C1–C10 implemented (see §4) |
 | ThreatModel.md | throughout | ✅ mapped: token tamper/expiry/revocation tests, P19 non-disclosure (denial identical for absent vs excluded), quarantine non-drop, collusion tripwires · residual: no rate limiting, no TLS |
 | DeploymentGuide.md / OperatorRunbook.md | README, main.rs | ✅ CLI + verbs; systemd/unit files not included |

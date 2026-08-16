@@ -276,8 +276,8 @@ Curator weight files are stored on disk and **pinned by SHA-256 in `ContractCell
 
 ```
 weights/
-  gemma-2-2b-q4_k_m/<sha256>.gguf       # LibrarianCell
-  qwen-2.5-coder-1.5b-q4_k_m/<sha256>.gguf  # WardenCell
+  librarian/<sha256>.gguf              # Gemma 2 2B Instruct, LibrarianCell
+  warden/<sha256>.gguf                 # Qwen 2.5 Coder 1.5B, WardenCell
   phi-3.5-mini-q4_k_m/<sha256>.gguf     # Adjudicator pool
   llama-3.2-3b-q4_k_m/<sha256>.gguf     # Adjudicator pool
   smollm-2-1.7b-q4_k_m/<sha256>.gguf    # Adjudicator pool
@@ -339,7 +339,7 @@ The bit-deterministic recovery sequence (PersistenceLayer §8) gets one new step
 
 ## §A.6 KV Budget Profiles (Closed GAP-CU-010)
 
-The unresolved budget-policy gap is now closed by the supported `small` / `reference` / `heavy` profiles above. The current checkout still treats these as operator planning limits rather than sampled live cache telemetry; the open curator-runtime gaps are the default model seams in `GAP-CU-001` and `GAP-CU-002`.
+The unresolved budget-policy gap is now closed by the supported `small` / `reference` / `heavy` profiles above. The current checkout still treats these as operator planning limits rather than sampled live cache telemetry. Curator default-model selection is closed: production pins distinct Gemma and Qwen GGUF slots, while development mode is explicit.
 
 ## §A.7 Congruence Contract (Updated)
 

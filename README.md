@@ -28,7 +28,7 @@ Implementation coverage, deviations, and known gaps are tracked in
 - Package: `ultracortex`
 - Toolchain target: Rust `1.75+`
 - License field: `LicenseRef-TBD`
-- Local validation: `cargo test` passes (`158 passed`, 7 suites).
+- Local validation: `cargo test` passes (`162 passed`, 7 suites).
 - Acceptance bench: [`tests/acceptance_bench.rs`](tests/acceptance_bench.rs) records `856` bytes p50, `1052` bytes p99, `84.21%` prefix-cache hit rate, and `0.25` hydrate/recall ratio; the measured artifact lives at [`docs/benchmarks/deepseek_acceptance_2026-07-07.json`](docs/benchmarks/deepseek_acceptance_2026-07-07.json).
 - Snapshot bench: [`tests/acceptance_bench.rs`](tests/acceptance_bench.rs) records `392 µs` p50 and `562 µs` p99/max for the admin snapshot pause window on a seeded Router workload; the measured artifact lives at [`docs/benchmarks/snapshot_pause_2026-07-07.json`](docs/benchmarks/snapshot_pause_2026-07-07.json).
 
@@ -98,6 +98,7 @@ ultracortex curator status
 ultracortex cross-check tail
 ultracortex adjudicator stats
 ultracortex metrics
+ultracortex metrics export
 ultracortex shutdown
 ```
 
@@ -106,7 +107,16 @@ agreement band should stay in the documented range, `rationale_access_denied`
 should remain non-zero, and `probe_missed` should stay at zero.
 `audit verify` now checks the audit hash chain plus completed CrossCheck
 batch signatures, and the `kms` verbs expose the local T3 custody /
-rotation seam.
+rotation seam. `metrics export` posts the in-process registry as OTLP/HTTP
+JSON to the configured collector (default `http://127.0.0.1:4318/v1/metrics`).
+
+Production Curator boot selects SHA-pinned Gemma 2 2B Q4_K_M for the
+Librarian and Qwen 2.5 Coder 1.5B Q4_K_M for the Warden. Place the verified
+files at `ultracortex-data/weights/librarian/<sha256>.gguf` and
+`ultracortex-data/weights/warden/<sha256>.gguf`, and put `llama-cli` on PATH;
+`ultracortex curator verify-weights` checks them. `--dry-run` and the test
+suite intentionally use explicit development mode, so they need neither
+model files nor software credentials.
 
 ## Repository layout
 
