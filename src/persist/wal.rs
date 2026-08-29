@@ -71,6 +71,8 @@ pub enum WalOp {
     CrossCheck = 7,
     AdminOp = 8,
     Checkpoint = 9,
+    Prepare = 10,
+    Commit = 11,
 }
 
 impl WalOp {
@@ -85,6 +87,8 @@ impl WalOp {
             7 => WalOp::CrossCheck,
             8 => WalOp::AdminOp,
             9 => WalOp::Checkpoint,
+            10 => WalOp::Prepare,
+            11 => WalOp::Commit,
             _ => return None,
         })
     }

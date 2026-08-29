@@ -223,6 +223,73 @@ impl CrossCheckLedgerCell {
         self.kms = Some(kms);
     }
 
+    /// Build the next ledger record without making it visible. The Router
+    /// durably commits the record through Node before calling apply_record.
+    #[allow(clippy::too_many_arguments)]
+    pub fn next_record(
+        &self,
+        logical_at: u64,
+        kind: CrossCheckKind,
+        initiator: &str,
+        auditor: &str,
+        outcome: CrossCheckOutcome,
+        adjudication: Option<String>,
+    ) -> CrossCheckRecord {
+        CrossCheckRecord {
+            seq: self.next_seq,
+            kind,
+            initiator: initiator.to_string(),
+            auditor: auditor.to_string(),
+            outcome,
+            adjudication,
+            logical_at,
+        }
+    }
+
+    /// Apply a record whose WAL transaction has already committed. This is
+    /// deliberately separate from append so an audit/WAL failure cannot leave
+    /// a visible ledger record that recovery would later replay differently.
+    pub fn apply_record(&mut self, metrics: &Metrics, rec: CrossCheckRecord) -> UcResult<u64> {
+        if rec.seq < self.next_seq {
+            return Ok(rec.seq);
+        }
+        if rec.seq != self.next_seq {
+            return Err(UcError::internal(format!(
+                "cross-check record sequence gap: expected {}, got {}",
+                self.next_seq, rec.seq
+            )));
+        }
+        let bytes = rec.to_cbor().encode();
+        self.batch_hashes.push(sha256(&bytes));
+
+        self.by_initiator
+            .entry(rec.initiator.clone())
+            .or_default()
+            .push(rec.seq);
+        *self.by_outcome.entry(rec.outcome.as_str()).or_insert(0) += 1;
+        if rec.kind == CrossCheckKind::WardenAudit {
+            if self.audit_window.len() == AGREEMENT_WINDOW {
+                self.audit_window.pop_front();
+            }
+            self.audit_window
+                .push_back(rec.outcome == CrossCheckOutcome::Agree);
+            match self.health() {
+                AgreementHealth::SuspiciousAgreement => metrics.inc("curator.suspicious_agreement"),
+                AgreementHealth::Miscalibration => metrics.inc("curator.miscalibration"),
+                _ => {}
+            }
+        }
+        metrics.inc("cross_check.records");
+
+        if self.next_seq % BATCH_SIGN_EVERY == BATCH_SIGN_EVERY - 1 {
+            self.sign_batch()?;
+        }
+
+        self.records.push(rec);
+        self.next_seq += 1;
+        Ok(self.next_seq - 1)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn append(
         &mut self,

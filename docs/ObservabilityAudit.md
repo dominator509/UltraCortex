@@ -166,7 +166,7 @@ struct AuditRecord {
 
 ### §5.4 Signing
 
-Current checkout: T2/T3 CrossCheck batches carry key-id HMAC evidence, T3 custody state persists in `kms/keyring.cbor`, `ultracortex kms rotate` emits `kms.key_rotated`, and batch-signature metadata persists in `wal/cross_check/batch-signatures.cbor`. Required application events are emitted synchronously from Router, Curator, admin, subscription, and snapshot paths; append or flush failure is returned and moves the node toward shutdown rather than being dropped.
+Current checkout: T2/T3 CrossCheck batches carry key-id HMAC evidence, T3 custody state persists in `kms/keyring.cbor`, `ultracortex kms rotate` emits `kms.key_rotated`, and batch-signature metadata persists in `wal/cross_check/batch-signatures.cbor`. Required application events are emitted synchronously from Router, Curator, admin, subscription, and snapshot paths; `snapshot.completed` is part of the forensic chain rather than ordinary logging only. State-changing WAL operations use a prepare/audit/commit gate, so append or flush failure is returned before commit and moves the node toward shutdown rather than being dropped.
 
 ### §5.5 Replay Verification
 

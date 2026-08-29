@@ -1,6 +1,6 @@
 # IMPLEMENTATION_STATUS — UltraCortex v1.0 Rust tree
 
-Status date: 2026-08-27. Sources of truth: the specification documents in
+Status date: 2026-08-28. Sources of truth: the specification documents in
 `docs/`, plus `RELEASE_AUDIT_REMEDIATION.md` for the supplied independent
 audit; conflicts are resolved in favor of CURATOR_PAIR_PROTOCOL.md and
 NATIVE_TRINITY.md per Architecture.md §1.
@@ -23,12 +23,13 @@ WAL-first transition, Curator governance, protocol, and CI gates. Run the
 commands in the remediation record against the final release commit; do not
 use the historical baseline above as release evidence.
 
-The current audit-remediation working-tree gate on 2026-08-27 is:
+The current audit-remediation working-tree gate on 2026-08-28 is:
 
 - `cargo fmt --check` passed;
 - `cargo clippy --all-targets --message-format=short -- -D warnings`
   passed;
-- `cargo test --all-targets` passed (`171 passed`, 6 suites);
+- `cargo test --all-targets` passed (`172 passed`, 6 suites) after the
+  follow-up transaction changes;
 - `git diff --check` passed with no whitespace errors.
 
 These are local working-tree results, not hosted CI or production-model
@@ -64,7 +65,7 @@ deployment gaps remain open in `docs/HANDOFF.md`.
 | D7 | SIGTERM/SIGINT graceful shutdown | Admin `shutdown` verb over the socket; no signal handler | std has no signal API and libc is a dependency. `ultracortex shutdown` performs the identical snapshot → sync → clean-manifest sequence. Unclean kills are covered by WAL replay + torn-tail truncation. |
 | D8 | TLS on TCP | None; UDS 0600 preferred, TCP loopback-only and fail-closed on non-loopback binds | The current v1.0 transport policy is explicit: local tooling may use plaintext loopback TCP, while LAN/multi-host TCP is out of scope until a future TLS-bearing transport lands. |
 | D9 | Curator models Gemma-2-2B / Qwen-2.5-1.5B / pool via llama.cpp FFI | Production config now selects distinct SHA-pinned Gemma 2 2B and Qwen 2.5 Coder 1.5B GGUF slots; `ExternalGgufBackend` and `WardenCell` are wired to the pinned runner. | Large GGUF files and `llama-cli` remain operator-owned deployment artifacts, not repository contents. Missing or unverifiable production artifacts fail closed; only explicit `--dry-run`/test development mode uses the deterministic backend. |
-| D10 | Blob/Timeline/Scratchpad WAL replay | Fact, Blob, Timeline, Scratchpad, Subscription, CuratorOutput, and dedicated CrossCheck frames are replayed; fresh provisioning persists its manifest before serving | Crash recovery is covered by an abrupt-drop regression. OS-level process death and a complete production crash matrix remain release evidence gates. |
+| D10 | Blob/Timeline/Scratchpad WAL replay | Fact, Blob, Timeline, Scratchpad, Subscription, CuratorOutput, and dedicated CrossCheck frames are replayed; fresh provisioning persists its manifest before serving; state-changing operations use WAL `Prepare` + mandatory audit + `Commit` markers | Crash recovery is covered by abrupt-drop and uncommitted-prepare regression tests. OS-level process death and a complete production crash matrix remain release evidence gates. |
 | D11 | Group commit 250 µs / 256 KiB, epoch roll at 1 GiB | Implemented in `persist::wal` per spec constants | Not perf-validated (no runtime). |
 
 ## 3. Coverage matrix (spec doc → module(s) → state)

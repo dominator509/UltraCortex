@@ -110,6 +110,23 @@ L0 holds **no domain logic**. It writes bytes, fsyncs, and reads back identicall
 - Single `fsync` per group.
 - Target fan-in ≥ 16 frames p50.
 
+### §3.3.1 Durable Mutation Transactions
+
+State-changing Router, Curator, CrossCheck, and admin operations use a
+recoverable WAL/audit transaction:
+
+1. Append `Prepare` (op `10`) containing the canonical logical operation and
+   transaction id, then durably flush it.
+2. Append every mandatory forensic audit record for the operation, including
+   the transaction id, and durably flush each record.
+3. Append `Commit` (op `11`) for the transaction id, then durably flush it.
+4. Apply the operation to in-memory cells and acknowledge the request.
+
+Recovery replays a prepared operation only when its matching commit marker is
+present. A prepare without a commit is an aborted crash tail and is ignored;
+an orphan commit is a recovery error. Legacy one-frame records remain
+replayable for migration compatibility.
+
 ### §3.4 Trinity Carve-Outs
 
 Trinity Cells (DecisionLedger, SpecAnchor, GapCell, ContractCell, QuarantineCell)

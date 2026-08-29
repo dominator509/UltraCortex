@@ -42,7 +42,7 @@ use crate::curator::{
     facet_handle, ConfidenceBand, CuratorOperation, CuratorOutput, CuratorPublic,
 };
 use crate::node::{ids, Node};
-use crate::persist::wal::{WalFrame, WalOp};
+use crate::persist::wal::{WalFrame, WalOp, FLAG_CROSS_CHECK};
 use crate::persist::ViewKey;
 use crate::trinity::cells::SpecAnchorCell;
 use crate::trinity::chain::{run_pre_validation_durable, PreCtx};
@@ -282,12 +282,13 @@ fn handle_write(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelo
         CellType::Scratchpad => ids::SCRATCHPAD,
         _ => unreachable!(),
     };
-    if let Err(err) = node.append_wal(
-        if handle.is_empty() {
-            "timeline"
-        } else {
-            &handle
-        },
+    let wal_handle = if handle.is_empty() {
+        "timeline"
+    } else {
+        &handle
+    };
+    if let Err(err) = node.durable_transaction(
+        wal_handle,
         &WalFrame {
             logical_at: at,
             cell_id: cell_id.0,
@@ -296,18 +297,6 @@ fn handle_write(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelo
             flags: 0,
             payload: wal_payload,
         },
-    ) {
-        let mut t = node.trinity.lock().unwrap();
-        t.work_budget
-            .charge_post(&env.work_budget.task_id, reserved, 0);
-        return Err(err);
-    }
-
-    // The forensic intent is committed before any in-memory cell becomes
-    // visible. If the audit file cannot accept it, do not acknowledge or
-    // apply the write.
-    if let Err(err) = node.audit_event(
-        at,
         "state.write_durable",
         &[
             ("handle", Cbor::t(handle.clone())),
@@ -1166,7 +1155,7 @@ fn append_curator_output_wal(
             ])
         })
         .collect();
-    node.append_wal(
+    node.durable_transaction(
         &public.output_handle,
         &WalFrame {
             logical_at: at,
@@ -1181,9 +1170,6 @@ fn append_curator_output_wal(
             ])
             .encode(),
         },
-    )?;
-    node.audit_event(
-        at,
         audit_event,
         &[
             ("output_handle", Cbor::t(public.output_handle.clone())),
@@ -1213,7 +1199,7 @@ fn append_warden_audit_wal(
     at: u64,
     audit: &crate::curator::warden::AuditRecord,
 ) -> UcResult<()> {
-    node.append_wal(
+    node.durable_transaction(
         &audit.judgment_handle,
         &WalFrame {
             logical_at: at,
@@ -1227,9 +1213,6 @@ fn append_warden_audit_wal(
             ])
             .encode(),
         },
-    )?;
-    node.audit_event(
-        at,
         "warden.judgment_emitted",
         &[
             ("judgment_handle", Cbor::t(audit.judgment_handle.clone())),
@@ -1240,7 +1223,7 @@ fn append_warden_audit_wal(
 }
 
 fn append_warden_flag_wal(node: &Node, at: u64, flag: &CuratorPublic) -> UcResult<()> {
-    node.append_wal(
+    node.durable_transaction(
         &flag.output_handle,
         &WalFrame {
             logical_at: at,
@@ -1254,9 +1237,6 @@ fn append_warden_flag_wal(node: &Node, at: u64, flag: &CuratorPublic) -> UcResul
             ])
             .encode(),
         },
-    )?;
-    node.audit_event(
-        at,
         "warden.judgment_emitted",
         &[
             ("judgment_handle", Cbor::t(flag.output_handle.clone())),
@@ -1271,7 +1251,11 @@ fn append_adjudication_wal(
     at: u64,
     adjudication: &crate::curator::adjudicator::Adjudication,
 ) -> UcResult<()> {
-    node.append_wal(
+    let audit_fields = [
+        ("handle", Cbor::t(adjudication.handle.clone())),
+        ("resolution", Cbor::t(adjudication.resolution.as_str())),
+    ];
+    node.durable_transaction_with_audits(
         &adjudication.handle,
         &WalFrame {
             logical_at: at,
@@ -1288,21 +1272,9 @@ fn append_adjudication_wal(
             ])
             .encode(),
         },
-    )?;
-    node.audit_event(
-        at,
-        "adjudicator.invoked",
         &[
-            ("handle", Cbor::t(adjudication.handle.clone())),
-            ("resolution", Cbor::t(adjudication.resolution.as_str())),
-        ],
-    )?;
-    node.audit_event(
-        at,
-        "adjudicator.resolution",
-        &[
-            ("handle", Cbor::t(adjudication.handle.clone())),
-            ("resolution", Cbor::t(adjudication.resolution.as_str())),
+            ("adjudicator.invoked", &audit_fields),
+            ("adjudicator.resolution", &audit_fields),
         ],
     )?;
     Ok(())
@@ -1414,28 +1386,37 @@ fn ledger_append(
     outcome: CrossCheckOutcome,
     adjudication: Option<String>,
 ) -> UcResult<()> {
-    {
-        let mut ledger = node.cross_check.lock().unwrap();
-        ledger.append(
-            &node.metrics,
-            at,
-            kind,
-            initiator,
-            auditor,
-            outcome,
-            adjudication,
-        )?;
-    }
-    node.audit_event(
-        at,
+    // CrossCheck has a dedicated WAL stream, but it still participates in the
+    // same prepare/audit/commit protocol as shard-backed state. The ledger is
+    // not visible until the transaction is fully committed.
+    let rec = {
+        let ledger = node.cross_check.lock().unwrap();
+        ledger.next_record(at, kind, initiator, auditor, outcome, adjudication)
+    };
+    let rec_seq = rec.seq;
+    node.durable_transaction(
+        &format!("cross-check/{rec_seq}"),
+        &WalFrame {
+            logical_at: at,
+            cell_id: ids::CROSS_CHECK.0,
+            op: WalOp::CrossCheck,
+            schema_ver: 1,
+            flags: FLAG_CROSS_CHECK,
+            payload: rec.to_cbor().encode(),
+        },
         "cross_check.record_appended",
         &[
+            ("seq", Cbor::U64(rec_seq)),
             ("kind", Cbor::t(kind.as_str())),
             ("initiator", Cbor::t(initiator)),
             ("auditor", Cbor::t(auditor)),
             ("outcome", Cbor::t(outcome.as_str())),
         ],
     )?;
+    {
+        let mut ledger = node.cross_check.lock().unwrap();
+        ledger.apply_record(&node.metrics, rec)?;
+    }
     if kind == CrossCheckKind::WardenAudit && outcome == CrossCheckOutcome::Disagree {
         node.audit_event(
             at,
@@ -1488,7 +1469,7 @@ fn append_quarantine_wal(
     detail: &str,
     record: &Cbor,
 ) -> UcResult<()> {
-    node.append_wal(
+    node.durable_transaction(
         qid,
         &WalFrame {
             logical_at: absorbed_at,
@@ -1506,6 +1487,12 @@ fn append_quarantine_wal(
             ])
             .encode(),
         },
+        "task.quarantined",
+        &[
+            ("qid", Cbor::t(qid)),
+            ("cause", Cbor::t(cause.as_str())),
+            ("seed", Cbor::U64(seed)),
+        ],
     )?;
     Ok(())
 }
@@ -1653,15 +1640,9 @@ fn handle_supersede(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEn
         ])
         .encode(),
     };
-    if let Err(err) = node.append_wal(&old, &frame) {
-        let mut t = node.trinity.lock().unwrap();
-        t.work_budget
-            .charge_post(&env.work_budget.task_id, estimate, 0);
-        return Err(err);
-    }
-
-    if let Err(err) = node.audit_event(
-        at,
+    if let Err(err) = node.durable_transaction(
+        &old,
+        &frame,
         "state.supersede_durable",
         &[
             ("old", Cbor::t(old.clone())),
@@ -2086,7 +2067,7 @@ fn handle_subscribe(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEn
         let subs = node.cells.subscription.lock().unwrap();
         subs.next_subscription_id()
     };
-    node.append_wal(
+    node.durable_transaction(
         &sid,
         &WalFrame {
             logical_at: at,
@@ -2107,9 +2088,6 @@ fn handle_subscribe(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEn
             ])
             .encode(),
         },
-    )?;
-    node.audit_event(
-        at,
         "subscription.registered",
         &[
             ("sub_id", Cbor::t(sid.clone())),

@@ -6,9 +6,9 @@
 Four GAP namespaces: `GAP-NNN` (carryover), `GAP-NT-NNN` (Trinity), `GAP-DS-NNN` (DeepSeek), `GAP-CU-NNN` (Curator pair — NEW v1.0). Status: open / in_progress / blocked / resolved / quarantined / deferred / closed.
 
 Rows marked `closed` below are gaps whose implementation now exists in the current checkout and is covered by local code/tests. Rows marked `in_progress` have concrete behavior implemented but lack a full benchmark/closure proof. Rows left `open` or `deferred` remain real policy, benchmark, deployment, or runtime-environment gaps even if some supporting code already exists.
-The 2026-08-27 independent-audit remediation pass supersedes stale implementation notes in the status pages. The open and deferred rows below remain real policy, product-scope, benchmark, deployment, or runtime-environment gaps.
+The 2026-08-28 independent-audit follow-up supersedes stale implementation notes in the status pages. The open and deferred rows below remain real policy, product-scope, benchmark, deployment, or runtime-environment gaps.
 
-Source-confirmed release-audit findings are reconciled in [`RELEASE_AUDIT_REMEDIATION.md`](../RELEASE_AUDIT_REMEDIATION.md). That record covers AUD-001 through AUD-018 without changing the product-gap classifications below: implementation remediations are distinct from hosted, operator-owned, runtime, legal, and external-review evidence.
+Source-confirmed release-audit findings are reconciled in [`RELEASE_AUDIT_REMEDIATION.md`](../RELEASE_AUDIT_REMEDIATION.md). That record covers AUD-001 through AUD-020 without changing the product-gap classifications below: implementation remediations are distinct from hosted, operator-owned, runtime, legal, and external-review evidence.
 
 ## §1 Carryover GAPs
 | ID | Description | Phase | Status | Audit note |

@@ -33,7 +33,7 @@ use crate::curator::{
 };
 use crate::obs::{AuditChain, Logger, Metrics, OtlpConfig, OtlpExporter};
 use crate::persist::wal::{
-    payload_nonce, payload_purpose, WalFrame, WalPos, WalWriter, FLAG_CROSS_CHECK,
+    payload_nonce, payload_purpose, WalFrame, WalOp, WalPos, WalWriter, FLAG_CROSS_CHECK,
 };
 use crate::persist::{CasStore, EncryptionTier, Kms, Manifest, PrefixCacheStore, SnapshotStore};
 use crate::router::captoken::{HmacSigner, Signer};
@@ -86,6 +86,40 @@ pub const SNAPSHOT_PAUSE_TARGET_US: u64 = 50_000;
 /// wall-clock SLA should use the snapshot metrics separately.
 pub const AUTO_SNAPSHOT_LOGICAL_INTERVAL: u64 = 5 * 60 * 1_000;
 pub const AUTO_SNAPSHOT_WAL_BYTES: u64 = 1 << 30;
+
+pub type TransactionId = [u8; 32];
+
+fn transaction_id(handle: &str, frame: &WalFrame) -> TransactionId {
+    sha256(
+        &Cbor::map(vec![
+            ("handle", Cbor::t(handle)),
+            ("logical_at", Cbor::U64(frame.logical_at)),
+            ("cell_id", Cbor::U64(frame.cell_id)),
+            ("op", Cbor::U64(frame.op as u64)),
+            ("schema_ver", Cbor::U64(frame.schema_ver as u64)),
+            ("flags", Cbor::U64(frame.flags as u64)),
+            ("payload", Cbor::Bytes(frame.payload.clone())),
+        ])
+        .encode(),
+    )
+}
+
+fn prepare_payload(tx_id: TransactionId, frame: &WalFrame) -> Vec<u8> {
+    Cbor::map(vec![
+        ("tx_id", Cbor::Bytes(tx_id.to_vec())),
+        ("logical_at", Cbor::U64(frame.logical_at)),
+        ("cell_id", Cbor::U64(frame.cell_id)),
+        ("op", Cbor::U64(frame.op as u64)),
+        ("schema_ver", Cbor::U64(frame.schema_ver as u64)),
+        ("flags", Cbor::U64(frame.flags as u64)),
+        ("payload", Cbor::Bytes(frame.payload.clone())),
+    ])
+    .encode()
+}
+
+fn commit_payload(tx_id: TransactionId) -> Vec<u8> {
+    Cbor::map(vec![("tx_id", Cbor::Bytes(tx_id.to_vec()))]).encode()
+}
 
 fn configured_curator_backend(
     data_dir: &Path,
@@ -419,6 +453,74 @@ impl Node {
         result
     }
 
+    /// Commit a state-changing operation as one recoverable WAL/audit
+    /// transaction. A prepare is durable before the mandatory audit record;
+    /// recovery applies the operation only after it sees the matching commit.
+    pub fn durable_transaction(
+        &self,
+        handle: &str,
+        frame: &WalFrame,
+        event: &str,
+        fields: &[(&str, Cbor)],
+    ) -> UcResult<TransactionId> {
+        self.durable_transaction_with_audits(handle, frame, &[(event, fields)])
+    }
+
+    /// Commit a state-changing operation after all of its mandatory forensic
+    /// records have been durably appended. Multiple records are kept in the
+    /// same prepare/commit window so a later required audit cannot turn into a
+    /// client-visible failure followed by a replayed mutation.
+    pub fn durable_transaction_with_audits(
+        &self,
+        handle: &str,
+        frame: &WalFrame,
+        audits: &[(&str, &[(&str, Cbor)])],
+    ) -> UcResult<TransactionId> {
+        if audits.is_empty() {
+            return Err(UcError::schema(
+                "durable transaction requires a mandatory audit event",
+            ));
+        }
+        if matches!(frame.op, WalOp::Prepare | WalOp::Commit) {
+            return Err(UcError::schema(
+                "transaction payload cannot wrap a prepare or commit frame",
+            ));
+        }
+        let tx_id = transaction_id(handle, frame);
+        self.append_wal(
+            handle,
+            &WalFrame {
+                logical_at: frame.logical_at,
+                cell_id: frame.cell_id,
+                op: WalOp::Prepare,
+                schema_ver: 1,
+                flags: frame.flags,
+                payload: prepare_payload(tx_id, frame),
+            },
+        )?;
+
+        for &(event, fields) in audits {
+            let mut audit_fields = Vec::with_capacity(fields.len() + 2);
+            audit_fields.push(("tx_id", Cbor::Bytes(tx_id.to_vec())));
+            audit_fields.push(("tx_phase", Cbor::t("prepared")));
+            audit_fields.extend(fields.iter().map(|(key, value)| (*key, value.clone())));
+            self.audit_event(frame.logical_at, event, &audit_fields)?;
+        }
+
+        self.append_wal(
+            handle,
+            &WalFrame {
+                logical_at: frame.logical_at,
+                cell_id: frame.cell_id,
+                op: WalOp::Commit,
+                schema_ver: 1,
+                flags: frame.flags,
+                payload: commit_payload(tx_id),
+            },
+        )?;
+        Ok(tx_id)
+    }
+
     /// Decode a WAL payload, accepting pre-encryption frames for a bounded
     /// migration window. New frames are always marked by KMS.
     pub fn decode_wal_payload(&self, frame: &WalFrame) -> UcResult<Vec<u8>> {
@@ -624,6 +726,11 @@ impl Node {
         result
     }
 
+    #[cfg(test)]
+    pub fn fail_next_audit_append(&self) {
+        self.audit.lock().unwrap().fail_next_append();
+    }
+
     /// State hashes for the manifest (clean-shutdown integrity record).
     pub fn state_hashes(&self) -> BTreeMap<u64, [u8; 32]> {
         Self::state_hashes_for(&self.snapshot_all())
@@ -693,6 +800,18 @@ impl Node {
             .gauge_set("snapshot.last_total_us", total_us as i64);
         self.metrics
             .gauge_set("snapshot.last_cells", states.len() as i64);
+        self.audit_event(
+            at,
+            "snapshot.completed",
+            &[
+                ("pause_us", Cbor::U64(pause_us)),
+                ("total_us", Cbor::U64(total_us)),
+                ("pause_target_us", Cbor::U64(SNAPSHOT_PAUSE_TARGET_US)),
+                ("cells", Cbor::U64(states.len() as u64)),
+                ("snapshot", Cbor::t(snap_name.clone())),
+                ("within_target", Cbor::Bool(within_target)),
+            ],
+        )?;
         if !within_target {
             self.metrics.inc("snapshot.pause_target_exceeded");
             self.logger.warn(

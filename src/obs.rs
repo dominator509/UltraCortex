@@ -415,6 +415,8 @@ struct ChainState {
     writer: Option<BufWriter<File>>,
     prev_hash: [u8; 32],
     seq: u64,
+    #[cfg(test)]
+    fail_next_append: bool,
 }
 
 impl AuditChain {
@@ -450,6 +452,8 @@ impl AuditChain {
                 writer: Some(writer),
                 prev_hash,
                 seq,
+                #[cfg(test)]
+                fail_next_append: false,
             }),
         })
     }
@@ -462,8 +466,15 @@ impl AuditChain {
                 writer: None,
                 prev_hash: [0u8; 32],
                 seq: 0,
+                #[cfg(test)]
+                fail_next_append: false,
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub fn fail_next_append(&self) {
+        self.inner.lock().unwrap().fail_next_append = true;
     }
 
     /// Append an audit record. Returns the record's hash (the new chain head).
@@ -474,6 +485,11 @@ impl AuditChain {
         fields: &[(&str, Cbor)],
     ) -> Result<[u8; 32], String> {
         let mut st = self.inner.lock().unwrap();
+        #[cfg(test)]
+        if st.fail_next_append {
+            st.fail_next_append = false;
+            return Err("injected audit append failure".into());
+        }
         // encode() applies canonical key ordering, so insertion order is
         // irrelevant here.
         let fmap = Cbor::map(fields.iter().map(|(k, v)| (*k, v.clone())).collect());

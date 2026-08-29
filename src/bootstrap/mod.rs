@@ -39,6 +39,7 @@ use crate::router::captoken::{
 };
 use crate::router::envelope::{Envelope, EnvelopeFlags, WorkBudget, PROTO_VERSION};
 use crate::router::handle_envelope;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -737,22 +738,8 @@ fn recover(node: &Node, manifest: &Manifest) -> UcResult<u64> {
             .then_with(|| (a.op as u8).cmp(&(b.op as u8)))
             .then_with(|| a.flags.cmp(&b.flags))
     });
-    for frame in frames {
-        if frame.logical_at <= snapshot_at {
-            continue;
-        }
-        replay_frame(node, &frame)?;
-        replayed += 1;
-        node.clock.advance_to(frame.logical_at);
-    }
-    for frame in cross_check_frames {
-        if frame.logical_at <= snapshot_at {
-            continue;
-        }
-        replay_frame(node, &frame)?;
-        replayed += 1;
-        node.clock.advance_to(frame.logical_at);
-    }
+    replayed += replay_stream(node, frames, snapshot_at)?;
+    replayed += replay_stream(node, cross_check_frames, snapshot_at)?;
     node.clock.advance_to(manifest.logical_at);
 
     // Audit-chain verification.
@@ -782,6 +769,88 @@ fn recover(node: &Node, manifest: &Manifest) -> UcResult<u64> {
         &[("replayed", replayed.to_string())],
     );
     Ok(replayed)
+}
+
+/// Replay one physical WAL stream. New state changes use a prepare/audit/commit
+/// protocol: only a prepare paired with a commit may become visible after a
+/// restart. Legacy one-frame records remain directly replayable so existing
+/// installations can migrate without losing already committed state.
+fn replay_stream(node: &Node, frames: Vec<WalFrame>, snapshot_at: u64) -> UcResult<u64> {
+    let mut prepared = BTreeMap::<Vec<u8>, WalFrame>::new();
+    let mut replayed = 0u64;
+
+    for frame in frames {
+        if frame.logical_at <= snapshot_at {
+            continue;
+        }
+        match frame.op {
+            WalOp::Prepare => {
+                let payload = node.decode_wal_payload(&frame)?;
+                let body = Cbor::decode(&payload)?;
+                let tx_id = transaction_id_from_body(&body)?;
+                let op = WalOp::from_u8(body.req_u64("op")? as u8)
+                    .ok_or_else(|| UcError::schema("prepare WAL has an unknown operation"))?;
+                if matches!(op, WalOp::Prepare | WalOp::Commit) {
+                    return Err(UcError::schema(
+                        "prepare WAL cannot wrap a transaction marker",
+                    ));
+                }
+                let original_payload = body
+                    .get("payload")
+                    .and_then(|value| value.as_bytes())
+                    .ok_or_else(|| UcError::schema("prepare WAL has no operation payload"))?;
+                let original = WalFrame {
+                    logical_at: body.req_u64("logical_at")?,
+                    cell_id: body.req_u64("cell_id")?,
+                    op,
+                    schema_ver: body.req_u64("schema_ver")? as u8,
+                    flags: body.req_u64("flags")? as u16,
+                    payload: original_payload.to_vec(),
+                };
+                prepared.insert(tx_id.to_vec(), original);
+            }
+            WalOp::Commit => {
+                let payload = node.decode_wal_payload(&frame)?;
+                let body = Cbor::decode(&payload)?;
+                let tx_id = transaction_id_from_body(&body)?;
+                let original = prepared
+                    .remove(tx_id.as_slice())
+                    .ok_or_else(|| UcError::internal("commit WAL has no matching prepare"))?;
+                replay_frame(node, &original)?;
+                replayed += 1;
+                node.clock.advance_to(original.logical_at);
+            }
+            _ => {
+                replay_frame(node, &frame)?;
+                replayed += 1;
+                node.clock.advance_to(frame.logical_at);
+            }
+        }
+    }
+
+    if !prepared.is_empty() {
+        node.metrics
+            .add("boot.uncommitted_transactions", prepared.len() as u64);
+        node.logger.warn(
+            node.now(),
+            "bootstrap.uncommitted_transactions",
+            &[("count", prepared.len().to_string())],
+        );
+    }
+    Ok(replayed)
+}
+
+fn transaction_id_from_body(body: &Cbor) -> UcResult<[u8; 32]> {
+    let raw = body
+        .get("tx_id")
+        .and_then(|value| value.as_bytes())
+        .ok_or_else(|| UcError::schema("transaction marker has no tx_id"))?;
+    if raw.len() != 32 {
+        return Err(UcError::schema("transaction marker tx_id must be 32 bytes"));
+    }
+    let mut tx_id = [0u8; 32];
+    tx_id.copy_from_slice(raw);
+    Ok(tx_id)
 }
 
 /// Re-apply one WAL frame to in-memory state (idempotent for frames at or
@@ -984,6 +1053,11 @@ fn replay_frame(node: &Node, frame: &crate::persist::wal::WalFrame) -> UcResult<
             let mut t = node.trinity.lock().unwrap();
             t.quarantine
                 .replay_absorb(&qid, absorbed_at, seed, cause, &detail, record)?;
+        }
+        WalOp::Prepare | WalOp::Commit => {
+            return Err(UcError::internal(
+                "transaction marker reached direct WAL replay",
+            ));
         }
         WalOp::Decision | WalOp::QuarantineResolve => {
             return Err(UcError::unsupported(format!(
@@ -1501,7 +1575,21 @@ pub fn self_test(node: &Arc<Node>) -> UcResult<u32> {
 /// replays the same command through `replay_admin_op`, so operator mutations
 /// cannot silently disappear between snapshots.
 fn append_admin_wal(node: &Node, at: u64, verb: &str, args: &Cbor) -> UcResult<()> {
-    node.append_wal(
+    append_admin_wal_with_audits(node, at, verb, args, &[])
+}
+
+fn append_admin_wal_with_audits(
+    node: &Node,
+    at: u64,
+    verb: &str,
+    args: &Cbor,
+    extra_audits: &[(&str, &[(&str, Cbor)])],
+) -> UcResult<()> {
+    let admin_fields = [("verb", Cbor::t(verb)), ("args", args.clone())];
+    let mut audits = Vec::with_capacity(extra_audits.len() + 1);
+    audits.push(("admin.operation_durable", admin_fields.as_slice()));
+    audits.extend_from_slice(extra_audits);
+    node.durable_transaction_with_audits(
         "admin",
         &WalFrame {
             logical_at: at,
@@ -1511,11 +1599,7 @@ fn append_admin_wal(node: &Node, at: u64, verb: &str, args: &Cbor) -> UcResult<(
             flags: 0,
             payload: Cbor::map(vec![("verb", Cbor::t(verb)), ("args", args.clone())]).encode(),
         },
-    )?;
-    node.audit_event(
-        at,
-        "admin.operation_durable",
-        &[("verb", Cbor::t(verb)), ("args", args.clone())],
+        &audits,
     )?;
     Ok(())
 }
@@ -2125,15 +2209,17 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
                 }
             }
             let uphold = uphold_auditor;
-            append_admin_wal(node, at, &verb, &args)?;
-            node.audit_event(
+            let resolution_audit_fields = [
+                ("handle", Cbor::t(handle.clone())),
+                ("uphold_auditor", Cbor::Bool(uphold)),
+                ("target", Cbor::t(target.clone())),
+            ];
+            append_admin_wal_with_audits(
+                node,
                 at,
-                "adjudicator.human_resolution",
-                &[
-                    ("handle", Cbor::t(handle.clone())),
-                    ("uphold_auditor", Cbor::Bool(uphold)),
-                    ("target", Cbor::t(target.clone())),
-                ],
+                &verb,
+                &args,
+                &[("adjudicator.human_resolution", &resolution_audit_fields)],
             )?;
             {
                 let mut adj = node.curators.adjudicator.lock().unwrap();
@@ -2535,6 +2621,75 @@ mod tests {
         let recovered = boot(&cfg).unwrap();
         assert!(recovered.recovered);
         assert!(recovered.node.handle_exists(&handle));
+        recovered.node.shutdown().unwrap();
+        let _ = std::fs::remove_dir_all(&cfg.data_dir);
+    }
+
+    #[test]
+    fn audit_failure_does_not_replay_uncommitted_mutation() {
+        let seq = DRY_RUN_SEQ.fetch_add(1, Ordering::Relaxed);
+        let data_dir = std::env::temp_dir().join(format!(
+            "ultracortex-audit-failure-{}-{}",
+            std::process::id(),
+            seq
+        ));
+        let cfg = Config {
+            data_dir: data_dir.clone(),
+            uds_path: Some(data_dir.join("ultracortex.sock")),
+            curator: CuratorConfig::development(),
+            ..Config::default()
+        };
+        let _ = std::fs::remove_dir_all(&cfg.data_dir);
+
+        let report = boot(&cfg).unwrap();
+        let node = report.node.clone();
+        let handle = "fact/audit-failure-ghost";
+        let frame = WalFrame {
+            logical_at: node.tick(),
+            cell_id: ids::FACT.0,
+            op: WalOp::Write,
+            schema_ver: 1,
+            flags: 0,
+            payload: Cbor::map(vec![
+                ("handle", Cbor::t(handle)),
+                (
+                    "payload",
+                    Cbor::map(vec![
+                        ("subject", Cbor::t("audit-failure")),
+                        ("predicate", Cbor::t("status")),
+                        ("object", Cbor::t("must-not-replay")),
+                    ]),
+                ),
+                ("agent_id", Cbor::t("test")),
+                ("seed", Cbor::U64(1)),
+                ("anchor", Cbor::t("Architecture.md§4")),
+            ])
+            .encode(),
+        };
+
+        node.fail_next_audit_append();
+        assert!(node
+            .durable_transaction(
+                handle,
+                &frame,
+                "state.write_durable",
+                &[("handle", Cbor::t(handle))],
+            )
+            .is_err());
+        assert!(!node.handle_exists(handle));
+
+        for wal in &node.shard_wals {
+            wal.sync().unwrap();
+            wal.shutdown();
+        }
+        node.cross_check_wal.sync().unwrap();
+        node.cross_check_wal.shutdown();
+        drop(node);
+        drop(report);
+
+        let recovered = boot(&cfg).unwrap();
+        assert!(recovered.recovered);
+        assert!(!recovered.node.handle_exists(handle));
         recovered.node.shutdown().unwrap();
         let _ = std::fs::remove_dir_all(&cfg.data_dir);
     }
