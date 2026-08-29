@@ -29,6 +29,7 @@ fn agent(node: &Node, id: &str) -> ultracortex::router::captoken::CapToken {
     tok
 }
 
+#[allow(clippy::too_many_arguments)]
 fn env_for(
     node: &Node,
     token: &ultracortex::router::captoken::CapToken,

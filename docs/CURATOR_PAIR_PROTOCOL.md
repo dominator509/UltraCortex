@@ -6,6 +6,11 @@
 ## §0 Conventions
 RFC 2119. SPEC-DERIVED-§N.N. [GAP-CU-NNN] track open items. All times are logical clocks. All in-substrate LLMs subject to Trinity governance (P20).
 
+Current checkout: Librarian, Warden, and Adjudicator model-generated artifacts
+use the same durable Trinity pre-validation path before indexing, activation,
+or escalation. Durable quarantine, CrossCheck, and audit failures propagate
+instead of being acknowledged as successful output.
+
 ## §1 Mission
 Bind three Cells — `LibrarianCell`, `WardenCell`, `AdjudicatorCell` — into a self-policing semantic layer where:
 1. No in-substrate LLM has a privileged path.
@@ -78,7 +83,7 @@ Examples:
 "librarian/output/*  warden/judgment/*  !*/rationale.*  !*/reasoning_trace.*  !cross_check_ledger/*"
 ```
 
-Router rejects `hydrate` requests matching exclude globs → emits `curator.rationale_access_denied`. **This event MUST fire at the rate of legitimate audits.** Dropping to zero = guardrail silently disabled → HALT fails. **[GAP-CU-012]** canonicalization.
+Router rejects `hydrate` requests matching exclude globs → emits `curator.rationale_access_denied`. **This event MUST fire at the rate of legitimate audits.** Dropping to zero = guardrail silently disabled → HALT fails. Negation-glob canonicalization is implemented and covered by local conformance/self-tests.
 
 ## §5 Nine Anti-Collusion Guardrails
 
@@ -121,7 +126,13 @@ Warden MUST NOT see when Librarian wrote outputs or in what order. Capability sc
 Any handle in auditor's `grounded_in` MUST exist in FactCell/DecisionLedger/Contract **at audit time** AND MUST NOT have been produced by the audited Cell in the same envelope. Enforced by SpecAnchorCell → violations route to QuarantineCell cause=`GroundingViolation`.
 
 ### §5.9 Periodic Blind Re-Audit
-Deterministic schedule (1% sample, seeded by logical clock). Fresh Warden instance, empty KV. Re-audits past Curator output with substrate-as-of-original-write-time. Disagreement with original = drift caught. `audit_kind: BlindReaudit` in CrossCheckLedger. **[GAP-CU-011]**.
+Deterministic schedule (1% sample, seeded by logical clock). The current
+checkout creates a fresh Warden instance with empty KV and captures an
+isolated FrozenPublicView at the review boundary, excluding private facets and
+prior judgments. Disagreement with the original = drift caught.
+`audit_kind: BlindReaudit` in CrossCheckLedger. A full historical database
+view remains a production replay validation concern, not an assumption of the
+in-process implementation.
 
 ## §6 CrossCheckLedger Schema (Summary)
 Full spec in CrossCheckLedgerCell.md.

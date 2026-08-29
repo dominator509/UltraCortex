@@ -11,7 +11,10 @@ The Drift/Hallucination Warden is an **in-substrate LLM** that judges:
 - agent envelopes for **hallucinated handles or facts**;
 - LibrarianCell PUBLIC outputs (audits-the-Librarian flow per CURATOR_PAIR_PROTOCOL.md §1.2).
 
-Opt-in sync on `flags.semantic_check`. Auto-sync on `severity=P0`. Async on Librarian outputs. Subject to LibrarianCell sanity-check (reverse flow, escalation power only).
+Opt-in sync on `flags.semantic_check`. Auto-sync on `severity=P0`. In the
+current single-binary checkout, Librarian outputs are audited synchronously in
+the Router write path before the output is acknowledged or activated. Subject
+to LibrarianCell sanity-check (reverse flow, escalation power only).
 
 ## §2 Model Selection
 **Default:** Qwen 2.5 Coder 1.5B Q4_K_M.
@@ -42,7 +45,8 @@ pub struct WardenState {
 ## §4 Invocation Paths
 - **Opt-in sync** via `flags.semantic_check = true` on the envelope.
 - **Auto-sync** on `severity = P0` regardless of `flags.semantic_check`.
-- **Async** audit of every LibrarianCell PUBLIC output (lands as `RoutineAudit` in CrossCheckLedger).
+- **Synchronous** audit of every LibrarianCell PUBLIC output (lands as
+  `RoutineAudit` in CrossCheckLedger before the write response completes).
 - **Blind re-audit** triggered by deterministic schedule (1% sample, clean KV cache).
 
 ## §5 Output Schema
@@ -77,7 +81,8 @@ The Warden MUST NOT read:
 
 ## §7 Audit-the-Librarian Flow
 On every Librarian PUBLIC output landing as PENDING:
-1. Router enqueues an audit job to Warden shard.
+1. Router creates an isolated audit view and invokes Warden before returning
+   the write response.
 2. Warden independently re-derives grounding from substrate (NOT from Librarian's `grounded_in`).
 3. Warden emits judgment:
    - **Agree** → Decision recorded; pending output becomes Active.
@@ -104,20 +109,15 @@ On every Warden flag (`FlagDrift` | `FlagHallucination`):
 | Op | p50 | p99 |
 |---|---|---|
 | Envelope judgment (CPU AVX2) | ~140 ms | ~350 ms |
-| Librarian audit (async, batched-16) | ~75 ms/job effective | ~150 ms/job |
+| Librarian audit (synchronous, write-path) | ~75 ms/job effective | ~150 ms/job |
 | Blind re-audit | ~140 ms | ~350 ms |
 
 ## §11 GAPs
-| ID | Description |
-|---|---|
-No open Warden default-model gap remains. Production `WardenCell` receives the
-SHA-verified Qwen backend from bootstrap and uses it for the semantic audit
-pass after fail-closed structural grounding checks.
-| GAP-CU-004 | Disagreement quota bounds |
-| GAP-CU-007 | Adjudicator pool composition |
-| GAP-CU-008 | Adjudicator rotation policy |
-| GAP-CU-011 | Blind re-audit sample rate |
-| GAP-CU-012 | Negation glob canonicalization |
+No open Warden-specific implementation gap remains. Production `WardenCell`
+receives the SHA-verified Qwen backend from bootstrap and uses it for the
+semantic audit pass after fail-closed structural grounding checks. Cross-cutting
+Curator rows are tracked in `docs/HANDOFF.md`; the remaining production-model
+and runtime evidence gates are listed in `RELEASE_AUDIT_REMEDIATION.md`.
 
 ## §12 Congruence Contract
 Congruent with: Architecture.md (§16), CURATOR_PAIR_PROTOCOL.md, LibrarianCell.md, AdjudicatorCell.md, CrossCheckLedgerCell.md, RouterScheduler.md (`flags.semantic_check` + auto-P0 + escalation path), McpProtocol.md (`SemanticDrift`/`HallucinationDetected` error codes), ObservabilityAudit.md (warden.* metrics).

@@ -9,7 +9,10 @@
 //! - `request` / `response` — an [`Envelope`] and its
 //!   [`ResponseEnvelope`], each as canonical CBOR.
 //! - `admin` / `admin_ack` — operator-plane verbs, dispatched to
-//!   [`crate::bootstrap::admin_dispatch`].
+//!   [`crate::bootstrap::admin_dispatch`] after an operator capability token
+//!   is verified.
+//! - `events` / `events_ack` — authenticated pull delivery for subscriptions;
+//!   this v1 transport does not claim an asynchronous push channel.
 //!
 //! Listeners: a Unix domain socket (chmod 0600 — same-user only, §2.1) is
 //! the preferred transport; a TCP listener bound to 127.0.0.1:7741 is
@@ -18,9 +21,11 @@
 //! (IMPLEMENTATION_STATUS.md §4).
 
 use crate::core::cbor::Cbor;
-use crate::core::{UcError, UcResult};
+use crate::core::{Intent, UcError, UcResult};
 use crate::node::Node;
+use crate::router::captoken::CapToken;
 use crate::router::envelope::{Envelope, ResponseEnvelope, PROTO_VERSION};
+use crate::router::events::Event;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
@@ -85,6 +90,8 @@ pub fn hello_ack(node: &Node) -> Cbor {
                 ),
                 ("views_builtin", Cbor::Bool(true)),
                 ("cross_check_ledger", Cbor::Bool(true)),
+                ("events_pull_supported", Cbor::Bool(true)),
+                ("admin_capability_required", Cbor::Bool(true)),
             ]),
         ),
     ])
@@ -112,6 +119,109 @@ pub fn validate_tcp_listen_addr(addr: &str) -> UcResult<()> {
     Ok(())
 }
 
+fn verify_capability(node: &Arc<Node>, msg: &Cbor, intent: Intent) -> UcResult<CapToken> {
+    let token = CapToken::from_cbor(
+        msg.get("capability")
+            .ok_or_else(|| UcError::denied("message missing capability token"))?,
+    )?;
+    token.verify(&*node.signer, node.now())?;
+    if let Some(agent_id) = msg.opt_str("agent_id") {
+        if agent_id != token.agent_id {
+            return Err(UcError::denied(
+                "capability token agent_id does not match message agent_id",
+            ));
+        }
+    }
+    {
+        let registry = node.cells.agent_registry.lock().unwrap();
+        if registry.is_revoked(&token.token_id) {
+            return Err(UcError::denied("capability token is revoked"));
+        }
+        if !registry
+            .get(&token.agent_id)
+            .is_some_and(|info| info.active)
+        {
+            return Err(UcError::denied("capability token agent is not active"));
+        }
+    }
+    if !token.allows_op(intent) {
+        return Err(UcError::denied(format!(
+            "capability token does not grant `{}`",
+            intent.as_str()
+        )));
+    }
+    Ok(token)
+}
+
+fn verify_admin_capability(node: &Arc<Node>, msg: &Cbor) -> UcResult<()> {
+    let token = verify_capability(node, msg, Intent::Admin)?;
+    let registry = node.cells.agent_registry.lock().unwrap();
+    if !registry
+        .get(&token.agent_id)
+        .is_some_and(|info| info.active && info.role == "operator")
+    {
+        return Err(UcError::denied(
+            "admin capability must belong to an active operator",
+        ));
+    }
+    Ok(())
+}
+
+fn event_to_cbor(event: &Event) -> Cbor {
+    Cbor::map(vec![
+        ("seq", Cbor::U64(event.seq)),
+        ("name", Cbor::t(event.name.clone())),
+        ("payload", event.payload.clone()),
+        ("logical_at", Cbor::U64(event.logical_at)),
+    ])
+}
+
+fn events_message(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
+    let token = verify_capability(node, msg, Intent::Subscribe)?;
+    let mode = msg.opt_str("mode").unwrap_or_else(|| "pending".into());
+    let events = match mode.as_str() {
+        "pending" => node.events.lock().unwrap().drain_for(&token.agent_id),
+        "since" => {
+            let since = msg.opt_u64("since").unwrap_or(0);
+            let subs = node.cells.subscription.lock().unwrap();
+            let registry = node.cells.agent_registry.lock().unwrap();
+            node.events
+                .lock()
+                .unwrap()
+                .since_for(&token.agent_id, since, &subs, &registry)
+        }
+        _ => return Err(UcError::schema("events mode must be `pending` or `since`")),
+    };
+    let latest_seq = node.events.lock().unwrap().latest_seq();
+    Ok(Cbor::map(vec![
+        ("type", Cbor::t("events_ack")),
+        ("ok", Cbor::Bool(true)),
+        ("agent_id", Cbor::t(token.agent_id)),
+        ("mode", Cbor::t(mode)),
+        (
+            "events",
+            Cbor::Array(events.iter().map(event_to_cbor).collect()),
+        ),
+        ("latest_seq", Cbor::U64(latest_seq)),
+    ]))
+}
+
+fn admin_reply(result: UcResult<Cbor>) -> Cbor {
+    match result {
+        Ok(body) => Cbor::map(vec![
+            ("type", Cbor::t("admin_ack")),
+            ("ok", Cbor::Bool(true)),
+            ("result", body),
+        ]),
+        Err(e) => Cbor::map(vec![
+            ("type", Cbor::t("admin_ack")),
+            ("ok", Cbor::Bool(false)),
+            ("err_code", Cbor::t(e.code.as_str())),
+            ("err_message", Cbor::t(e.message)),
+        ]),
+    }
+}
+
 fn handle_message(node: &Arc<Node>, msg: &Cbor) -> Cbor {
     match msg.opt_str("type").as_deref() {
         Some("hello") => hello_ack(node),
@@ -135,21 +245,20 @@ fn handle_message(node: &Arc<Node>, msg: &Cbor) -> Cbor {
                 }
             }
         }
+        Some("events") => match events_message(node, msg) {
+            Ok(reply) => reply,
+            Err(e) => Cbor::map(vec![
+                ("type", Cbor::t("events_ack")),
+                ("ok", Cbor::Bool(false)),
+                ("err_code", Cbor::t(e.code.as_str())),
+                ("err_message", Cbor::t(e.message)),
+            ]),
+        },
         Some("admin") => {
-            let result = crate::bootstrap::admin_dispatch(node, msg);
-            match result {
-                Ok(body) => Cbor::map(vec![
-                    ("type", Cbor::t("admin_ack")),
-                    ("ok", Cbor::Bool(true)),
-                    ("result", body),
-                ]),
-                Err(e) => Cbor::map(vec![
-                    ("type", Cbor::t("admin_ack")),
-                    ("ok", Cbor::Bool(false)),
-                    ("err_code", Cbor::t(e.code.as_str())),
-                    ("err_message", Cbor::t(e.message.clone())),
-                ]),
+            if let Err(e) = verify_admin_capability(node, msg) {
+                return admin_reply(Err(e));
             }
+            admin_reply(crate::bootstrap::admin_dispatch(node, msg))
         }
         other => Cbor::map(vec![
             ("type", Cbor::t("error")),
@@ -356,12 +465,22 @@ impl Client {
         ResponseEnvelope::from_cbor(body)
     }
 
-    pub fn admin(&mut self, verb: &str, args: Cbor) -> UcResult<Cbor> {
-        let reply = self.roundtrip(&Cbor::map(vec![
+    fn admin_message(
+        &mut self,
+        verb: &str,
+        args: Cbor,
+        token: Option<&CapToken>,
+    ) -> UcResult<Cbor> {
+        let mut fields = vec![
             ("type", Cbor::t("admin")),
             ("verb", Cbor::t(verb)),
             ("args", args),
-        ]))?;
+        ];
+        if let Some(token) = token {
+            fields.push(("capability", token.to_cbor()));
+            fields.push(("agent_id", Cbor::t(token.agent_id.clone())));
+        }
+        let reply = self.roundtrip(&Cbor::map(fields))?;
         if reply.opt_bool("ok").unwrap_or(false) {
             Ok(reply.get("result").cloned().unwrap_or(Cbor::Null))
         } else {
@@ -372,11 +491,40 @@ impl Client {
             ))
         }
     }
+
+    /// Unauthenticated admin frames are retained only as an explicit
+    /// negative-path API; the server rejects them on every transport.
+    pub fn admin(&mut self, verb: &str, args: Cbor) -> UcResult<Cbor> {
+        self.admin_message(verb, args, None)
+    }
+
+    pub fn admin_with_token(&mut self, token: &CapToken, verb: &str, args: Cbor) -> UcResult<Cbor> {
+        self.admin_message(verb, args, Some(token))
+    }
+
+    /// Pull queued subscription events or replay entitled events after a
+    /// sequence cursor. This is the supported v1 delivery mechanism.
+    pub fn events(&mut self, token: &CapToken, mode: &str, since: Option<u64>) -> UcResult<Cbor> {
+        let mut fields = vec![
+            ("type", Cbor::t("events")),
+            ("agent_id", Cbor::t(token.agent_id.clone())),
+            ("capability", token.to_cbor()),
+            ("mode", Cbor::t(mode)),
+        ];
+        if let Some(since) = since {
+            fields.push(("since", Cbor::U64(since)));
+        }
+        self.roundtrip(&Cbor::map(fields))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ulid::{DetRng, Ulid};
+    use crate::core::{Intent, Severity, Tier};
+    use crate::router::captoken::{issue_agent_token, issue_operator_token};
+    use crate::router::envelope::{EnvelopeFlags, WorkBudget};
 
     #[test]
     fn frame_roundtrip_and_limits() {
@@ -412,5 +560,93 @@ mod tests {
         assert!(validate_tcp_listen_addr("0.0.0.0:7741").is_err());
         assert!(validate_tcp_listen_addr("192.168.1.25:7741").is_err());
         assert!(validate_tcp_listen_addr("[::]:7741").is_err());
+    }
+
+    #[test]
+    fn admin_requires_operator_and_events_pull_delivers() {
+        let report = crate::bootstrap::dry_run().unwrap();
+        let node = report.node;
+
+        let unauthenticated = handle_message(
+            &node,
+            &Cbor::map(vec![
+                ("type", Cbor::t("admin")),
+                ("verb", Cbor::t("status")),
+                ("args", Cbor::Null),
+            ]),
+        );
+        assert_eq!(unauthenticated.opt_bool("ok"), Some(false));
+
+        let operator = issue_operator_token(&*node.signer, "operator");
+        let authenticated = handle_message(
+            &node,
+            &Cbor::map(vec![
+                ("type", Cbor::t("admin")),
+                ("verb", Cbor::t("status")),
+                ("args", Cbor::Null),
+                ("agent_id", Cbor::t("operator")),
+                ("capability", operator.to_cbor()),
+            ]),
+        );
+        assert_eq!(authenticated.opt_bool("ok"), Some(true));
+
+        let agent = issue_agent_token(&*node.signer, "events-agent", 0);
+        node.cells
+            .agent_registry
+            .lock()
+            .unwrap()
+            .register(node.now(), "events-agent", "agent");
+        let response = crate::router::handle_envelope(
+            &node,
+            &Envelope {
+                proto_version: PROTO_VERSION,
+                request_id: Ulid::from_parts(node.now(), &mut DetRng::new(901)),
+                agent_id: agent.agent_id.clone(),
+                capability: agent.clone(),
+                work_budget: WorkBudget {
+                    task_id: "events-subscribe".into(),
+                    units: 1_000,
+                },
+                intent: Intent::Subscribe,
+                payload: Cbor::map(vec![("pattern", Cbor::t("node.test"))]),
+                spec_anchor: None,
+                severity: Severity::P2,
+                gap_ref: None,
+                tier: Tier::L1,
+                seed: 902,
+                flags: EnvelopeFlags::default(),
+            },
+        );
+        assert!(
+            response.ok,
+            "subscription failed: {:?}",
+            response.err_message
+        );
+
+        {
+            let subs = node.cells.subscription.lock().unwrap();
+            let registry = node.cells.agent_registry.lock().unwrap();
+            node.events.lock().unwrap().publish(
+                &subs,
+                &registry,
+                node.now(),
+                "node.test",
+                Cbor::t("delivered"),
+            );
+        }
+        let delivered = handle_message(
+            &node,
+            &Cbor::map(vec![
+                ("type", Cbor::t("events")),
+                ("agent_id", Cbor::t(agent.agent_id.clone())),
+                ("capability", agent.to_cbor()),
+                ("mode", Cbor::t("pending")),
+            ]),
+        );
+        assert_eq!(delivered.opt_bool("ok"), Some(true));
+        let events = delivered.get("events").and_then(|v| v.as_array()).unwrap();
+        assert!(events
+            .iter()
+            .any(|event| { event.opt_str("name").as_deref() == Some("node.test") }));
     }
 }

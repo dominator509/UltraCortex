@@ -94,6 +94,18 @@ impl LibrarianCell {
     /// Router to WAL-persist, store private facets in CAS, and enqueue the
     /// Warden audit).
     pub fn curate(&mut self, view: &dyn SubstrateView, job: &CurationJob) -> CuratorOutput {
+        let output = self.curate_unstored(view, job);
+        self.outputs.insert(
+            output.public.output_handle.clone(),
+            (output.public.clone(), OutputStatus::Pending),
+        );
+        output
+    }
+
+    /// Produce an output without making it visible in the Librarian cell.
+    /// Router persistence uses this variant to preserve WAL-before-visibility
+    /// when a model output or its private facets cannot be committed.
+    pub fn curate_unstored(&self, view: &dyn SubstrateView, job: &CurationJob) -> CuratorOutput {
         let mut rng = DetRng::new(job.seed ^ job.logical_at ^ 0x11B);
         let ulid = Ulid::from_parts(job.logical_at, &mut rng);
         let output_handle = format!("librarian/output/{ulid}");
@@ -124,8 +136,6 @@ impl LibrarianCell {
             ),
             private_seed: rng.next_u64(),
         };
-        self.outputs
-            .insert(output_handle, (public.clone(), OutputStatus::Pending));
         CuratorOutput { public, private }
     }
 
@@ -212,6 +222,19 @@ impl LibrarianCell {
 
     pub fn status(&self, output_handle: &str) -> Option<OutputStatus> {
         self.outputs.get(output_handle).map(|(_, s)| *s)
+    }
+
+    /// Restore one output from its durable WAL record without running model
+    /// code. Recovery must rebuild the pending/active/quarantined state that
+    /// was visible at the snapshot boundary.
+    pub fn replay_output(&mut self, public: CuratorPublic, status: OutputStatus) {
+        self.outputs
+            .insert(public.output_handle.clone(), (public, status));
+    }
+
+    pub fn replay_private_facet(&mut self, output_handle: &str, facet: &str, sha: [u8; 32]) {
+        self.private_facets
+            .insert(facet_handle(output_handle, facet), sha);
     }
 
     pub fn get_public(&self, output_handle: &str) -> Option<&CuratorPublic> {

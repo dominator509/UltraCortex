@@ -31,10 +31,11 @@ pub mod view;
 use crate::cells::memory::Fact;
 use crate::cells::CellType;
 use crate::core::cbor::Cbor;
+use crate::core::crypto::{hex, sha256};
 use crate::core::ulid::{DetRng, Ulid};
-use crate::core::{est_tokens, ErrCode, Intent, Severity, Tier, UcError, UcResult};
+use crate::core::{est_tokens, ErrCode, Intent, Severity, UcError, UcResult};
 use crate::curator::adjudicator::{Dispute, Resolution};
-use crate::curator::ledger::{CrossCheckKind, CrossCheckOutcome};
+use crate::curator::ledger::{AgreementHealth, CrossCheckKind, CrossCheckOutcome};
 use crate::curator::librarian::{CurationJob, OutputStatus};
 use crate::curator::warden::{AuditVerdict, WardenCell};
 use crate::curator::{
@@ -43,8 +44,8 @@ use crate::curator::{
 use crate::node::{ids, Node};
 use crate::persist::wal::{WalFrame, WalOp};
 use crate::persist::ViewKey;
-use crate::trinity::chain::{run_pre_validation, PreCtx};
 use crate::trinity::cells::SpecAnchorCell;
+use crate::trinity::chain::{run_pre_validation_durable, PreCtx};
 use envelope::{Envelope, ResponseEnvelope};
 use view::{render_view, RenderedView, ViewItem};
 
@@ -53,17 +54,25 @@ use view::{render_view, RenderedView, ViewItem};
 pub fn handle_envelope(node: &Node, env: &Envelope) -> ResponseEnvelope {
     let at = node.tick();
     node.metrics.inc("router.envelopes");
-    node.metrics.inc(&format!("router.intent.{}", env.intent.as_str()));
+    node.metrics
+        .inc(&format!("router.intent.{}", env.intent.as_str()));
 
-    match dispatch(node, env, at) {
+    let result = dispatch(node, env, at).and_then(|resp| {
+        node.maybe_snapshot(at)?;
+        Ok(resp)
+    });
+    match result {
         Ok(mut resp) => {
             resp.logical_at = at;
+            resp.seed = env.seed;
             resp
         }
         Err(e) => {
             node.metrics.inc("router.errors");
             node.metrics.inc(&format!("router.err.{}", e.code.as_str()));
-            ResponseEnvelope::err(env.request_id, at, &e)
+            let mut resp = ResponseEnvelope::err(env.request_id, at, &e);
+            resp.seed = env.seed;
+            resp
         }
     }
 }
@@ -73,6 +82,7 @@ fn dispatch(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelope> 
 
     // Gap-aware dispatch accounting + anti-fixation (NATIVE_TRINITY.md §9).
     if let Some(gap_ref) = &env.gap_ref {
+        let _mutation = node.mutation_guard();
         let mut t = node.trinity.lock().unwrap();
         t.gap.on_dispatch(gap_ref)?;
     }
@@ -134,12 +144,28 @@ fn estimate_units(env: &Envelope) -> u64 {
 }
 
 fn handle_write(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelope> {
+    let _mutation = node.mutation_guard();
     let target_type = target_cell_type(env)?;
     if !env.capability.allows_cell(target_type.as_str()) {
         return Err(UcError::denied(format!(
             "token does not grant cell `{}`",
             target_type.as_str()
         )));
+    }
+    match target_type {
+        CellType::Fact => {
+            // Validate required fields before reserving budget or writing the
+            // durable intent. A malformed request must not become a replayable
+            // partial mutation.
+            env.payload.req_str("subject")?;
+            env.payload.req_str("predicate")?;
+            env.payload.req_str("object")?;
+        }
+        CellType::Scratchpad => {
+            env.payload.req_str("key")?;
+        }
+        CellType::Blob | CellType::Timeline => {}
+        _ => {}
     }
     let schema_id = env
         .payload
@@ -154,7 +180,7 @@ fn handle_write(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelo
     // Steps 1–5: the Trinity chain (one lock scope; failures absorbed).
     let reserved = {
         let mut t = node.trinity.lock().unwrap();
-        run_pre_validation(
+        run_pre_validation_durable(
             &mut t,
             &node.metrics,
             &PreCtx {
@@ -167,6 +193,9 @@ fn handle_write(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelo
                 severity: env.severity,
                 payload: &env.payload,
                 estimate,
+            },
+            |qid, absorbed_at, seed, cause, detail, record| {
+                append_quarantine_wal(node, qid, absorbed_at, seed, cause, detail, record)
             },
         )?
         .reserved
@@ -194,9 +223,8 @@ fn handle_write(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelo
         CellType::Fact => format!("fact/{}", Ulid::from_parts(at, &mut rng)),
         CellType::Blob => {
             let body = env.payload.opt_str("body").unwrap_or_default();
-            let sha = node.cas.put(body.as_bytes())?;
-            let mut blob = node.cells.blob.lock().unwrap();
-            blob.register(sha, body.len() as u64, "text/plain".into())
+            let sha = sha256(body.as_bytes());
+            format!("blob/{}", hex(&sha))
         }
         CellType::Timeline => String::new(), // assigned by the cell below
         CellType::Scratchpad => format!(
@@ -214,6 +242,24 @@ fn handle_write(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelo
             )));
         }
     };
+
+    // Reject an invalid supersession before its durable intent is recorded.
+    // The later cell operation is then a validated, all-or-nothing edge.
+    if target_type == CellType::Fact {
+        if let Some(old) = env.payload.opt_str("supersedes") {
+            let fact = node.cells.fact.lock().unwrap();
+            if !fact.exists(&old) {
+                return Err(UcError::not_found(format!("old fact {old} not found")));
+            }
+            if fact
+                .get(&old)
+                .and_then(|f| f.superseded_by.as_ref())
+                .is_some()
+            {
+                return Err(UcError::schema(format!("{old} already superseded")));
+            }
+        }
+    }
 
     let wal_payload = Cbor::map(vec![
         ("handle", Cbor::t(handle.clone())),
@@ -236,19 +282,55 @@ fn handle_write(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelo
         CellType::Scratchpad => ids::SCRATCHPAD,
         _ => unreachable!(),
     };
-    node.wal_for(if handle.is_empty() { "timeline" } else { &handle })
-        .append(&WalFrame {
+    if let Err(err) = node.append_wal(
+        if handle.is_empty() {
+            "timeline"
+        } else {
+            &handle
+        },
+        &WalFrame {
             logical_at: at,
             cell_id: cell_id.0,
             op: WalOp::Write,
             schema_ver: 1,
             flags: 0,
             payload: wal_payload,
-        })
-        .map_err(UcError::internal)?;
+        },
+    ) {
+        let mut t = node.trinity.lock().unwrap();
+        t.work_budget
+            .charge_post(&env.work_budget.task_id, reserved, 0);
+        return Err(err);
+    }
+
+    // The forensic intent is committed before any in-memory cell becomes
+    // visible. If the audit file cannot accept it, do not acknowledge or
+    // apply the write.
+    if let Err(err) = node.audit_event(
+        at,
+        "state.write_durable",
+        &[
+            ("handle", Cbor::t(handle.clone())),
+            ("cell", Cbor::t(target_type.as_str())),
+            ("agent_id", Cbor::t(env.agent_id.clone())),
+        ],
+    ) {
+        let mut t = node.trinity.lock().unwrap();
+        t.work_budget
+            .charge_post(&env.work_budget.task_id, reserved, 0);
+        return Err(err);
+    }
 
     // In-memory apply.
-    let (final_handle, curation) = apply_write(node, env, at, target_type, handle)?;
+    let (final_handle, curation) = match apply_write(node, env, at, target_type, handle) {
+        Ok(result) => result,
+        Err(err) => {
+            let mut t = node.trinity.lock().unwrap();
+            t.work_budget
+                .charge_post(&env.work_budget.task_id, reserved, 0);
+            return Err(err);
+        }
+    };
 
     // Reconcile the budget.
     {
@@ -266,15 +348,20 @@ fn handle_write(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelo
     let _ = node.view_cache.invalidate_handle(&final_handle);
 
     // node.written event.
-    publish(node, at, "node.written", Cbor::map(vec![
-        ("handle", Cbor::t(final_handle.clone())),
-        ("agent_id", Cbor::t(env.agent_id.clone())),
-    ]));
+    publish(
+        node,
+        at,
+        "node.written",
+        Cbor::map(vec![
+            ("handle", Cbor::t(final_handle.clone())),
+            ("agent_id", Cbor::t(env.agent_id.clone())),
+        ]),
+    );
     node.metrics.inc("node.writes");
 
     // Synchronous curation cycle (see module deviation note).
     if let Some(job) = curation {
-        run_curation_cycle(node, &job);
+        run_curation_cycle(node, &job)?;
     }
 
     Ok(ResponseEnvelope::ok(
@@ -298,19 +385,23 @@ fn apply_write(
             let subject = env.payload.req_str("subject")?;
             let predicate = env.payload.req_str("predicate")?;
             let object = env.payload.req_str("object")?;
+            let supersedes = env.payload.opt_str("supersedes");
             {
                 let mut fact = node.cells.fact.lock().unwrap();
-                fact.insert(Fact {
-                    handle: handle.clone(),
-                    subject: subject.clone(),
-                    predicate: predicate.clone(),
-                    object: object.clone(),
-                    confidence: None,
-                    written_at: at,
-                    superseded_by: None,
-                    supersedes: env.payload.opt_str("supersedes"),
-                    anchor: env.spec_anchor.clone().unwrap_or_default(),
-                });
+                fact.insert_with_supersede(
+                    Fact {
+                        handle: handle.clone(),
+                        subject: subject.clone(),
+                        predicate: predicate.clone(),
+                        object: object.clone(),
+                        confidence: None,
+                        written_at: at,
+                        superseded_by: None,
+                        supersedes: supersedes.clone(),
+                        anchor: env.spec_anchor.clone().unwrap_or_default(),
+                    },
+                    supersedes.as_deref(),
+                )?;
             }
             // Index for recall.
             {
@@ -318,11 +409,10 @@ fn apply_write(
                 node.cells.bm25.lock().unwrap().add(handle.clone(), &text);
                 node.cells.vector.lock().unwrap().add(handle.clone(), &text);
             }
-            // A declared supersede is honored atomically with the write.
-            if let Some(old) = env.payload.opt_str("supersedes") {
-                let mut fact = node.cells.fact.lock().unwrap();
-                fact.supersede(&old, &handle)?;
-                drop(fact);
+            if let Some(old) = supersedes {
+                // The cache is derived state; an invalidation failure must
+                // not turn an already durable fact transition into a client
+                // error or leave budget reserved.
                 let _ = node.view_cache.invalidate_handle(&old);
             }
             let job = CurationJob {
@@ -338,6 +428,14 @@ fn apply_write(
         }
         CellType::Blob => {
             let body = env.payload.opt_str("body").unwrap_or_default();
+            let sha = node.cas.put(body.as_bytes())?;
+            let mut blob = node.cells.blob.lock().unwrap();
+            let registered = blob.register(sha, body.len() as u64, "text/plain".into());
+            if registered != handle {
+                return Err(UcError::internal(
+                    "blob handle changed during durable apply",
+                ));
+            }
             let job = CurationJob {
                 written_handle: handle.clone(),
                 subject: None,
@@ -350,16 +448,28 @@ fn apply_write(
             Ok((handle, Some(job)))
         }
         CellType::Timeline => {
-            let stream = env.payload.opt_str("stream").unwrap_or_else(|| "main".into());
+            let stream = env
+                .payload
+                .opt_str("stream")
+                .unwrap_or_else(|| "main".into());
             let event = env.payload.get("event").cloned().unwrap_or(Cbor::Null);
-            let h = node.cells.timeline.lock().unwrap().append(at, &stream, event);
+            let h = node
+                .cells
+                .timeline
+                .lock()
+                .unwrap()
+                .append(at, &stream, event);
             Ok((h, None))
         }
         CellType::Scratchpad => {
             let key = env.payload.req_str("key")?;
             let value = env.payload.get("value").cloned().unwrap_or(Cbor::Null);
             let ttl = env.payload.opt_u64("ttl");
-            node.cells.scratchpad.lock().unwrap().put(at, key, value, ttl);
+            node.cells
+                .scratchpad
+                .lock()
+                .unwrap()
+                .put(at, key, value, ttl);
             Ok((handle, None))
         }
         _ => unreachable!(),
@@ -376,12 +486,32 @@ fn handle_gate_dispute(
     reserved: u64,
     gate_err: UcError,
 ) -> UcError {
-    node.metrics.inc(&format!("warden.gate.{}", gate_err.code.as_str()));
+    node.metrics
+        .inc(&format!("warden.gate.{}", gate_err.code.as_str()));
     let disputed = WardenCell::harvest_handles(&env.payload);
     let flag: CuratorOutput = {
         let w = node.curators.warden.lock().unwrap();
         w.flag_from_error(at, env.seed, "envelope", &gate_err, disputed.clone())
     };
+    if let Err(err) = govern_curator_public(
+        node,
+        at,
+        env.seed,
+        "curator.warden",
+        CellType::Warden,
+        &flag.public,
+    ) {
+        let mut t = node.trinity.lock().unwrap();
+        t.work_budget
+            .charge_post(&env.work_budget.task_id, reserved, 0);
+        return UcError::internal(format!("unable to govern Warden flag: {}", err.message));
+    }
+    if let Err(err) = append_warden_flag_wal(node, at, &flag.public) {
+        let mut t = node.trinity.lock().unwrap();
+        t.work_budget
+            .charge_post(&env.work_budget.task_id, reserved, 0);
+        return UcError::internal(format!("unable to record Warden flag: {}", err.message));
+    }
     node.index_public(&flag.public.output_handle, &flag.public.body);
 
     let agrees = {
@@ -389,20 +519,32 @@ fn handle_gate_dispute(
         lib.sanity_check_warden(node, &flag.public)
     };
     let release_and_absorb = |cause: ErrCode, detail: &str| -> UcError {
+        let record = Cbor::map(vec![
+            ("payload", env.payload.clone()),
+            ("agent_id", Cbor::t(env.agent_id.clone())),
+            ("flag", Cbor::t(flag.public.output_handle.clone())),
+        ]);
+        let (qid, persist_result) = {
+            let t = node.trinity.lock().unwrap();
+            let qid = t.quarantine.next_qid(at, env.seed);
+            let result = append_quarantine_wal(node, &qid, at, env.seed, cause, detail, &record);
+            (qid, result)
+        };
+        if let Err(err) = persist_result {
+            let mut t = node.trinity.lock().unwrap();
+            t.work_budget
+                .charge_post(&env.work_budget.task_id, reserved, 0);
+            return UcError::internal(format!("unable to record gate quarantine: {}", err.message));
+        }
         let mut t = node.trinity.lock().unwrap();
         t.work_budget
             .charge_post(&env.work_budget.task_id, reserved, 0);
-        let qid = t.quarantine.absorb(
-            at,
-            env.seed,
-            cause,
-            detail,
-            Cbor::map(vec![
-                ("payload", env.payload.clone()),
-                ("agent_id", Cbor::t(env.agent_id.clone())),
-                ("flag", Cbor::t(flag.public.output_handle.clone())),
-            ]),
-        );
+        if let Err(err) = t
+            .quarantine
+            .absorb_with_qid(&qid, at, env.seed, cause, detail, record)
+        {
+            return err;
+        }
         node.metrics
             .gauge_set("quarantine.pending", t.quarantine.pending_count() as i64);
         drop(t);
@@ -416,7 +558,7 @@ fn handle_gate_dispute(
 
     if agrees {
         // Both curators concur the write is bad.
-        ledger_append(
+        if let Err(err) = ledger_append(
             node,
             at,
             CrossCheckKind::WardenFlag,
@@ -424,8 +566,15 @@ fn handle_gate_dispute(
             &flag.public.output_handle,
             CrossCheckOutcome::Agree,
             None,
+        ) {
+            return UcError::internal(format!("unable to record Warden flag: {}", err.message));
+        }
+        publish(
+            node,
+            at,
+            "curator.warden.flag",
+            Cbor::t(flag.public.output_handle.clone()),
         );
-        publish(node, at, "curator.warden.flag", Cbor::t(flag.public.output_handle.clone()));
         return release_and_absorb(gate_err.code, &gate_err.message);
     }
 
@@ -435,7 +584,10 @@ fn handle_gate_dispute(
         output_handle: format!("envelope/{}", env.request_id.to_base32()),
         operation: CuratorOperation::Skeleton,
         target_handle: "envelope".into(),
-        grounded_in: disputed.into_iter().filter(|h| node_view_exists(node, h)).collect(),
+        grounded_in: disputed
+            .into_iter()
+            .filter(|h| node_view_exists(node, h))
+            .collect(),
         confidence_band: ConfidenceBand::Medium,
         schema_id: "envelope.write.v1".into(),
         spec_anchor: env.spec_anchor.clone().unwrap_or_default(),
@@ -443,8 +595,8 @@ fn handle_gate_dispute(
         body: String::new(),
     };
     let adjudication = {
-        let mut adj = node.curators.adjudicator.lock().unwrap();
-        adj.adjudicate(
+        let adj = node.curators.adjudicator.lock().unwrap();
+        adj.adjudicate_preview(
             node,
             &Dispute {
                 initiator_output: &pseudo_initiator,
@@ -454,8 +606,34 @@ fn handle_gate_dispute(
             },
         )
     };
+    if let Err(err) = govern_curator_payload(
+        node,
+        at,
+        env.seed,
+        "curator.adjudicator",
+        CellType::Adjudicator,
+        "curator.adjudicator.v1",
+        "AdjudicatorCell.md\u{00a7}3",
+        crate::curator::adjudicator::adjudication_to_cbor(&adjudication),
+    ) {
+        let mut t = node.trinity.lock().unwrap();
+        t.work_budget
+            .charge_post(&env.work_budget.task_id, reserved, 0);
+        return UcError::internal(format!("unable to govern adjudication: {}", err.message));
+    }
+    if let Err(err) = append_adjudication_wal(node, at, &adjudication) {
+        let mut t = node.trinity.lock().unwrap();
+        t.work_budget
+            .charge_post(&env.work_budget.task_id, reserved, 0);
+        return UcError::internal(format!("unable to record adjudication: {}", err.message));
+    }
+    node.curators
+        .adjudicator
+        .lock()
+        .unwrap()
+        .replay_adjudication(adjudication.clone());
     node.index_public(&adjudication.handle, adjudication.resolution.as_str());
-    ledger_append(
+    if let Err(err) = ledger_append(
         node,
         at,
         CrossCheckKind::Adjudication,
@@ -466,8 +644,15 @@ fn handle_gate_dispute(
             _ => CrossCheckOutcome::Disagree,
         },
         Some(adjudication.handle.clone()),
+    ) {
+        return UcError::internal(format!("unable to record adjudication: {}", err.message));
+    }
+    publish(
+        node,
+        at,
+        "curator.adjudication",
+        Cbor::t(adjudication.handle.clone()),
     );
-    publish(node, at, "curator.adjudication", Cbor::t(adjudication.handle.clone()));
 
     match adjudication.resolution {
         Resolution::AuditorUpheld => {
@@ -516,32 +701,49 @@ fn node_view_exists(node: &Node, h: &str) -> bool {
 // Curation cycle (Librarian → Warden → [Adjudicator] → Ledger + guardrails)
 // ---------------------------------------------------------------------------
 
-pub fn run_curation_cycle(node: &Node, job: &CurationJob) {
+fn warden_audit_public(
+    audit: &crate::curator::warden::AuditRecord,
+    verdict: &AuditVerdict,
+) -> CuratorPublic {
+    let (operation, body) = match verdict {
+        AuditVerdict::Pass => (
+            CuratorOperation::AuditPass,
+            audit
+                .hash_proof
+                .as_ref()
+                .map(|proof| format!("audit pass hash_proof={proof}"))
+                .unwrap_or_else(|| "audit pass".into()),
+        ),
+        AuditVerdict::Fail { reason } => (CuratorOperation::AuditFail, reason.clone()),
+    };
+    CuratorPublic {
+        output_handle: audit.judgment_handle.clone(),
+        operation,
+        target_handle: audit.target_output.clone(),
+        grounded_in: audit.independent_grounds.clone(),
+        confidence_band: ConfidenceBand::High,
+        schema_id: "curator.warden.judgment.v1".into(),
+        spec_anchor: "WardenCell.md\u{00a7}6".into(),
+        logical_at: audit.logical_at,
+        body,
+    }
+}
+
+pub fn run_curation_cycle(node: &Node, job: &CurationJob) -> UcResult<()> {
     let at = node.tick();
 
     // 1. Librarian produces its output (PENDING).
     let output: CuratorOutput = {
-        let mut lib = node.curators.librarian.lock().unwrap();
-        lib.curate(node, job)
+        let lib = node.curators.librarian.lock().unwrap();
+        lib.curate_unstored(node, job)
     };
-    node.index_public(&output.public.output_handle, &output.public.body);
-    node.metrics.inc("librarian.outputs");
-    ledger_append(
-        node,
-        at,
-        CrossCheckKind::LibrarianOutput,
-        &output.public.output_handle,
-        "",
-        CrossCheckOutcome::Agree,
-        None,
-    );
 
     // 2. The output itself is a substrate write: it runs the Trinity chain
     //    (P20 — the substrate polices curators). Failure quarantines the
     //    output; the chain's own absorb pathway records it.
-    let chain_ok = {
+    let chain_result = {
         let mut t = node.trinity.lock().unwrap();
-        run_pre_validation(
+        run_pre_validation_durable(
             &mut t,
             &node.metrics,
             &PreCtx {
@@ -555,34 +757,75 @@ pub fn run_curation_cycle(node: &Node, job: &CurationJob) {
                 payload: &output.public.to_cbor(),
                 estimate: 5,
             },
+            |qid, absorbed_at, seed, cause, detail, record| {
+                append_quarantine_wal(node, qid, absorbed_at, seed, cause, detail, record)
+            },
         )
         .map(|pre| {
-            t.work_budget.charge_post("curator.librarian", pre.reserved, pre.reserved);
+            t.work_budget
+                .charge_post("curator.librarian", pre.reserved, pre.reserved);
         })
-        .is_ok()
     };
-    if !chain_ok {
+    if let Err(err) = chain_result {
+        // A persisted quarantine is a normal governed rejection. A failure
+        // before that record is durable must remain an error to the caller.
+        if err.quarantine_id.is_none() {
+            return Err(err);
+        }
         node.metrics.inc("curator.chain_rejected");
+        append_curator_output_wal(
+            node,
+            at,
+            &output.public,
+            OutputStatus::Quarantined,
+            &[],
+            "librarian.output_emitted",
+        )?;
         let mut lib = node.curators.librarian.lock().unwrap();
-        let _ = lib.set_status(&output.public.output_handle, OutputStatus::Quarantined);
-        return;
+        lib.replay_output(output.public.clone(), OutputStatus::Quarantined);
+        drop(lib);
+        node.index_public(&output.public.output_handle, &output.public.body);
+        ledger_append(
+            node,
+            at,
+            CrossCheckKind::LibrarianOutput,
+            &output.public.output_handle,
+            "",
+            CrossCheckOutcome::Disagree,
+            None,
+        )?;
+        return Ok(());
     }
-
-    // WAL the curator output on the shard stream.
-    let _ = node
-        .wal_for(&output.public.output_handle)
-        .append(&WalFrame {
-            logical_at: at,
-            cell_id: ids::LIBRARIAN.0,
-            op: WalOp::CuratorOutput,
-            schema_ver: 1,
-            flags: 0,
-            payload: output.public.to_cbor().encode(),
-        });
 
     // 3. PRIVATE facets → CAS blobs, registered on the Librarian. Reachable
     //    only through the Router's facet-gated hydrate (P19).
-    store_private_facets(node, &output);
+    let facets = store_private_facets(node, &output)?;
+    append_curator_output_wal(
+        node,
+        at,
+        &output.public,
+        OutputStatus::Pending,
+        &facets,
+        "librarian.output_emitted",
+    )?;
+    {
+        let mut lib = node.curators.librarian.lock().unwrap();
+        lib.replay_output(output.public.clone(), OutputStatus::Pending);
+        for (facet, sha) in &facets {
+            lib.replay_private_facet(&output.public.output_handle, facet, *sha);
+        }
+    }
+    node.index_public(&output.public.output_handle, &output.public.body);
+    node.metrics.inc("librarian.outputs");
+    ledger_append(
+        node,
+        at,
+        CrossCheckKind::LibrarianOutput,
+        &output.public.output_handle,
+        "",
+        CrossCheckOutcome::Agree,
+        None,
+    )?;
 
     // 4. Boundary probe: a Warden-scoped hydrate of the rationale facet
     //    MUST be denied; this keeps rationale_access_denied non-zero.
@@ -592,43 +835,100 @@ pub fn run_curation_cycle(node: &Node, job: &CurationJob) {
     let boost = node.cross_check.lock().unwrap().probe_boost();
     let probe_due = node.guardrails.probe.lock().unwrap().should_probe(boost);
     if probe_due {
-        run_adversarial_probe(node, at, job.seed);
+        run_adversarial_probe(node, at, job.seed)?;
     }
 
     // 6. Warden audit (independent grounding or hash-proof).
     let (audit_rec, verdict) = {
-        let mut w = node.curators.warden.lock().unwrap();
-        w.audit_librarian(node, &output.public, Some(job), at, job.seed)
+        let w = node.curators.warden.lock().unwrap();
+        w.audit_librarian_preview(node, &output.public, Some(job), at, job.seed)
     };
+    let audit_public = warden_audit_public(&audit_rec, &verdict);
+    govern_curator_public(
+        node,
+        at,
+        job.seed,
+        "curator.warden",
+        CellType::Warden,
+        &audit_public,
+    )?;
+    append_warden_audit_wal(node, at, &audit_rec)?;
+    node.curators
+        .warden
+        .lock()
+        .unwrap()
+        .replay_audit(audit_rec.clone());
     node.index_public(&audit_rec.judgment_handle, "");
     node.metrics.inc("warden.audits");
 
+    let calibration_degraded = node.guardrails.calibration.lock().unwrap().degraded();
     match verdict {
         AuditVerdict::Pass => {
-            {
-                let mut lib = node.curators.librarian.lock().unwrap();
-                let _ = lib.set_status(&output.public.output_handle, OutputStatus::Active);
+            if calibration_degraded {
+                // Degraded mode disables the synchronous publish shortcut:
+                // every output must receive an independent Adjudicator
+                // decision before it can become active.
+                node.metrics.inc("curator.degraded_auto_escalations");
+                node.metrics.gauge_set("curator.degraded_mode", 1);
+                node.audit_event(
+                    at,
+                    "curator.degraded_escalation",
+                    &[(
+                        "output_handle",
+                        Cbor::t(output.public.output_handle.clone()),
+                    )],
+                )?;
+                ledger_append(
+                    node,
+                    at,
+                    CrossCheckKind::WardenAudit,
+                    &output.public.output_handle,
+                    &audit_rec.judgment_handle,
+                    CrossCheckOutcome::Agree,
+                    None,
+                )?;
+                resolve_audit_failure(
+                    node,
+                    at,
+                    job,
+                    &output.public,
+                    &audit_rec.judgment_handle,
+                    "calibration degraded: mandatory adjudication",
+                    true,
+                )?;
+            } else {
+                append_curator_status_wal(
+                    node,
+                    at,
+                    &output.public.output_handle,
+                    OutputStatus::Active,
+                )?;
+                {
+                    let mut lib = node.curators.librarian.lock().unwrap();
+                    lib.set_status(&output.public.output_handle, OutputStatus::Active)?;
+                }
+                ledger_append(
+                    node,
+                    at,
+                    CrossCheckKind::WardenAudit,
+                    &output.public.output_handle,
+                    &audit_rec.judgment_handle,
+                    CrossCheckOutcome::Agree,
+                    None,
+                )?;
+                node.guardrails
+                    .calibration
+                    .lock()
+                    .unwrap()
+                    .record(output.public.confidence_band, true);
+                node.metrics.gauge_set("curator.degraded_mode", 0);
             }
-            ledger_append(
-                node,
-                at,
-                CrossCheckKind::WardenAudit,
-                &output.public.output_handle,
-                &audit_rec.judgment_handle,
-                CrossCheckOutcome::Agree,
-                None,
-            );
-            node.guardrails
-                .calibration
-                .lock()
-                .unwrap()
-                .record(output.public.confidence_band, true);
 
             // Blind re-audit sample (~1%): verdict must be order-insensitive.
             let reaudit_due = node.guardrails.blind.lock().unwrap().should_reaudit();
             if reaudit_due {
                 let (orig, re) = {
-                    let mut w = node.curators.warden.lock().unwrap();
+                    let w = node.curators.warden.lock().unwrap();
                     w.blind_reaudit(node, &output.public, Some(job), at, job.seed)
                 };
                 let matched = orig == re;
@@ -647,14 +947,23 @@ pub fn run_curation_cycle(node: &Node, job: &CurationJob) {
                         CrossCheckOutcome::Disagree
                     },
                     None,
-                );
+                )?;
             }
         }
         AuditVerdict::Fail { reason } => {
             node.metrics.inc("warden.audit_failures");
-            resolve_audit_failure(node, at, job, &output.public, &audit_rec.judgment_handle, &reason);
+            resolve_audit_failure(
+                node,
+                at,
+                job,
+                &output.public,
+                &audit_rec.judgment_handle,
+                &reason,
+                false,
+            )?;
         }
     }
+    Ok(())
 }
 
 fn resolve_audit_failure(
@@ -664,11 +973,16 @@ fn resolve_audit_failure(
     output: &CuratorPublic,
     judgment_handle: &str,
     reason: &str,
-) {
+    force_adjudication: bool,
+) -> UcResult<()> {
     // Build the Warden flag as a public artifact.
     let flag = CuratorPublic {
         output_handle: judgment_handle.to_string(),
-        operation: CuratorOperation::AuditFail,
+        operation: if force_adjudication {
+            CuratorOperation::FlagDrift
+        } else {
+            CuratorOperation::AuditFail
+        },
         target_handle: output.output_handle.clone(),
         grounded_in: output.grounded_in.clone(),
         confidence_band: ConfidenceBand::High,
@@ -677,30 +991,52 @@ fn resolve_audit_failure(
         logical_at: at,
         body: reason.to_string(),
     };
-    node.index_public(&flag.output_handle, &flag.body);
-    publish(node, at, "curator.warden.flag", Cbor::t(flag.output_handle.clone()));
-
-    let agrees = {
-        let lib = node.curators.librarian.lock().unwrap();
-        lib.sanity_check_warden(node, &flag)
-    };
-    ledger_append(
+    govern_curator_public(
         node,
         at,
-        CrossCheckKind::LibrarianSanity,
-        &output.output_handle,
-        &flag.output_handle,
-        if agrees {
-            CrossCheckOutcome::Agree
-        } else {
-            CrossCheckOutcome::Disagree
-        },
-        None,
+        job.seed,
+        "curator.warden",
+        CellType::Warden,
+        &flag,
+    )?;
+    append_warden_flag_wal(node, at, &flag)?;
+    node.index_public(&flag.output_handle, &flag.body);
+    publish(
+        node,
+        at,
+        "curator.warden.flag",
+        Cbor::t(flag.output_handle.clone()),
     );
 
+    let agrees = if force_adjudication {
+        // A degraded-mode escalation is intentional even when this audit
+        // passed; do not let the Librarian's sanity shortcut bypass it.
+        false
+    } else {
+        let agrees = {
+            let lib = node.curators.librarian.lock().unwrap();
+            lib.sanity_check_warden(node, &flag)
+        };
+        ledger_append(
+            node,
+            at,
+            CrossCheckKind::LibrarianSanity,
+            &output.output_handle,
+            &flag.output_handle,
+            if agrees {
+                CrossCheckOutcome::Agree
+            } else {
+                CrossCheckOutcome::Disagree
+            },
+            None,
+        )?;
+        agrees
+    };
+
     if agrees {
+        append_curator_status_wal(node, at, &output.output_handle, OutputStatus::Quarantined)?;
         let mut lib = node.curators.librarian.lock().unwrap();
-        let _ = lib.set_status(&output.output_handle, OutputStatus::Quarantined);
+        lib.set_status(&output.output_handle, OutputStatus::Quarantined)?;
         drop(lib);
         ledger_append(
             node,
@@ -710,20 +1046,20 @@ fn resolve_audit_failure(
             &flag.output_handle,
             CrossCheckOutcome::Disagree,
             None,
-        );
+        )?;
         node.guardrails
             .calibration
             .lock()
             .unwrap()
             .record(output.confidence_band, false);
-        return;
+        return Ok(());
     }
 
     // Escalate to the Adjudicator.
     node.metrics.inc("curator.disagreements");
     let adjudication = {
-        let mut adj = node.curators.adjudicator.lock().unwrap();
-        adj.adjudicate(
+        let adj = node.curators.adjudicator.lock().unwrap();
+        adj.adjudicate_preview(
             node,
             &Dispute {
                 initiator_output: output,
@@ -733,8 +1069,29 @@ fn resolve_audit_failure(
             },
         )
     };
+    govern_curator_payload(
+        node,
+        at,
+        job.seed,
+        "curator.adjudicator",
+        CellType::Adjudicator,
+        "curator.adjudicator.v1",
+        "AdjudicatorCell.md\u{00a7}3",
+        crate::curator::adjudicator::adjudication_to_cbor(&adjudication),
+    )?;
+    append_adjudication_wal(node, at, &adjudication)?;
+    node.curators
+        .adjudicator
+        .lock()
+        .unwrap()
+        .replay_adjudication(adjudication.clone());
     node.index_public(&adjudication.handle, adjudication.resolution.as_str());
-    publish(node, at, "curator.adjudication", Cbor::t(adjudication.handle.clone()));
+    publish(
+        node,
+        at,
+        "curator.adjudication",
+        Cbor::t(adjudication.handle.clone()),
+    );
 
     let (status, outcome) = match adjudication.resolution {
         Resolution::AuditorUpheld => (Some(OutputStatus::Quarantined), CrossCheckOutcome::Disagree),
@@ -748,8 +1105,9 @@ fn resolve_audit_failure(
         }
     };
     if let Some(s) = status {
+        append_curator_status_wal(node, at, &output.output_handle, s)?;
         let mut lib = node.curators.librarian.lock().unwrap();
-        let _ = lib.set_status(&output.output_handle, s);
+        lib.set_status(&output.output_handle, s)?;
         drop(lib);
         node.guardrails
             .calibration
@@ -760,15 +1118,20 @@ fn resolve_audit_failure(
     ledger_append(
         node,
         at,
-        CrossCheckKind::WardenAudit,
+        if force_adjudication {
+            CrossCheckKind::Adjudication
+        } else {
+            CrossCheckKind::WardenAudit
+        },
         &output.output_handle,
         &flag.output_handle,
         outcome,
         Some(adjudication.handle),
-    );
+    )?;
+    Ok(())
 }
 
-fn store_private_facets(node: &Node, output: &CuratorOutput) {
+fn store_private_facets(node: &Node, output: &CuratorOutput) -> UcResult<Vec<(String, [u8; 32])>> {
     let facets: [(&str, String); 4] = [
         ("rationale", output.private.rationale.clone()),
         ("considered_alts", output.private.considered_alts.join("\n")),
@@ -778,12 +1141,171 @@ fn store_private_facets(node: &Node, output: &CuratorOutput) {
             format!("{:.6}", output.private.confidence_precise),
         ),
     ];
+    let mut stored = Vec::with_capacity(facets.len());
     for (facet, body) in facets {
-        if let Ok(sha) = node.cas.put(body.as_bytes()) {
-            let mut lib = node.curators.librarian.lock().unwrap();
-            lib.register_private_facet(&output.public.output_handle, facet, sha);
-        }
+        let sha = node.cas.put(body.as_bytes())?;
+        stored.push((facet.to_string(), sha));
     }
+    Ok(stored)
+}
+
+fn append_curator_output_wal(
+    node: &Node,
+    at: u64,
+    public: &CuratorPublic,
+    status: OutputStatus,
+    facets: &[(String, [u8; 32])],
+    audit_event: &str,
+) -> UcResult<()> {
+    let facet_items = facets
+        .iter()
+        .map(|(facet, sha)| {
+            Cbor::map(vec![
+                ("facet", Cbor::t(facet.clone())),
+                ("sha256", Cbor::Bytes(sha.to_vec())),
+            ])
+        })
+        .collect();
+    node.append_wal(
+        &public.output_handle,
+        &WalFrame {
+            logical_at: at,
+            cell_id: ids::LIBRARIAN.0,
+            op: WalOp::CuratorOutput,
+            schema_ver: 1,
+            flags: 0,
+            payload: Cbor::map(vec![
+                ("public", public.to_cbor()),
+                ("status", Cbor::t(status.as_str())),
+                ("private_facets", Cbor::Array(facet_items)),
+            ])
+            .encode(),
+        },
+    )?;
+    node.audit_event(
+        at,
+        audit_event,
+        &[
+            ("output_handle", Cbor::t(public.output_handle.clone())),
+            ("status", Cbor::t(status.as_str())),
+        ],
+    )?;
+    Ok(())
+}
+
+fn append_curator_status_wal(
+    node: &Node,
+    at: u64,
+    output_handle: &str,
+    status: OutputStatus,
+) -> UcResult<()> {
+    let public = {
+        let lib = node.curators.librarian.lock().unwrap();
+        lib.get_public(output_handle)
+            .cloned()
+            .ok_or_else(|| UcError::not_found(format!("librarian output {output_handle}")))?
+    };
+    append_curator_output_wal(node, at, &public, status, &[], "librarian.status_changed")
+}
+
+fn append_warden_audit_wal(
+    node: &Node,
+    at: u64,
+    audit: &crate::curator::warden::AuditRecord,
+) -> UcResult<()> {
+    node.append_wal(
+        &audit.judgment_handle,
+        &WalFrame {
+            logical_at: at,
+            cell_id: ids::WARDEN.0,
+            op: WalOp::CuratorOutput,
+            schema_ver: 1,
+            flags: 0,
+            payload: Cbor::map(vec![
+                ("role", Cbor::t("warden_audit")),
+                ("audit", crate::curator::warden::audit_to_cbor(audit)),
+            ])
+            .encode(),
+        },
+    )?;
+    node.audit_event(
+        at,
+        "warden.judgment_emitted",
+        &[
+            ("judgment_handle", Cbor::t(audit.judgment_handle.clone())),
+            ("target_output", Cbor::t(audit.target_output.clone())),
+        ],
+    )?;
+    Ok(())
+}
+
+fn append_warden_flag_wal(node: &Node, at: u64, flag: &CuratorPublic) -> UcResult<()> {
+    node.append_wal(
+        &flag.output_handle,
+        &WalFrame {
+            logical_at: at,
+            cell_id: ids::WARDEN.0,
+            op: WalOp::CuratorOutput,
+            schema_ver: 1,
+            flags: 0,
+            payload: Cbor::map(vec![
+                ("role", Cbor::t("warden_flag")),
+                ("public", flag.to_cbor()),
+            ])
+            .encode(),
+        },
+    )?;
+    node.audit_event(
+        at,
+        "warden.judgment_emitted",
+        &[
+            ("judgment_handle", Cbor::t(flag.output_handle.clone())),
+            ("target_output", Cbor::t(flag.target_handle.clone())),
+        ],
+    )?;
+    Ok(())
+}
+
+fn append_adjudication_wal(
+    node: &Node,
+    at: u64,
+    adjudication: &crate::curator::adjudicator::Adjudication,
+) -> UcResult<()> {
+    node.append_wal(
+        &adjudication.handle,
+        &WalFrame {
+            logical_at: at,
+            cell_id: ids::ADJUDICATOR.0,
+            op: WalOp::CuratorOutput,
+            schema_ver: 1,
+            flags: 0,
+            payload: Cbor::map(vec![
+                ("role", Cbor::t("adjudication")),
+                (
+                    "adjudication",
+                    crate::curator::adjudicator::adjudication_to_cbor(adjudication),
+                ),
+            ])
+            .encode(),
+        },
+    )?;
+    node.audit_event(
+        at,
+        "adjudicator.invoked",
+        &[
+            ("handle", Cbor::t(adjudication.handle.clone())),
+            ("resolution", Cbor::t(adjudication.resolution.as_str())),
+        ],
+    )?;
+    node.audit_event(
+        at,
+        "adjudicator.resolution",
+        &[
+            ("handle", Cbor::t(adjudication.handle.clone())),
+            ("resolution", Cbor::t(adjudication.resolution.as_str())),
+        ],
+    )?;
+    Ok(())
 }
 
 /// A Warden-scoped hydrate of the Librarian's rationale — MUST fail with
@@ -791,20 +1313,16 @@ fn store_private_facets(node: &Node, output: &CuratorOutput) {
 /// P19 is broken (critical incident).
 fn boundary_probe(node: &Node, output_handle: &str, at: u64) {
     let facet = facet_handle(output_handle, "rationale");
-    let warden_token =
-        captoken::issue_curator_token(&*node.signer, "curator.warden", 0);
-    match facet_gate(node, &warden_token, &facet) {
+    let warden_token = captoken::issue_curator_token(&*node.signer, "curator.warden", 0);
+    match facet_gate_at(node, &warden_token, &facet, at) {
         Err(e) if e.code == ErrCode::PermissionDenied => {
             // Expected: the boundary held.
         }
         Err(_) => node.metrics.inc("curator.boundary_probe_odd"),
         Ok(()) => {
             node.metrics.inc("curator.boundary_breach");
-            node.logger.error(
-                at,
-                "curator.boundary_breach",
-                &[("facet", facet.clone())],
-            );
+            node.logger
+                .error(at, "curator.boundary_breach", &[("facet", facet.clone())]);
             publish(node, at, "curator.boundary_breach", Cbor::t(facet));
         }
     }
@@ -812,16 +1330,19 @@ fn boundary_probe(node: &Node, output_handle: &str, at: u64) {
 
 /// Operator-triggered probe (`ultracortex curator probe-now`): bypasses the
 /// scheduler and fires an adversarial probe immediately.
-pub fn run_curation_probe(node: &Node, at: u64) {
-    run_adversarial_probe(node, at, node.boot_seed ^ at);
+pub fn run_curation_probe(node: &Node, at: u64) -> UcResult<()> {
+    run_adversarial_probe(node, at, node.boot_seed ^ at)
 }
 
 /// Inject a fabricated Librarian output; the Warden must flag it.
-fn run_adversarial_probe(node: &Node, at: u64, seed: u64) {
+fn run_adversarial_probe(node: &Node, at: u64, seed: u64) -> UcResult<()> {
     node.metrics.inc("curator.probes");
     let (fake_handle, ulid) = {
         let mut p = node.guardrails.probe.lock().unwrap();
-        (p.fabricated_handle(at), Ulid::from_parts(at, &mut DetRng::new(seed ^ 0x9E0B)))
+        (
+            p.fabricated_handle(at),
+            Ulid::from_parts(at, &mut DetRng::new(seed ^ 0x9E0B)),
+        )
     };
     let probe_output = CuratorPublic {
         output_handle: format!("librarian/output/{ulid}"),
@@ -834,14 +1355,40 @@ fn run_adversarial_probe(node: &Node, at: u64, seed: u64) {
         logical_at: at,
         body: "probe skeleton".into(),
     };
-    let (_, verdict) = {
-        let mut w = node.curators.warden.lock().unwrap();
-        w.audit_librarian(node, &probe_output, None, at, seed)
+    let (audit_rec, verdict) = {
+        let w = node.curators.warden.lock().unwrap();
+        w.audit_librarian_preview(node, &probe_output, None, at, seed)
     };
+    let audit_public = warden_audit_public(&audit_rec, &verdict);
+    govern_curator_public(
+        node,
+        at,
+        seed,
+        "curator.warden",
+        CellType::Warden,
+        &audit_public,
+    )?;
+    append_warden_audit_wal(node, at, &audit_rec)?;
+    node.curators
+        .warden
+        .lock()
+        .unwrap()
+        .replay_audit(audit_rec.clone());
+    node.index_public(&audit_rec.judgment_handle, "");
     let caught = matches!(verdict, AuditVerdict::Fail { .. });
     if !caught {
         node.metrics.inc("curator.probe_missed");
-        publish(node, at, "curator.probe_missed", Cbor::t(probe_output.output_handle.clone()));
+        node.audit_event(
+            at,
+            "curator.probe_failed",
+            &[("output_handle", Cbor::t(probe_output.output_handle.clone()))],
+        )?;
+        publish(
+            node,
+            at,
+            "curator.probe_missed",
+            Cbor::t(probe_output.output_handle.clone()),
+        );
     }
     ledger_append(
         node,
@@ -855,7 +1402,7 @@ fn run_adversarial_probe(node: &Node, at: u64, seed: u64) {
             CrossCheckOutcome::Agree // missed probe
         },
         None,
-    );
+    )
 }
 
 fn ledger_append(
@@ -866,9 +1413,159 @@ fn ledger_append(
     auditor: &str,
     outcome: CrossCheckOutcome,
     adjudication: Option<String>,
-) {
-    let mut ledger = node.cross_check.lock().unwrap();
-    let _ = ledger.append(&node.metrics, at, kind, initiator, auditor, outcome, adjudication);
+) -> UcResult<()> {
+    {
+        let mut ledger = node.cross_check.lock().unwrap();
+        ledger.append(
+            &node.metrics,
+            at,
+            kind,
+            initiator,
+            auditor,
+            outcome,
+            adjudication,
+        )?;
+    }
+    node.audit_event(
+        at,
+        "cross_check.record_appended",
+        &[
+            ("kind", Cbor::t(kind.as_str())),
+            ("initiator", Cbor::t(initiator)),
+            ("auditor", Cbor::t(auditor)),
+            ("outcome", Cbor::t(outcome.as_str())),
+        ],
+    )?;
+    if kind == CrossCheckKind::WardenAudit && outcome == CrossCheckOutcome::Disagree {
+        node.audit_event(
+            at,
+            "warden.audit_disagreement",
+            &[
+                ("initiator", Cbor::t(initiator)),
+                ("auditor", Cbor::t(auditor)),
+            ],
+        )?;
+    }
+    if kind == CrossCheckKind::LibrarianSanity && outcome == CrossCheckOutcome::Disagree {
+        node.audit_event(
+            at,
+            "librarian.sanity_check_disagreement",
+            &[
+                ("initiator", Cbor::t(initiator)),
+                ("auditor", Cbor::t(auditor)),
+            ],
+        )?;
+    }
+    let health = {
+        let ledger = node.cross_check.lock().unwrap();
+        ledger.health()
+    };
+    match health {
+        AgreementHealth::SuspiciousAgreement => node.audit_event(
+            at,
+            "curator.suspicious_agreement",
+            &[("kind", Cbor::t(kind.as_str()))],
+        )?,
+        AgreementHealth::Miscalibration => {
+            node.metrics.inc("curator.calibration_drift_detected");
+            node.audit_event(
+                at,
+                "curator.calibration_drift_detected",
+                &[("kind", Cbor::t(kind.as_str()))],
+            )?;
+        }
+        AgreementHealth::Healthy | AgreementHealth::InsufficientData => {}
+    }
+    Ok(())
+}
+
+fn append_quarantine_wal(
+    node: &Node,
+    qid: &str,
+    absorbed_at: u64,
+    seed: u64,
+    cause: ErrCode,
+    detail: &str,
+    record: &Cbor,
+) -> UcResult<()> {
+    node.append_wal(
+        qid,
+        &WalFrame {
+            logical_at: absorbed_at,
+            cell_id: ids::QUARANTINE.0,
+            op: WalOp::QuarantineAbsorb,
+            schema_ver: 1,
+            flags: 0,
+            payload: Cbor::map(vec![
+                ("qid", Cbor::t(qid)),
+                ("absorbed_at", Cbor::U64(absorbed_at)),
+                ("seed", Cbor::U64(seed)),
+                ("cause", Cbor::t(cause.as_str())),
+                ("detail", Cbor::t(detail)),
+                ("record", record.clone()),
+            ])
+            .encode(),
+        },
+    )?;
+    Ok(())
+}
+
+/// Apply the same Trinity pre-validation contract to every Curator artifact,
+/// not only Librarian outputs. A model result is not visible or durable until
+/// this governed operation succeeds.
+fn govern_curator_public(
+    node: &Node,
+    at: u64,
+    seed: u64,
+    task_id: &str,
+    target_type: CellType,
+    public: &CuratorPublic,
+) -> UcResult<()> {
+    govern_curator_payload(
+        node,
+        at,
+        seed,
+        task_id,
+        target_type,
+        &public.schema_id,
+        &public.spec_anchor,
+        public.to_cbor(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn govern_curator_payload(
+    node: &Node,
+    at: u64,
+    seed: u64,
+    task_id: &str,
+    target_type: CellType,
+    schema_id: &str,
+    spec_anchor: &str,
+    payload: Cbor,
+) -> UcResult<()> {
+    let mut t = node.trinity.lock().unwrap();
+    let pre = run_pre_validation_durable(
+        &mut t,
+        &node.metrics,
+        &PreCtx {
+            logical_at: at,
+            seed,
+            task_id: task_id.to_string(),
+            schema_id,
+            target_type,
+            spec_anchor: SpecAnchorCell::parse_anchor(spec_anchor),
+            severity: Severity::P1,
+            payload: &payload,
+            estimate: 5,
+        },
+        |qid, absorbed_at, q_seed, cause, detail, record| {
+            append_quarantine_wal(node, qid, absorbed_at, q_seed, cause, detail, record)
+        },
+    )?;
+    t.work_budget
+        .charge_post(task_id, pre.reserved, pre.reserved);
+    Ok(())
 }
 
 fn publish(node: &Node, at: u64, name: &str, payload: Cbor) {
@@ -883,6 +1580,7 @@ fn publish(node: &Node, at: u64, name: &str, payload: Cbor) {
 // ---------------------------------------------------------------------------
 
 fn handle_supersede(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelope> {
+    let _mutation = node.mutation_guard();
     let old = env.payload.req_str("old")?;
     let new = env.payload.req_str("new")?;
     let estimate = 10u64;
@@ -890,8 +1588,93 @@ fn handle_supersede(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEn
     {
         let mut t = node.trinity.lock().unwrap();
         t.work_budget.ensure(&env.work_budget.task_id, None);
-        t.work_budget.charge_pre(&env.work_budget.task_id, estimate)?;
+        t.work_budget
+            .charge_pre(&env.work_budget.task_id, estimate)?;
     }
+    let validation = if old == new {
+        Err(UcError::schema(
+            "supersession old and new handles must differ",
+        ))
+    } else if old.starts_with("decision/") {
+        let t = node.trinity.lock().unwrap();
+        if !t.decision_ledger.exists(&old) {
+            Err(UcError::not_found(format!("decision {old}")))
+        } else if !t.decision_ledger.exists(&new) {
+            Err(UcError::not_found(format!("decision {new}")))
+        } else if t
+            .decision_ledger
+            .get(&old)
+            .and_then(|d| d.superseded_by.as_ref())
+            .is_some()
+        {
+            Err(UcError::schema(format!("{old} already superseded")))
+        } else {
+            Ok(())
+        }
+    } else {
+        let fact = node.cells.fact.lock().unwrap();
+        if !fact.exists(&old) {
+            Err(UcError::not_found(format!("old fact {old} not found")))
+        } else if !fact.exists(&new) {
+            Err(UcError::not_found(format!("new fact {new} not found")))
+        } else if fact
+            .get(&old)
+            .and_then(|f| f.superseded_by.as_ref())
+            .is_some()
+        {
+            Err(UcError::schema(format!("{old} already superseded")))
+        } else {
+            Ok(())
+        }
+    };
+    if let Err(err) = validation {
+        let mut t = node.trinity.lock().unwrap();
+        t.work_budget
+            .charge_post(&env.work_budget.task_id, estimate, 0);
+        return Err(err);
+    }
+
+    // Persist the complete transition before changing either endpoint. The
+    // recovery path replays this same edge after all writes are globally
+    // ordered by logical time.
+    let frame = WalFrame {
+        logical_at: at,
+        cell_id: if old.starts_with("decision/") {
+            ids::DECISION_LEDGER.0
+        } else {
+            ids::FACT.0
+        },
+        op: WalOp::Supersede,
+        schema_ver: 1,
+        flags: 0,
+        payload: Cbor::map(vec![
+            ("old", Cbor::t(old.clone())),
+            ("new", Cbor::t(new.clone())),
+        ])
+        .encode(),
+    };
+    if let Err(err) = node.append_wal(&old, &frame) {
+        let mut t = node.trinity.lock().unwrap();
+        t.work_budget
+            .charge_post(&env.work_budget.task_id, estimate, 0);
+        return Err(err);
+    }
+
+    if let Err(err) = node.audit_event(
+        at,
+        "state.supersede_durable",
+        &[
+            ("old", Cbor::t(old.clone())),
+            ("new", Cbor::t(new.clone())),
+            ("agent_id", Cbor::t(env.agent_id.clone())),
+        ],
+    ) {
+        let mut t = node.trinity.lock().unwrap();
+        t.work_budget
+            .charge_post(&env.work_budget.task_id, estimate, 0);
+        return Err(err);
+    }
+
     let result = if old.starts_with("decision/") {
         let mut t = node.trinity.lock().unwrap();
         t.decision_ledger.supersede(&old, &new)
@@ -901,33 +1684,25 @@ fn handle_supersede(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEn
     };
     {
         let mut t = node.trinity.lock().unwrap();
-        t.work_budget
-            .charge_post(&env.work_budget.task_id, estimate, if result.is_ok() { estimate } else { 0 });
+        t.work_budget.charge_post(
+            &env.work_budget.task_id,
+            estimate,
+            if result.is_ok() { estimate } else { 0 },
+        );
     }
     result?;
 
-    node.wal_for(&old)
-        .append(&WalFrame {
-            logical_at: at,
-            cell_id: if old.starts_with("decision/") {
-                ids::DECISION_LEDGER.0
-            } else {
-                ids::FACT.0
-            },
-            op: WalOp::Supersede,
-            schema_ver: 1,
-            flags: 0,
-            payload: Cbor::map(vec![("old", Cbor::t(old.clone())), ("new", Cbor::t(new.clone()))])
-                .encode(),
-        })
-        .map_err(UcError::internal)?;
-
     node.bump_view_version();
     let _ = node.view_cache.invalidate_handle(&old);
-    publish(node, at, "node.superseded", Cbor::map(vec![
-        ("old", Cbor::t(old.clone())),
-        ("new", Cbor::t(new.clone())),
-    ]));
+    publish(
+        node,
+        at,
+        "node.superseded",
+        Cbor::map(vec![
+            ("old", Cbor::t(old.clone())),
+            ("new", Cbor::t(new.clone())),
+        ]),
+    );
     node.metrics.inc("node.supersedes");
 
     Ok(ResponseEnvelope::ok(
@@ -943,6 +1718,7 @@ fn handle_supersede(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEn
 // ---------------------------------------------------------------------------
 
 fn handle_recall(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelope> {
+    let _mutation = node.mutation_guard();
     let query = env.payload.req_str("query")?;
     let k = env.payload.opt_u64("k").unwrap_or(8) as usize;
 
@@ -952,13 +1728,16 @@ fn handle_recall(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvel
     let mut candidates: Vec<(String, String)> = Vec::new();
     {
         let fact = node.cells.fact.lock().unwrap();
-        let mut push = |h: &String, candidates: &mut Vec<(String, String)>| {
+        let push = |h: &String, candidates: &mut Vec<(String, String)>| {
             if candidates.iter().any(|(ch, _)| ch == h) {
                 return;
             }
             if let Some(f) = fact.get(h) {
                 if f.superseded_by.is_none() {
-                    candidates.push((h.clone(), format!("{} {} {}", f.subject, f.predicate, f.object)));
+                    candidates.push((
+                        h.clone(),
+                        format!("{} {} {}", f.subject, f.predicate, f.object),
+                    ));
                 }
             }
         };
@@ -969,7 +1748,12 @@ fn handle_recall(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvel
             push(h, &mut candidates);
         }
     }
-    let ranked = node.cells.reranker.lock().unwrap().rerank(&query, &candidates);
+    let ranked = node
+        .cells
+        .reranker
+        .lock()
+        .unwrap()
+        .rerank(&query, &candidates);
 
     // Assemble view items: skeleton = active librarian skeleton when one
     // exists for the handle, else the fact text itself.
@@ -996,7 +1780,14 @@ fn handle_recall(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvel
     items.sort_by(|a, b| a.handle.cmp(&b.handle));
 
     let params = Cbor::map(vec![("query", Cbor::t(query)), ("k", Cbor::U64(k as u64))]);
-    let rendered = render_view("recall", "default", *node.view_version.lock().unwrap(), &params, &items, env.tier);
+    let rendered = render_view(
+        "recall",
+        "default",
+        *node.view_version.lock().unwrap(),
+        &params,
+        &items,
+        env.tier,
+    );
     charge_read(node, env, rendered.tokens_emitted)?;
 
     let mut resp = ResponseEnvelope::ok(
@@ -1018,7 +1809,8 @@ fn charge_read(node: &Node, env: &Envelope, tokens: u64) -> UcResult<()> {
     let mut t = node.trinity.lock().unwrap();
     t.work_budget.ensure(&env.work_budget.task_id, None);
     t.work_budget.charge_pre(&env.work_budget.task_id, tokens)?;
-    t.work_budget.charge_post(&env.work_budget.task_id, tokens, tokens);
+    t.work_budget
+        .charge_post(&env.work_budget.task_id, tokens, tokens);
     Ok(())
 }
 
@@ -1026,16 +1818,24 @@ fn charge_read(node: &Node, env: &Envelope, tokens: u64) -> UcResult<()> {
 // Hydrate — the P19 chokepoint
 // ---------------------------------------------------------------------------
 
-pub fn facet_gate(
-    node: &Node,
-    token: &captoken::CapToken,
-    handle: &str,
-) -> UcResult<()> {
+pub fn facet_gate(node: &Node, token: &captoken::CapToken, handle: &str) -> UcResult<()> {
+    facet_gate_at(node, token, handle, node.now())
+}
+
+fn facet_gate_at(node: &Node, token: &captoken::CapToken, handle: &str, at: u64) -> UcResult<()> {
     if token.allows_facet(handle) {
         return Ok(());
     }
     if token.facet_excluded(handle) && crate::curator::is_private_facet(handle) {
         node.metrics.inc("curator.rationale_access_denied");
+        node.audit_event(
+            at,
+            "curator.rationale_access_denied",
+            &[
+                ("requester", Cbor::t(token.agent_id.clone())),
+                ("target", Cbor::t(handle)),
+            ],
+        )?;
     } else {
         node.metrics.inc("router.facet_denied");
     }
@@ -1045,10 +1845,11 @@ pub fn facet_gate(
 }
 
 fn handle_hydrate(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelope> {
+    let _mutation = node.mutation_guard();
     let handle = env.payload.req_str("handle")?;
 
     // Facet-scope gate FIRST — before existence is even consulted.
-    facet_gate(node, &env.capability, &handle)?;
+    facet_gate_at(node, &env.capability, &handle, at)?;
 
     let text: String = if crate::curator::is_private_facet(&handle) {
         // Only operator-plane (or same-curator) tokens reach this branch.
@@ -1070,10 +1871,7 @@ fn handle_hydrate(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnve
     Ok(ResponseEnvelope::ok(
         env.request_id,
         at,
-        Cbor::map(vec![
-            ("handle", Cbor::t(handle)),
-            ("body", Cbor::t(text)),
-        ]),
+        Cbor::map(vec![("handle", Cbor::t(handle)), ("body", Cbor::t(text))]),
         tokens,
     ))
 }
@@ -1083,6 +1881,7 @@ fn handle_hydrate(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnve
 // ---------------------------------------------------------------------------
 
 fn handle_view(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelope> {
+    let _mutation = node.mutation_guard();
     let view_id = env.payload.req_str("view_id")?;
     let params = env.payload.get("params").cloned().unwrap_or(Cbor::Null);
     let current_version = *node.view_version.lock().unwrap();
@@ -1091,9 +1890,7 @@ fn handle_view(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelop
         Some(v) if v > current_version => {
             return Err(UcError::new(
                 ErrCode::ContractViolation,
-                format!(
-                    "requested view_version {v} is newer than current {current_version}"
-                ),
+                format!("requested view_version {v} is newer than current {current_version}"),
             ));
         }
         Some(v) if v < current_version => {
@@ -1128,7 +1925,10 @@ fn handle_view(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelop
         ),
     ]);
 
-    if matches!(env.payload.opt_str("formatting").as_deref(), Some("deepseek_fim")) {
+    if matches!(
+        env.payload.opt_str("formatting").as_deref(),
+        Some("deepseek_fim")
+    ) {
         let prefix = env
             .payload
             .get("prefix")
@@ -1140,9 +1940,11 @@ fn handle_view(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelop
             .and_then(|v| v.as_str())
             .ok_or_else(|| UcError::schema("view formatting deepseek_fim requires suffix"))?;
         let client_kind = crate::deepseek::DeepSeekClientKind::parse(
-            &env.payload.opt_str("client_kind").unwrap_or_else(|| "deepseek-coder".into()),
+            &env.payload
+                .opt_str("client_kind")
+                .unwrap_or_else(|| "deepseek-coder".into()),
         );
-        let framed = crate::deepseek::frame_edit_prompt(client_kind, &prefix, &suffix);
+        let framed = crate::deepseek::frame_edit_prompt(client_kind, prefix, suffix);
         let tokens = est_tokens(framed.len()) as u64;
         charge_read(node, env, tokens)?;
         return Ok(ResponseEnvelope::ok(
@@ -1274,16 +2076,60 @@ fn build_builtin_view(node: &Node, view_id: &str, params: &Cbor) -> UcResult<Vec
 
 fn handle_subscribe(node: &Node, env: &Envelope, at: u64) -> UcResult<ResponseEnvelope> {
     let pattern = env.payload.req_str("pattern")?;
-    let sid = {
-        let mut subs = node.cells.subscription.lock().unwrap();
-        subs.subscribe(at, &env.agent_id, &pattern)
-    };
+
+    // Subscription registration is durable state. Allocate its stable id
+    // before the WAL append, then make the cell visible only after the
+    // encrypted intent and forensic record are durable.
+    let _mutation = node.mutation_guard();
     charge_read(node, env, 1)?;
+    let sid = {
+        let subs = node.cells.subscription.lock().unwrap();
+        subs.next_subscription_id()
+    };
+    node.append_wal(
+        &sid,
+        &WalFrame {
+            logical_at: at,
+            cell_id: ids::SUBSCRIPTION.0,
+            op: WalOp::Write,
+            schema_ver: 1,
+            flags: 0,
+            payload: Cbor::map(vec![
+                ("handle", Cbor::t(sid.clone())),
+                (
+                    "payload",
+                    Cbor::map(vec![
+                        ("agent_id", Cbor::t(env.agent_id.clone())),
+                        ("pattern", Cbor::t(pattern.clone())),
+                        ("since", Cbor::U64(at)),
+                    ]),
+                ),
+            ])
+            .encode(),
+        },
+    )?;
+    node.audit_event(
+        at,
+        "subscription.registered",
+        &[
+            ("sub_id", Cbor::t(sid.clone())),
+            ("agent_id", Cbor::t(env.agent_id.clone())),
+            ("pattern", Cbor::t(pattern.clone())),
+        ],
+    )?;
+    node.cells
+        .subscription
+        .lock()
+        .unwrap()
+        .subscribe_with_id(at, &sid, &env.agent_id, &pattern)?;
     node.metrics.inc("node.subscriptions");
     Ok(ResponseEnvelope::ok(
         env.request_id,
         at,
-        Cbor::map(vec![("sub_id", Cbor::t(sid)), ("pattern", Cbor::t(pattern))]),
+        Cbor::map(vec![
+            ("sub_id", Cbor::t(sid)),
+            ("pattern", Cbor::t(pattern)),
+        ]),
         1,
     ))
 }

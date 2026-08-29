@@ -23,7 +23,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use ultracortex::bootstrap::{self, Config};
 use ultracortex::core::cbor::Cbor;
+use ultracortex::persist::{EncryptionTier, Kms, Manifest};
 use ultracortex::proto::Client;
+use ultracortex::router::captoken::{issue_operator_token, HmacSigner};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -90,7 +92,7 @@ fn cmd_run(rest: &[String]) -> Result<(), String> {
     bootstrap::run(&cfg).map_err(|e| e.message)
 }
 
-fn connect() -> Result<Client, String> {
+fn connect() -> Result<(Client, ultracortex::router::captoken::CapToken), String> {
     // Same resolution order as the node: config file (if present) → env →
     // defaults. Keep it light: honor UC_DATA_DIR/UC_UDS/UC_TCP + default
     // ./ultracortex-data/ultracortex.sock, then 127.0.0.1:7741.
@@ -99,7 +101,16 @@ fn connect() -> Result<Client, String> {
         .tcp_addr
         .clone()
         .unwrap_or_else(|| "127.0.0.1:7741".into());
-    Client::connect(cfg.uds_path.as_deref(), Some(tcp.as_str())).map_err(|e| e.message)
+    let tier = Manifest::load(&cfg.data_dir)
+        .map_err(|e| e.message)?
+        .and_then(|m| EncryptionTier::parse(&m.encryption_tier).ok())
+        .unwrap_or(cfg.encryption_tier);
+    let kms = Kms::open(&cfg.data_dir, tier).map_err(|e| e.message)?;
+    let signer = HmacSigner::new(kms.subkey("captoken"));
+    let token = issue_operator_token(&signer, "operator");
+    let client =
+        Client::connect(cfg.uds_path.as_deref(), Some(tcp.as_str())).map_err(|e| e.message)?;
+    Ok((client, token))
 }
 
 fn cmd_admin(args: &[String]) -> Result<(), String> {
@@ -126,9 +137,7 @@ fn cmd_admin(args: &[String]) -> Result<(), String> {
             "kms rotate".into(),
             Cbor::map(vec![("emergency", Cbor::Bool(true))]),
         ),
-        [c, sub] if c == "congruence" && sub == "audit" => {
-            ("congruence audit".into(), Cbor::Null)
-        }
+        [c, sub] if c == "congruence" && sub == "audit" => ("congruence audit".into(), Cbor::Null),
         xs if xs.len() >= 3 && xs[0] == "congruence" && xs[1] == "accept" => (
             "congruence accept".into(),
             Cbor::map(vec![("entities", Cbor::text_array(&xs[2..]))]),
@@ -144,22 +153,28 @@ fn cmd_admin(args: &[String]) -> Result<(), String> {
         ),
         [c, sub, source, target, decision, plan, deprecated_after]
             if c == "contract" && sub == "plan-migration" =>
-        (
-            "contract plan-migration".into(),
-            Cbor::map(vec![
-                ("schema_id", Cbor::t(source.clone())),
-                ("target_schema_id", Cbor::t(target.clone())),
-                ("decision_handle", Cbor::t(decision.clone())),
-                ("migration_plan_handle", Cbor::t(plan.clone())),
-                ("deprecated_after", Cbor::t(deprecated_after.clone())),
-            ]),
-        ),
-        [c, sub] if c == "curator" && matches!(sub.as_str(), "status" | "probe-now" | "verify-weights") => {
+        {
+            (
+                "contract plan-migration".into(),
+                Cbor::map(vec![
+                    ("schema_id", Cbor::t(source.clone())),
+                    ("target_schema_id", Cbor::t(target.clone())),
+                    ("decision_handle", Cbor::t(decision.clone())),
+                    ("migration_plan_handle", Cbor::t(plan.clone())),
+                    ("deprecated_after", Cbor::t(deprecated_after.clone())),
+                ]),
+            )
+        }
+        [c, sub]
+            if c == "curator"
+                && matches!(sub.as_str(), "status" | "probe-now" | "verify-weights") =>
+        {
             (format!("curator {sub}"), Cbor::Null)
         }
-        [c, sub] if c == "cross-check" && sub == "tail" => {
-            ("cross-check tail".into(), Cbor::map(vec![("n", Cbor::U64(20))]))
-        }
+        [c, sub] if c == "cross-check" && sub == "tail" => (
+            "cross-check tail".into(),
+            Cbor::map(vec![("n", Cbor::U64(20))]),
+        ),
         [c, sub, n] if c == "cross-check" && sub == "tail" => (
             "cross-check tail".into(),
             Cbor::map(vec![(
@@ -192,8 +207,10 @@ fn cmd_admin(args: &[String]) -> Result<(), String> {
         }
     };
 
-    let mut client = connect()?;
-    let result = client.admin(&verb, cbor_args).map_err(|e| e.message)?;
+    let (mut client, token) = connect()?;
+    let result = client
+        .admin_with_token(&token, &verb, cbor_args)
+        .map_err(|e| e.message)?;
     println!("{}", render(&result, 0));
     Ok(())
 }
@@ -205,7 +222,10 @@ fn render(c: &Cbor, indent: usize) -> String {
         Cbor::Map(pairs) => pairs
             .iter()
             .map(|(k, v)| {
-                let key = k.as_str().map(String::from).unwrap_or_else(|| format!("{k:?}"));
+                let key = k
+                    .as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("{k:?}"));
                 match v {
                     Cbor::Map(_) | Cbor::Array(_) => {
                         format!("{pad}{key}:\n{}", render(v, indent + 1))

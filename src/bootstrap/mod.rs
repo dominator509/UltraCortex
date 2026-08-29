@@ -19,19 +19,20 @@
 //! The admin plane ([`admin_dispatch`]) serves every operator verb over
 //! the same wire protocol, marked `type: "admin"`.
 
+use crate::cells::CellBehavior;
 use crate::core::cbor::Cbor;
+use crate::core::crypto::sha256;
 use crate::core::minitoml::{self, TomlValue};
 use crate::core::ulid::{DetRng, Ulid};
 use crate::core::{fnv1a64, ErrCode, Intent, Severity, ShardTopology, Tier, UcError, UcResult};
 use crate::curator::guardrails::{CALIBRATION_WINDOW, HIGH_BAND_FLOOR, MEDIUM_BAND_FLOOR};
 use crate::curator::ledger::{
-    BATCH_SIGN_EVERY, PROBE_BOOST_ON_SUSPICIOUS,
-    RETENTION_POLICY as CROSS_CHECK_RETENTION_POLICY,
+    BATCH_SIGN_EVERY, PROBE_BOOST_ON_SUSPICIOUS, RETENTION_POLICY as CROSS_CHECK_RETENTION_POLICY,
 };
 use crate::curator::{CuratorConfig, CuratorKvBudgetProfile};
 use crate::node::{ids, Node};
 use crate::obs::{AuditChain, OtlpConfig};
-use crate::persist::wal::{replay_dir, WalOp};
+use crate::persist::wal::{replay_dir, WalFrame, WalOp};
 use crate::persist::{EncryptionTier, Manifest};
 use crate::router::captoken::{
     issue_agent_token, issue_curator_token, issue_operator_token, CapToken,
@@ -192,22 +193,20 @@ impl Config {
         if let Some(v) = get("curator", "external_cmd").and_then(|v| v.as_str().map(String::from)) {
             self.curator.external_cmd = if v.is_empty() { None } else { Some(v) };
         }
-        if let Some(v) = get("curator", "librarian_model")
-            .and_then(|v| v.as_str().map(String::from))
+        if let Some(v) =
+            get("curator", "librarian_model").and_then(|v| v.as_str().map(String::from))
         {
             self.curator.librarian_model = v;
         }
-        if let Some(v) = get("curator", "warden_model")
-            .and_then(|v| v.as_str().map(String::from))
-        {
+        if let Some(v) = get("curator", "warden_model").and_then(|v| v.as_str().map(String::from)) {
             self.curator.warden_model = v;
         }
         if let Some(v) = get("curator", "pool").and_then(|v| v.as_str().map(String::from)) {
             let pool: Vec<String> = v
                 .split(',')
                 .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+                .filter(|s| !s.is_empty())
+                .collect();
             if !pool.is_empty() {
                 self.curator.adjudicator_pool = pool;
             }
@@ -217,18 +216,18 @@ impl Config {
         if let Some(v) = get("observability", "otlp_enabled").and_then(|v| v.as_bool()) {
             self.observability.enabled = v;
         }
-        if let Some(v) = get("observability", "otlp_metrics_endpoint")
-            .and_then(|v| v.as_str().map(String::from))
+        if let Some(v) =
+            get("observability", "otlp_metrics_endpoint").and_then(|v| v.as_str().map(String::from))
         {
             self.observability.metrics_endpoint = v;
         }
-        if let Some(v) = get("observability", "otlp_traces_endpoint")
-            .and_then(|v| v.as_str().map(String::from))
+        if let Some(v) =
+            get("observability", "otlp_traces_endpoint").and_then(|v| v.as_str().map(String::from))
         {
             self.observability.traces_endpoint = v;
         }
-        if let Some(v) = get("observability", "otlp_logs_endpoint")
-            .and_then(|v| v.as_str().map(String::from))
+        if let Some(v) =
+            get("observability", "otlp_logs_endpoint").and_then(|v| v.as_str().map(String::from))
         {
             self.observability.logs_endpoint = v;
         }
@@ -444,14 +443,35 @@ pub fn boot(cfg: &Config) -> UcResult<BootReport> {
     let prior = Manifest::load(&cfg.data_dir)?;
     let (recovered, replayed) = match prior {
         None => {
+            // Node::open creates empty WAL files. Capture whether anything
+            // durable existed before provisioning so a missing manifest from
+            // an interrupted first boot cannot silently discard the WAL.
+            let had_durable_state = durable_state_present(&cfg.data_dir);
             provision_fresh(&node)?;
-            (false, 0)
+            let mut manifest = node.manifest.lock().unwrap().clone();
+            manifest.clean_shutdown = false;
+            manifest.logical_at = node.now();
+            if let Some(snapshot) = latest_snapshot_name(&cfg.data_dir) {
+                let (snapshot_at, _) = node.snapshots.load(&snapshot)?;
+                manifest.last_snapshot = Some(snapshot);
+                manifest.logical_at = snapshot_at;
+            }
+            // Persist the bootstrap record before the listener is started or
+            // any state-changing request can be accepted.
+            manifest.save(&cfg.data_dir)?;
+            *node.manifest.lock().unwrap() = manifest.clone();
+            if had_durable_state {
+                (true, recover(&node, &manifest)?)
+            } else {
+                (false, 0)
+            }
         }
         Some(manifest) => {
             let frames = recover(&node, &manifest)?;
             (true, frames)
         }
     };
+    node.set_snapshot_watermark(node.manifest.lock().unwrap().logical_at);
 
     // Verify pinned weights before serving (P20 weight pinning).
     for (model, sha) in &node.curator_cfg.pinned {
@@ -461,20 +481,16 @@ pub fn boot(cfg: &Config) -> UcResult<BootReport> {
     // B5 — self-test. Fatal on any failure.
     let passed = self_test(&node)?;
 
-    node.audit
-        .lock()
-        .unwrap()
-        .append(
-            node.now(),
-            "node.boot",
-            &[
-                ("node_id", Cbor::t(node.node_id.clone())),
-                ("recovered", Cbor::Bool(recovered)),
-                ("replayed", Cbor::U64(replayed)),
-                ("self_test", Cbor::U64(passed as u64)),
-            ],
-        )
-        .map_err(UcError::internal)?;
+    node.audit_event(
+        node.now(),
+        "node.boot",
+        &[
+            ("node_id", Cbor::t(node.node_id.clone())),
+            ("recovered", Cbor::Bool(recovered)),
+            ("replayed", Cbor::U64(replayed)),
+            ("self_test", Cbor::U64(passed as u64)),
+        ],
+    )?;
 
     Ok(BootReport {
         node,
@@ -482,6 +498,40 @@ pub fn boot(cfg: &Config) -> UcResult<BootReport> {
         replayed_frames: replayed,
         self_test_passed: passed,
     })
+}
+
+fn durable_state_present(data_dir: &Path) -> bool {
+    let wal_root = data_dir.join("wal");
+    if let Ok(shards) = std::fs::read_dir(wal_root) {
+        for shard in shards.flatten() {
+            if let Ok(epochs) = std::fs::read_dir(shard.path()) {
+                if epochs.flatten().any(|entry| {
+                    entry.file_name().to_string_lossy().starts_with("epoch-")
+                        && entry.metadata().map(|m| m.len() > 0).unwrap_or(false)
+                }) {
+                    return true;
+                }
+            }
+        }
+    }
+    latest_snapshot_name(data_dir).is_some()
+}
+
+fn latest_snapshot_name(data_dir: &Path) -> Option<String> {
+    let mut names: Vec<String> = std::fs::read_dir(data_dir.join("snapshots"))
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name.starts_with("snap-")
+                && name.ends_with(".cbor")
+                && !name.contains(".tmp-")
+                && entry.metadata().map(|m| m.len() > 0).unwrap_or(false))
+            .then_some(name)
+        })
+        .collect();
+    names.sort();
+    names.pop()
 }
 
 /// B3a — fresh provisioning in the mandated order. Any failure is fatal:
@@ -514,6 +564,16 @@ fn provision_fresh(node: &Node) -> UcResult<()> {
                 "output_handle".into(),
                 "operation".into(),
                 "target_handle".into(),
+            ],
+        );
+        t.contract.register(
+            at,
+            "curator.adjudicator.v1",
+            vec![
+                "handle".into(),
+                "initiator_output".into(),
+                "auditor_flag".into(),
+                "resolution".into(),
             ],
         );
         t.contract.register(at, "blob.v1", vec!["body".into()]);
@@ -638,13 +698,19 @@ fn recover(node: &Node, manifest: &Manifest) -> UcResult<u64> {
         let (at, states) = node.snapshots.load(name)?;
         node.restore_all(&states)?;
         snapshot_at = at;
-    } else {
+    } else if node.trinity.lock().unwrap().contract.list().is_empty() {
         // No snapshot: provision governance fresh, then replay everything.
+        // A missing-manifest recovery may already have provisioned it before
+        // persisting the initial manifest.
         provision_fresh(node)?;
     }
 
-    // WAL replay strictly after the snapshot point.
+    // WAL replay strictly after the snapshot point. Sort all streams into one
+    // deterministic logical order so a superseding write cannot be replayed
+    // before its target merely because the two handles hash to different
+    // shards.
     let mut replayed = 0u64;
+    let mut frames = Vec::new();
     for shard in &node.shard_wals {
         let outcome = replay_dir(shard.dir()).map_err(UcError::internal)?;
         if let Some(torn) = outcome.torn_tail {
@@ -652,14 +718,40 @@ fn recover(node: &Node, manifest: &Manifest) -> UcResult<u64> {
                 .warn(0, "bootstrap.torn_tail_truncated", &[("file", torn)]);
             node.metrics.inc("boot.torn_tails");
         }
-        for frame in outcome.frames {
-            if frame.logical_at <= snapshot_at {
-                continue;
-            }
-            replay_frame(node, &frame)?;
-            replayed += 1;
-            node.clock.advance_to(frame.logical_at);
+        frames.extend(outcome.frames);
+    }
+    let cross_check_outcome = replay_dir(node.cross_check_wal.dir()).map_err(UcError::internal)?;
+    if let Some(torn) = cross_check_outcome.torn_tail {
+        node.logger
+            .warn(0, "bootstrap.torn_tail_truncated", &[("file", torn)]);
+        node.metrics.inc("boot.torn_tails");
+    }
+    // CrossCheck has its own sequence number. Preserve that stream's physical
+    // WAL order instead of applying the shard merge tie-breaker to encrypted
+    // payload bytes, which can reorder same-timestamp records.
+    let cross_check_frames = cross_check_outcome.frames;
+    frames.sort_by(|a, b| {
+        a.logical_at
+            .cmp(&b.logical_at)
+            .then_with(|| a.cell_id.cmp(&b.cell_id))
+            .then_with(|| (a.op as u8).cmp(&(b.op as u8)))
+            .then_with(|| a.flags.cmp(&b.flags))
+    });
+    for frame in frames {
+        if frame.logical_at <= snapshot_at {
+            continue;
         }
+        replay_frame(node, &frame)?;
+        replayed += 1;
+        node.clock.advance_to(frame.logical_at);
+    }
+    for frame in cross_check_frames {
+        if frame.logical_at <= snapshot_at {
+            continue;
+        }
+        replay_frame(node, &frame)?;
+        replayed += 1;
+        node.clock.advance_to(frame.logical_at);
     }
     node.clock.advance_to(manifest.logical_at);
 
@@ -695,12 +787,16 @@ fn recover(node: &Node, manifest: &Manifest) -> UcResult<u64> {
 /// Re-apply one WAL frame to in-memory state (idempotent for frames at or
 /// before current state; duplicate inserts overwrite identically).
 fn replay_frame(node: &Node, frame: &crate::persist::wal::WalFrame) -> UcResult<()> {
-    let body = Cbor::decode(&frame.payload)?;
+    let payload = node.decode_wal_payload(frame)?;
+    let body = Cbor::decode(&payload)?;
     match frame.op {
         WalOp::Write => {
             let handle = body.opt_str("handle").unwrap_or_default();
             let payload = body.get("payload").cloned().unwrap_or(Cbor::Null);
             if frame.cell_id == ids::FACT.0 {
+                if handle.is_empty() {
+                    return Err(UcError::schema("fact WAL frame has no handle"));
+                }
                 let (s, p, o) = (
                     payload.opt_str("subject").unwrap_or_default(),
                     payload.opt_str("predicate").unwrap_or_default(),
@@ -708,44 +804,304 @@ fn replay_frame(node: &Node, frame: &crate::persist::wal::WalFrame) -> UcResult<
                 );
                 let mut fact = node.cells.fact.lock().unwrap();
                 if !fact.exists(&handle) && !handle.is_empty() {
-                    fact.insert(crate::cells::memory::Fact {
-                        handle: handle.clone(),
-                        subject: s.clone(),
-                        predicate: p.clone(),
-                        object: o.clone(),
-                        confidence: None,
-                        written_at: frame.logical_at,
-                        superseded_by: None,
-                        supersedes: payload.opt_str("supersedes"),
-                        anchor: body.opt_str("anchor").unwrap_or_default(),
-                    });
+                    let supersedes = payload.opt_str("supersedes");
+                    fact.insert_with_supersede(
+                        crate::cells::memory::Fact {
+                            handle: handle.clone(),
+                            subject: s.clone(),
+                            predicate: p.clone(),
+                            object: o.clone(),
+                            confidence: None,
+                            written_at: frame.logical_at,
+                            superseded_by: None,
+                            supersedes: supersedes.clone(),
+                            anchor: body.opt_str("anchor").unwrap_or_default(),
+                        },
+                        supersedes.as_deref(),
+                    )?;
                     drop(fact);
                     let text = format!("{s} {p} {o}");
                     node.cells.bm25.lock().unwrap().add(handle.clone(), &text);
                     node.cells.vector.lock().unwrap().add(handle, &text);
                 }
+            } else if frame.cell_id == ids::BLOB.0 {
+                let text = payload.opt_str("body").unwrap_or_default();
+                let sha = sha256(text.as_bytes());
+                let mut blob = node.cells.blob.lock().unwrap();
+                if !blob.exists(&handle) {
+                    let stored = node.cas.put(text.as_bytes())?;
+                    if stored != sha {
+                        return Err(UcError::internal("CAS returned a mismatched blob digest"));
+                    }
+                    let registered = blob.register(
+                        sha,
+                        text.len() as u64,
+                        payload
+                            .opt_str("media")
+                            .unwrap_or_else(|| "text/plain".into()),
+                    );
+                    if registered != handle {
+                        return Err(UcError::internal("blob WAL handle does not match digest"));
+                    }
+                }
+            } else if frame.cell_id == ids::TIMELINE.0 {
+                let update = Cbor::map(vec![
+                    (
+                        "stream",
+                        Cbor::t(payload.opt_str("stream").unwrap_or_else(|| "main".into())),
+                    ),
+                    ("event", payload.get("event").cloned().unwrap_or(Cbor::Null)),
+                ]);
+                node.cells
+                    .timeline
+                    .lock()
+                    .unwrap()
+                    .on_update(frame.logical_at, &update)?;
+            } else if frame.cell_id == ids::SCRATCHPAD.0 {
+                node.cells
+                    .scratchpad
+                    .lock()
+                    .unwrap()
+                    .on_update(frame.logical_at, &payload)?;
+            } else if frame.cell_id == ids::SUBSCRIPTION.0 {
+                let sub_id = if handle.is_empty() {
+                    return Err(UcError::schema("subscription WAL frame has no handle"));
+                } else {
+                    handle.as_str()
+                };
+                let agent_id = payload.req_str("agent_id")?;
+                let pattern = payload.req_str("pattern")?;
+                let since = payload.opt_u64("since").unwrap_or(frame.logical_at);
+                node.cells
+                    .subscription
+                    .lock()
+                    .unwrap()
+                    .subscribe_with_id(since, sub_id, &agent_id, &pattern)?;
+            } else {
+                return Err(UcError::unsupported(format!(
+                    "unsupported write WAL cell {}",
+                    frame.cell_id
+                )));
             }
-            // Blob/Timeline/Scratchpad replay is covered by snapshots in v0
-            // (their WAL frames exist for forensics; snapshot cadence
-            // bounds loss to the group-commit window).
         }
         WalOp::Supersede => {
             let old = body.opt_str("old").unwrap_or_default();
             let new = body.opt_str("new").unwrap_or_default();
             if old.starts_with("decision/") {
                 let mut t = node.trinity.lock().unwrap();
-                let _ = t.decision_ledger.supersede(&old, &new);
+                t.decision_ledger.supersede(&old, &new)?;
             } else {
                 let mut fact = node.cells.fact.lock().unwrap();
-                let _ = fact.supersede(&old, &new);
+                fact.supersede(&old, &new)?;
             }
         }
-        WalOp::CuratorOutput => {
-            if let Ok(public) = crate::curator::CuratorPublic::from_cbor(&body) {
+        WalOp::CuratorOutput => match body.opt_str("role").as_deref() {
+            Some("warden_audit") => {
+                let audit = crate::curator::warden::audit_from_cbor(
+                    body.get("audit")
+                        .ok_or_else(|| UcError::schema("warden WAL audit missing"))?,
+                )?;
+                node.curators
+                    .warden
+                    .lock()
+                    .unwrap()
+                    .replay_audit(audit.clone());
+                node.index_public(&audit.judgment_handle, "");
+            }
+            Some("warden_flag") => {
+                let public = crate::curator::CuratorPublic::from_cbor(
+                    body.get("public")
+                        .ok_or_else(|| UcError::schema("warden WAL flag missing"))?,
+                )?;
                 node.index_public(&public.output_handle, &public.body);
             }
+            Some("adjudication") => {
+                let adjudication = crate::curator::adjudicator::adjudication_from_cbor(
+                    body.get("adjudication")
+                        .ok_or_else(|| UcError::schema("adjudicator WAL record missing"))?,
+                )?;
+                node.curators
+                    .adjudicator
+                    .lock()
+                    .unwrap()
+                    .replay_adjudication(adjudication.clone());
+                node.index_public(&adjudication.handle, adjudication.resolution.as_str());
+            }
+            _ => {
+                let public_cbor = body.get("public").unwrap_or(&body);
+                let public = crate::curator::CuratorPublic::from_cbor(public_cbor)?;
+                let status = body
+                    .opt_str("status")
+                    .and_then(|s| crate::curator::librarian::OutputStatus::parse(&s))
+                    .unwrap_or(crate::curator::librarian::OutputStatus::Pending);
+                node.curators
+                    .librarian
+                    .lock()
+                    .unwrap()
+                    .replay_output(public.clone(), status);
+                if let Some(items) = body.get("private_facets").and_then(|v| v.as_array()) {
+                    let mut lib = node.curators.librarian.lock().unwrap();
+                    for item in items {
+                        let raw = item
+                            .get("sha256")
+                            .and_then(|v| v.as_bytes())
+                            .ok_or_else(|| UcError::schema("curator WAL facet missing sha256"))?;
+                        if raw.len() != 32 {
+                            return Err(UcError::schema(
+                                "curator WAL facet sha256 must be 32 bytes",
+                            ));
+                        }
+                        let mut sha = [0u8; 32];
+                        sha.copy_from_slice(raw);
+                        let facet = item.req_str("facet")?;
+                        lib.replay_private_facet(&public.output_handle, &facet, sha);
+                    }
+                }
+                node.index_public(&public.output_handle, &public.body);
+            }
+        },
+        WalOp::CrossCheck => {
+            let record = crate::curator::ledger::CrossCheckRecord::from_cbor(&body)?;
+            node.cross_check
+                .lock()
+                .unwrap()
+                .replay_record(&node.metrics, record)?;
         }
-        _ => {} // CrossCheck lives on its own stream; others snapshot-covered
+        WalOp::Checkpoint => {}
+        WalOp::QuarantineAbsorb => {
+            let qid = body.req_str("qid")?;
+            let cause = ErrCode::from_str(&body.req_str("cause")?)
+                .ok_or_else(|| UcError::schema("quarantine WAL has an unknown cause"))?;
+            let record = body.get("record").cloned().unwrap_or_else(|| {
+                Cbor::map(vec![(
+                    "payload",
+                    body.get("payload").cloned().unwrap_or(Cbor::Null),
+                )])
+            });
+            let absorbed_at = body.opt_u64("absorbed_at").unwrap_or(frame.logical_at);
+            let seed = body.opt_u64("seed").unwrap_or(0);
+            let detail = body.opt_str("detail").unwrap_or_default();
+            let mut t = node.trinity.lock().unwrap();
+            t.quarantine
+                .replay_absorb(&qid, absorbed_at, seed, cause, &detail, record)?;
+        }
+        WalOp::Decision | WalOp::QuarantineResolve => {
+            return Err(UcError::unsupported(format!(
+                "WAL operation {:?} has no recovery handler",
+                frame.op
+            )));
+        }
+        WalOp::AdminOp => replay_admin_op(node, frame.logical_at, &body)?,
+    }
+    Ok(())
+}
+
+fn replay_admin_op(node: &Node, at: u64, body: &Cbor) -> UcResult<()> {
+    let verb = body.req_str("verb")?;
+    let args = body.get("args").cloned().unwrap_or(Cbor::Null);
+    match verb.as_str() {
+        "quarantine reinject" => {
+            let qid = args.req_str("qid")?;
+            let mut t = node.trinity.lock().unwrap();
+            if let Some(item) = t.quarantine.get(&qid) {
+                if item.status == crate::trinity::cells::QuarantineStatus::Pending {
+                    t.quarantine.reinject(at, &qid)?;
+                }
+            }
+        }
+        "quarantine reject" => {
+            let qid = args.req_str("qid")?;
+            let mut t = node.trinity.lock().unwrap();
+            if let Some(item) = t.quarantine.get(&qid) {
+                if item.status == crate::trinity::cells::QuarantineStatus::Pending {
+                    t.quarantine.reject(at, &qid)?;
+                }
+            }
+        }
+        "congruence accept" => {
+            let entities = args
+                .get("entities")
+                .and_then(|v| v.as_array())
+                .map(|items| items.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let mut t = node.trinity.lock().unwrap();
+            for entity in entities {
+                t.congruence.accept_delta(entity);
+            }
+        }
+        "contract plan-migration" => {
+            let source = args.req_str("schema_id")?;
+            let target = args.req_str("target_schema_id")?;
+            let plan = args.req_str("migration_plan_handle")?;
+            let decision = args.req_str("decision_handle")?;
+            let deprecated_after = args
+                .opt_u64("deprecated_after")
+                .or_else(|| {
+                    args.opt_str("deprecated_after")
+                        .and_then(|s| s.parse().ok())
+                })
+                .ok_or_else(|| {
+                    UcError::schema("admin WAL migration is missing deprecated_after")
+                })?;
+            let mut t = node.trinity.lock().unwrap();
+            if t.contract.list().iter().any(|c| {
+                c.schema_id == source
+                    && c.superseded_by.as_deref() == Some(target.as_str())
+                    && c.migration_plan_handle.as_deref() == Some(plan.as_str())
+                    && c.decision_handle.as_deref() == Some(decision.as_str())
+            }) {
+                return Ok(());
+            }
+            t.contract
+                .plan_migration(&source, &target, &plan, &decision, deprecated_after)?;
+        }
+        "contract apply-migration" => {
+            let source = args.req_str("schema_id")?;
+            let mut t = node.trinity.lock().unwrap();
+            if t.contract
+                .list()
+                .iter()
+                .find(|c| c.schema_id == source)
+                .is_some_and(|c| c.deprecated)
+            {
+                return Ok(());
+            }
+            t.contract.apply_migration(at, &source)?;
+        }
+        "resolve" => {
+            let handle = args.req_str("handle")?;
+            let uphold = args.opt_bool("uphold_auditor").unwrap_or(false);
+            let target = {
+                let mut adj = node.curators.adjudicator.lock().unwrap();
+                if let Some(rec) = adj.get(&handle) {
+                    if rec.human_resolved {
+                        rec.initiator_output.clone()
+                    } else {
+                        let target = rec.initiator_output.clone();
+                        adj.resolve_human(&handle, uphold)?;
+                        target
+                    }
+                } else {
+                    return Err(UcError::not_found(format!("adjudication {handle}")));
+                }
+            };
+            if target.starts_with("librarian/output/") {
+                let status = if uphold {
+                    crate::curator::librarian::OutputStatus::Quarantined
+                } else {
+                    crate::curator::librarian::OutputStatus::Active
+                };
+                let mut lib = node.curators.librarian.lock().unwrap();
+                if lib.status(&target) != Some(status) {
+                    lib.set_status(&target, status)?;
+                }
+            }
+        }
+        other => {
+            return Err(UcError::unsupported(format!(
+                "admin WAL operation `{other}` has no recovery handler"
+            )))
+        }
     }
     Ok(())
 }
@@ -754,6 +1110,7 @@ fn replay_frame(node: &Node, frame: &crate::persist::wal::WalFrame) -> UcResult<
 // B5 — self-test
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn selftest_env(
     node: &Node,
     token: &CapToken,
@@ -1064,10 +1421,8 @@ pub fn self_test(node: &Arc<Node>) -> UcResult<u32> {
         lib.pending()
             .first()
             .map(|p| p.output_handle.clone())
-            .or_else(|| {
-                // Any output at all — pull from the public index.
-                None
-            })
+            // Any output at all — pull from the public index.
+            .or(None)
     };
     let facet = {
         // Use the active skeleton from B5.7's target.
@@ -1142,6 +1497,29 @@ pub fn self_test(node: &Arc<Node>) -> UcResult<u32> {
 // Admin plane
 // ---------------------------------------------------------------------------
 
+/// Record a state-changing operator command before applying it. Recovery
+/// replays the same command through `replay_admin_op`, so operator mutations
+/// cannot silently disappear between snapshots.
+fn append_admin_wal(node: &Node, at: u64, verb: &str, args: &Cbor) -> UcResult<()> {
+    node.append_wal(
+        "admin",
+        &WalFrame {
+            logical_at: at,
+            cell_id: 0,
+            op: WalOp::AdminOp,
+            schema_ver: 1,
+            flags: 0,
+            payload: Cbor::map(vec![("verb", Cbor::t(verb)), ("args", args.clone())]).encode(),
+        },
+    )?;
+    node.audit_event(
+        at,
+        "admin.operation_durable",
+        &[("verb", Cbor::t(verb)), ("args", args.clone())],
+    )?;
+    Ok(())
+}
+
 /// Dispatch an operator verb. Called by the proto server for
 /// `type: "admin"` frames and by `main.rs` for offline verbs.
 pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
@@ -1215,7 +1593,24 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
         }
         "quarantine reinject" => {
             let qid = args.req_str("qid")?;
+            // Validate before recording the operation, then commit the
+            // quarantine status transition before re-driving the payload.
             let payload = {
+                let _mutation = node.mutation_guard();
+                {
+                    let t = node.trinity.lock().unwrap();
+                    let item = t
+                        .quarantine
+                        .get(&qid)
+                        .ok_or_else(|| UcError::not_found(format!("quarantine item {qid}")))?;
+                    if item.status != crate::trinity::cells::QuarantineStatus::Pending {
+                        return Err(UcError::schema(format!(
+                            "quarantine item {qid} already {}",
+                            item.status.as_str()
+                        )));
+                    }
+                }
+                append_admin_wal(node, at, &verb, &args)?;
                 let mut t = node.trinity.lock().unwrap();
                 t.quarantine.reinject(at, &qid)?
             };
@@ -1253,6 +1648,21 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
         }
         "quarantine reject" => {
             let qid = args.req_str("qid")?;
+            let _mutation = node.mutation_guard();
+            {
+                let t = node.trinity.lock().unwrap();
+                let item = t
+                    .quarantine
+                    .get(&qid)
+                    .ok_or_else(|| UcError::not_found(format!("quarantine item {qid}")))?;
+                if item.status != crate::trinity::cells::QuarantineStatus::Pending {
+                    return Err(UcError::schema(format!(
+                        "quarantine item {qid} already {}",
+                        item.status.as_str()
+                    )));
+                }
+            }
+            append_admin_wal(node, at, &verb, &args)?;
             let mut t = node.trinity.lock().unwrap();
             t.quarantine.reject(at, &qid)?;
             Ok(Cbor::map(vec![("rejected", Cbor::t(qid))]))
@@ -1290,18 +1700,9 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
             Ok(Cbor::map(vec![
                 ("records", Cbor::U64(records)),
                 ("intact", Cbor::Bool(ok)),
-                (
-                    "cross_check_batches_expected",
-                    Cbor::U64(expected_batches),
-                ),
-                (
-                    "cross_check_batches_verified",
-                    Cbor::U64(verified_batches),
-                ),
-                (
-                    "cross_check_signatures_intact",
-                    Cbor::Bool(signatures_ok),
-                ),
+                ("cross_check_batches_expected", Cbor::U64(expected_batches)),
+                ("cross_check_batches_verified", Cbor::U64(verified_batches)),
+                ("cross_check_signatures_intact", Cbor::Bool(signatures_ok)),
             ]))
         }
         "kms status" => {
@@ -1355,6 +1756,20 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
         }
         "kms rotate" => {
             let emergency = args.opt_bool("emergency").unwrap_or(false);
+            let _mutation = node.mutation_guard();
+            // Record the intent before changing the keyring. The keyring
+            // update is itself atomic; this audit entry prevents a rotation
+            // from becoming invisible if the process stops immediately
+            // afterward.
+            node.audit
+                .lock()
+                .unwrap()
+                .append(
+                    at,
+                    "kms.key_rotation_requested",
+                    &[("emergency", Cbor::Bool(emergency))],
+                )
+                .map_err(UcError::internal)?;
             let rotation = node.kms.rotate(at, emergency)?;
             let due = node.kms.rotation_status(at).map(|s| s.next_due_at);
             node.audit
@@ -1387,10 +1802,7 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
                 ("active_key_id", Cbor::U64(rotation.active_key_id)),
                 ("logical_at", Cbor::U64(rotation.logical_at)),
                 ("emergency", Cbor::Bool(rotation.emergency)),
-                (
-                    "next_due_at",
-                    due.map(Cbor::U64).unwrap_or(Cbor::Null),
-                ),
+                ("next_due_at", due.map(Cbor::U64).unwrap_or(Cbor::Null)),
                 ("audited", Cbor::Bool(true)),
             ]))
         }
@@ -1444,6 +1856,8 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
                     "congruence accept: missing entity or entities",
                 ));
             }
+            let _mutation = node.mutation_guard();
+            append_admin_wal(node, at, &verb, &args)?;
             let mut t = node.trinity.lock().unwrap();
             for entity in &entities {
                 t.congruence.accept_delta(entity);
@@ -1533,12 +1947,20 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
                 .ok_or_else(|| {
                     UcError::schema("contract plan-migration: missing deprecated_after")
                 })?;
+            let _mutation = node.mutation_guard();
             let mut t = node.trinity.lock().unwrap();
             if !t.decision_ledger.exists(&decision_handle) {
                 return Err(UcError::not_found(format!(
                     "decision handle `{decision_handle}` does not exist"
                 )));
             }
+            t.contract.validate_migration_plan(
+                &source_schema_id,
+                &target_schema_id,
+                &migration_plan_handle,
+                &decision_handle,
+            )?;
+            append_admin_wal(node, at, &verb, &args)?;
             t.contract.plan_migration(
                 &source_schema_id,
                 &target_schema_id,
@@ -1555,7 +1977,10 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
         }
         "contract apply-migration" => {
             let source_schema_id = args.req_str("schema_id")?;
+            let _mutation = node.mutation_guard();
             let mut t = node.trinity.lock().unwrap();
+            t.contract.validate_apply_migration(at, &source_schema_id)?;
+            append_admin_wal(node, at, &verb, &args)?;
             t.contract.apply_migration(at, &source_schema_id)?;
             t.contract.migration_status(&source_schema_id)
         }
@@ -1636,7 +2061,8 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
             ]))
         }
         "curator probe-now" => {
-            crate::router::run_curation_probe(node, at);
+            let _mutation = node.mutation_guard();
+            crate::router::run_curation_probe(node, at)?;
             Ok(Cbor::map(vec![(
                 "probes",
                 Cbor::U64(node.metrics.counter("curator.probes")),
@@ -1676,7 +2102,7 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
                 ("pool", Cbor::U64(pool)),
                 ("human", Cbor::U64(human)),
                 ("queued", Cbor::U64(queued as u64)),
-                ("escalations", Cbor::text_array(&adj.escalations().to_vec())),
+                ("escalations", Cbor::text_array(adj.escalations())),
                 (
                     "escalation_subscribers",
                     Cbor::text_array(&escalation_subscribers),
@@ -1686,22 +2112,44 @@ pub fn admin_dispatch(node: &Arc<Node>, msg: &Cbor) -> UcResult<Cbor> {
         "resolve" => {
             let handle = args.req_str("handle")?;
             let uphold_auditor = args.opt_bool("uphold_auditor").unwrap_or(false);
-            let mut adj = node.curators.adjudicator.lock().unwrap();
-            let rec = adj.resolve_human(&handle, uphold_auditor)?;
-            let target = rec.initiator_output.clone();
+            let _mutation = node.mutation_guard();
+            let target = {
+                let adj = node.curators.adjudicator.lock().unwrap();
+                let rec = adj.validate_human_resolution(&handle)?;
+                rec.initiator_output.clone()
+            };
+            if target.starts_with("librarian/output/") {
+                let lib = node.curators.librarian.lock().unwrap();
+                if lib.status(&target).is_none() {
+                    return Err(UcError::not_found(format!("librarian output {target}")));
+                }
+            }
             let uphold = uphold_auditor;
-            drop(adj);
+            append_admin_wal(node, at, &verb, &args)?;
+            node.audit_event(
+                at,
+                "adjudicator.human_resolution",
+                &[
+                    ("handle", Cbor::t(handle.clone())),
+                    ("uphold_auditor", Cbor::Bool(uphold)),
+                    ("target", Cbor::t(target.clone())),
+                ],
+            )?;
+            {
+                let mut adj = node.curators.adjudicator.lock().unwrap();
+                adj.resolve_human(&handle, uphold_auditor)?;
+            }
             // Apply the human verdict to the disputed librarian output.
             if target.starts_with("librarian/output/") {
                 let mut lib = node.curators.librarian.lock().unwrap();
-                let _ = lib.set_status(
+                lib.set_status(
                     &target,
                     if uphold {
                         crate::curator::librarian::OutputStatus::Quarantined
                     } else {
                         crate::curator::librarian::OutputStatus::Active
                     },
-                );
+                )?;
             }
             Ok(Cbor::map(vec![
                 ("resolved", Cbor::t(handle)),
@@ -1804,23 +2252,27 @@ pub fn run(cfg: &Config) -> UcResult<()> {
 /// A deterministic offline environment used by `--dry-run` and tests: full
 /// boot in a temp dir, no listeners.
 pub fn dry_run() -> UcResult<BootReport> {
-    let mut cfg = Config::default();
-    cfg.curator = CuratorConfig::development();
     let seq = DRY_RUN_SEQ.fetch_add(1, Ordering::Relaxed);
-    cfg.data_dir = std::env::temp_dir().join(format!(
+    let data_dir = std::env::temp_dir().join(format!(
         "ultracortex-dryrun-{}-{}-{}",
         std::process::id(),
         DetRng::new(fnv1a64(b"dryrun")).next_u64(),
         seq
     ));
+    let cfg = Config {
+        data_dir: data_dir.clone(),
+        uds_path: Some(data_dir.join("ultracortex.sock")),
+        curator: CuratorConfig::development(),
+        ..Config::default()
+    };
     let _ = std::fs::remove_dir_all(&cfg.data_dir);
-    cfg.uds_path = Some(cfg.data_dir.join("ultracortex.sock"));
     boot(&cfg)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::curator::SubstrateView;
     use std::collections::BTreeSet;
 
     #[test]
@@ -1837,12 +2289,15 @@ mod tests {
 
     #[test]
     fn recovery_restores_written_facts() {
-        let mut cfg = Config::default();
-        cfg.curator = CuratorConfig::development();
-        cfg.data_dir =
+        let data_dir =
             std::env::temp_dir().join(format!("ultracortex-recover-{}", std::process::id()));
+        let cfg = Config {
+            data_dir: data_dir.clone(),
+            uds_path: Some(data_dir.join("ultracortex.sock")),
+            curator: CuratorConfig::development(),
+            ..Config::default()
+        };
         let _ = std::fs::remove_dir_all(&cfg.data_dir);
-        cfg.uds_path = Some(cfg.data_dir.join("ultracortex.sock"));
 
         let report = boot(&cfg).unwrap();
         let node = report.node.clone();
@@ -1865,6 +2320,222 @@ mod tests {
             &*report2.node,
             &handle
         ));
+        let _ = std::fs::remove_dir_all(&cfg.data_dir);
+    }
+
+    #[test]
+    fn abrupt_recovery_replays_all_normal_wal_state_classes() {
+        let seq = DRY_RUN_SEQ.fetch_add(1, Ordering::Relaxed);
+        let data_dir = std::env::temp_dir().join(format!(
+            "ultracortex-abrupt-recover-{}-{}",
+            std::process::id(),
+            seq
+        ));
+        let cfg = Config {
+            data_dir: data_dir.clone(),
+            uds_path: Some(data_dir.join("ultracortex.sock")),
+            curator: CuratorConfig::development(),
+            ..Config::default()
+        };
+        let _ = std::fs::remove_dir_all(&cfg.data_dir);
+
+        let report = boot(&cfg).unwrap();
+        let node = report.node.clone();
+        let agent = issue_agent_token(&*node.signer, "abrupt-recovery-agent", 0);
+        node.cells
+            .agent_registry
+            .lock()
+            .unwrap()
+            .register(node.now(), &agent.agent_id, "agent");
+
+        let write = |payload: Cbor, seed: u64| {
+            handle_envelope(
+                &node,
+                &selftest_env(
+                    &node,
+                    &agent,
+                    Intent::Write,
+                    payload,
+                    Some("Architecture.md\u{00a7}4"),
+                    "abrupt-recovery",
+                    seed,
+                    false,
+                ),
+            )
+        };
+
+        let fact = write(
+            Cbor::map(vec![
+                ("subject", Cbor::t("abrupt-recovery")),
+                ("predicate", Cbor::t("fact")),
+                ("object", Cbor::t("wal-fact-survives")),
+            ]),
+            100,
+        );
+        assert!(fact.ok, "fact write failed: {:?}", fact.err_message);
+        let fact_handle = fact.result.opt_str("handle").unwrap();
+
+        let blob = write(
+            Cbor::map(vec![
+                ("target", Cbor::t("Blob")),
+                ("schema_id", Cbor::t("blob.v1")),
+                ("body", Cbor::t("wal-blob-survives")),
+            ]),
+            101,
+        );
+        assert!(blob.ok, "blob write failed: {:?}", blob.err_message);
+        let blob_handle = blob.result.opt_str("handle").unwrap();
+
+        let timeline = write(
+            Cbor::map(vec![
+                ("target", Cbor::t("Timeline")),
+                ("schema_id", Cbor::t("timeline.v1")),
+                ("stream", Cbor::t("abrupt-recovery")),
+                (
+                    "event",
+                    Cbor::map(vec![("body", Cbor::t("wal-timeline-survives"))]),
+                ),
+            ]),
+            102,
+        );
+        assert!(
+            timeline.ok,
+            "timeline write failed: {:?}",
+            timeline.err_message
+        );
+
+        let scratchpad = write(
+            Cbor::map(vec![
+                ("target", Cbor::t("Scratchpad")),
+                ("schema_id", Cbor::t("scratchpad.v1")),
+                ("key", Cbor::t("abrupt-recovery")),
+                ("value", Cbor::t("wal-scratchpad-survives")),
+                ("ttl", Cbor::U64(100_000)),
+            ]),
+            103,
+        );
+        assert!(
+            scratchpad.ok,
+            "scratchpad write failed: {:?}",
+            scratchpad.err_message
+        );
+
+        assert!(node.data_dir.join("manifest.cbor").exists());
+        // No shutdown or snapshot: this models an unclean process exit after
+        // the Router has acknowledged WAL-backed writes.
+        drop(node);
+        drop(report);
+
+        let recovered = boot(&cfg).unwrap();
+        assert!(recovered.recovered);
+        assert!(recovered.replayed_frames > 0);
+        assert_eq!(
+            recovered.node.public_text(&fact_handle).as_deref(),
+            Some("wal-fact-survives")
+        );
+        assert_eq!(
+            recovered.node.public_text(&blob_handle).as_deref(),
+            Some("wal-blob-survives")
+        );
+        {
+            let timeline = recovered.node.cells.timeline.lock().unwrap();
+            let tail = timeline.tail("abrupt-recovery", 1);
+            assert_eq!(tail.len(), 1);
+            assert_eq!(
+                tail[0].2,
+                Cbor::map(vec![("body", Cbor::t("wal-timeline-survives"))])
+            );
+        }
+        {
+            let mut scratchpad = recovered.node.cells.scratchpad.lock().unwrap();
+            assert_eq!(
+                scratchpad
+                    .get(recovered.node.now(), "abrupt-recovery")
+                    .cloned(),
+                Some(Cbor::t("wal-scratchpad-survives"))
+            );
+        }
+
+        let _ = recovered.node.shutdown();
+        let _ = std::fs::remove_dir_all(&cfg.data_dir);
+    }
+
+    #[test]
+    fn wal_only_restart_recovers_without_initial_manifest() {
+        let seq = DRY_RUN_SEQ.fetch_add(1, Ordering::Relaxed);
+        let data_dir = std::env::temp_dir().join(format!(
+            "ultracortex-wal-only-{}-{}",
+            std::process::id(),
+            seq
+        ));
+        let cfg = Config {
+            data_dir: data_dir.clone(),
+            uds_path: Some(data_dir.join("ultracortex.sock")),
+            curator: CuratorConfig::development(),
+            ..Config::default()
+        };
+        let _ = std::fs::remove_dir_all(&cfg.data_dir);
+
+        // Simulate the first process dying after an acknowledged WAL write but
+        // before the bootstrap manifest is written.
+        let node = Arc::new(
+            Node::open(
+                &cfg.node_id,
+                &cfg.data_dir,
+                cfg.shards,
+                cfg.encryption_tier,
+                cfg.boot_seed,
+                cfg.trinity_topology,
+                cfg.curator.clone(),
+                cfg.embedder_dim,
+            )
+            .unwrap(),
+        );
+        provision_fresh(&node).unwrap();
+        let agent = issue_agent_token(&*node.signer, "wal-only-agent", 0);
+        node.cells
+            .agent_registry
+            .lock()
+            .unwrap()
+            .register(node.now(), &agent.agent_id, "agent");
+        let response = handle_envelope(
+            &node,
+            &selftest_env(
+                &node,
+                &agent,
+                Intent::Write,
+                Cbor::map(vec![
+                    ("subject", Cbor::t("wal-only")),
+                    ("predicate", Cbor::t("status")),
+                    ("object", Cbor::t("survives missing manifest")),
+                ]),
+                Some("Architecture.md\u{00a7}4"),
+                "wal-only-recovery",
+                1201,
+                false,
+            ),
+        );
+        assert!(
+            response.ok,
+            "WAL-only write failed: {:?}",
+            response.err_message
+        );
+        let handle = response.result.opt_str("handle").unwrap();
+        for wal in &node.shard_wals {
+            wal.sync().unwrap();
+        }
+        node.cross_check_wal.sync().unwrap();
+        for wal in &node.shard_wals {
+            wal.shutdown();
+        }
+        node.cross_check_wal.shutdown();
+        assert!(!cfg.data_dir.join("manifest.cbor").exists());
+        drop(node);
+
+        let recovered = boot(&cfg).unwrap();
+        assert!(recovered.recovered);
+        assert!(recovered.node.handle_exists(&handle));
+        recovered.node.shutdown().unwrap();
         let _ = std::fs::remove_dir_all(&cfg.data_dir);
     }
 
@@ -1932,22 +2603,21 @@ mod tests {
 
     #[test]
     fn kms_status_and_rotate_surface_custody_and_keep_audit_chain_intact() {
-        let dir = std::env::temp_dir().join(format!(
-            "uc-kms-admin-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("uc-kms-admin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let node = Arc::new(Node::open(
-            "kms-admin-node",
-            &dir,
-            2,
-            EncryptionTier::T3,
-            7,
-            ShardTopology::Dedicated,
-            CuratorConfig::development(),
-            256,
-        )
-        .unwrap());
+        let node = Arc::new(
+            Node::open(
+                "kms-admin-node",
+                &dir,
+                2,
+                EncryptionTier::T3,
+                7,
+                ShardTopology::Dedicated,
+                CuratorConfig::development(),
+                256,
+            )
+            .unwrap(),
+        );
         provision_fresh(&node).unwrap();
 
         let status = admin_dispatch(
@@ -1957,17 +2627,20 @@ mod tests {
         .unwrap();
         assert_eq!(status.opt_str("tier"), Some("T3".to_string()));
         assert_eq!(status.opt_u64("active_key_id"), Some(1));
-        assert_eq!(status.opt_u64("rotation_interval_ops"), Some(crate::persist::T3_ROTATION_INTERVAL_OPS));
-        assert!(status.opt_str("custody_path").unwrap_or_default().ends_with("keyring.cbor"));
+        assert_eq!(
+            status.opt_u64("rotation_interval_ops"),
+            Some(crate::persist::T3_ROTATION_INTERVAL_OPS)
+        );
+        assert!(status
+            .opt_str("custody_path")
+            .unwrap_or_default()
+            .ends_with("keyring.cbor"));
 
         let rotated = admin_dispatch(
             &node,
             &Cbor::map(vec![
                 ("verb", Cbor::t("kms rotate")),
-                (
-                    "args",
-                    Cbor::map(vec![("emergency", Cbor::Bool(true))]),
-                ),
+                ("args", Cbor::map(vec![("emergency", Cbor::Bool(true))])),
             ]),
         )
         .unwrap();
@@ -1978,7 +2651,10 @@ mod tests {
 
         let audit = admin_dispatch(
             &node,
-            &Cbor::map(vec![("verb", Cbor::t("audit verify")), ("args", Cbor::Null)]),
+            &Cbor::map(vec![
+                ("verb", Cbor::t("audit verify")),
+                ("args", Cbor::Null),
+            ]),
         )
         .unwrap();
         assert_eq!(audit.opt_bool("intact"), Some(true));
@@ -2275,18 +2951,23 @@ mod tests {
 
     #[test]
     fn topology_overrides_and_cross_check_policy_surface_cleanly() {
-        let mut cfg = Config::default();
-        cfg.data_dir = std::env::temp_dir().join(format!(
+        let data_dir = std::env::temp_dir().join(format!(
             "ultracortex-topology-{}-{}",
             std::process::id(),
             DRY_RUN_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
+        let cfg = Config {
+            data_dir: data_dir.clone(),
+            uds_path: Some(data_dir.join("ultracortex.sock")),
+            trinity_topology: ShardTopology::CoTenantShard0,
+            curator: CuratorConfig {
+                topology: ShardTopology::CoTenantShard0,
+                kv_budget_profile: CuratorKvBudgetProfile::Small,
+                ..CuratorConfig::development()
+            },
+            ..Config::default()
+        };
         let _ = std::fs::remove_dir_all(&cfg.data_dir);
-        cfg.uds_path = Some(cfg.data_dir.join("ultracortex.sock"));
-        cfg.trinity_topology = ShardTopology::CoTenantShard0;
-        cfg.curator = CuratorConfig::development();
-        cfg.curator.topology = ShardTopology::CoTenantShard0;
-        cfg.curator.kv_budget_profile = CuratorKvBudgetProfile::Small;
 
         let report = boot(&cfg).unwrap();
         let node = report.node;

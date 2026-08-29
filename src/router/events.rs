@@ -100,6 +100,31 @@ impl EventBus {
         self.ring.iter().filter(|e| e.seq > since).collect()
     }
 
+    /// Replay only events the named agent is currently entitled to receive.
+    /// The wire protocol uses this instead of exposing the unfiltered ring so
+    /// a caller cannot turn a replay cursor into an event side channel.
+    pub fn since_for(
+        &self,
+        agent_id: &str,
+        since: u64,
+        subs: &SubscriptionCell,
+        registry: &AgentRegistryCell,
+    ) -> Vec<Event> {
+        self.since(since)
+            .into_iter()
+            .filter(|event| {
+                subs.entitled_at(agent_id, &event.name, event.logical_at)
+                    || (ALWAYS_DELIVER
+                        .iter()
+                        .any(|prefix| event.name.starts_with(prefix))
+                        && registry
+                            .get(agent_id)
+                            .is_some_and(|info| info.active && info.role == "operator"))
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn latest_seq(&self) -> u64 {
         self.next_seq.saturating_sub(1)
     }
@@ -165,5 +190,20 @@ mod tests {
         assert_eq!(bus.latest_seq(), EVENT_RING as u64 + 99);
         // Oldest entries evicted.
         assert!(bus.since(0).len() == EVENT_RING);
+    }
+
+    #[test]
+    fn since_replay_honors_subscription_activation_cursor() {
+        let mut bus = EventBus::new();
+        let mut subs = SubscriptionCell::new(CellId(13));
+        let mut reg = AgentRegistryCell::new(CellId(11));
+        reg.register(0, "agent-a", "agent");
+        subs.subscribe(10, "agent-a", "node.*");
+        bus.publish(&subs, &reg, 9, "node.written", Cbor::U64(9));
+        bus.publish(&subs, &reg, 10, "node.written", Cbor::U64(10));
+
+        let replay = bus.since_for("agent-a", 0, &subs, &reg);
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].logical_at, 10);
     }
 }

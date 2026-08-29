@@ -26,7 +26,9 @@ use crate::core::cbor::Cbor;
 use crate::core::crypto::{hex, sha256};
 use crate::core::{CellId, SchemaId, UcError, UcResult};
 use crate::obs::Metrics;
-use crate::persist::wal::{WalFrame, WalOp, WalWriter, FLAG_CROSS_CHECK};
+use crate::persist::wal::{
+    payload_nonce, payload_purpose, WalFrame, WalOp, WalWriter, FLAG_CROSS_CHECK,
+};
 use crate::persist::{BatchSignature, Kms};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -221,6 +223,7 @@ impl CrossCheckLedgerCell {
         self.kms = Some(kms);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn append(
         &mut self,
         metrics: &Metrics,
@@ -243,13 +246,22 @@ impl CrossCheckLedgerCell {
         // Own WAL stream first — durability before visibility (§5).
         let bytes = rec.to_cbor().encode();
         if let Some(wal) = &self.wal {
+            let payload = if let Some(kms) = &self.kms {
+                kms.seal(
+                    &payload_purpose(self.id.0, FLAG_CROSS_CHECK),
+                    payload_nonce(logical_at, self.id.0, WalOp::CrossCheck, &bytes),
+                    &bytes,
+                )
+            } else {
+                bytes.clone()
+            };
             wal.append(&WalFrame {
                 logical_at,
                 cell_id: self.id.0,
                 op: WalOp::CrossCheck,
                 schema_ver: 1,
                 flags: FLAG_CROSS_CHECK,
-                payload: bytes.clone(),
+                payload,
             })
             .map_err(UcError::internal)?;
         }
@@ -284,6 +296,51 @@ impl CrossCheckLedgerCell {
         self.records.push(rec);
         self.next_seq += 1;
         Ok(self.next_seq - 1)
+    }
+
+    /// Re-apply a record that was already durably written to the dedicated
+    /// WAL. Recovery must never append it again, but it must rebuild the same
+    /// indices, rolling window, batch hashes, and sequence number.
+    pub fn replay_record(&mut self, metrics: &Metrics, rec: CrossCheckRecord) -> UcResult<()> {
+        if rec.seq < self.next_seq {
+            return Ok(());
+        }
+        if rec.seq != self.next_seq {
+            return Err(UcError::internal(format!(
+                "cross-check WAL sequence gap: expected {}, got {}",
+                self.next_seq, rec.seq
+            )));
+        }
+        let bytes = rec.to_cbor().encode();
+        self.batch_hashes.push(sha256(&bytes));
+        self.by_initiator
+            .entry(rec.initiator.clone())
+            .or_default()
+            .push(rec.seq);
+        *self.by_outcome.entry(rec.outcome.as_str()).or_insert(0) += 1;
+        if rec.kind == CrossCheckKind::WardenAudit {
+            if self.audit_window.len() == AGREEMENT_WINDOW {
+                self.audit_window.pop_front();
+            }
+            self.audit_window
+                .push_back(rec.outcome == CrossCheckOutcome::Agree);
+        }
+        metrics.inc("cross_check.records_replayed");
+        if self.next_seq % BATCH_SIGN_EVERY == BATCH_SIGN_EVERY - 1
+            && !self
+                .batch_signatures
+                .iter()
+                .any(|sig| sig.last_seq == self.next_seq)
+        {
+            // A replay never writes a new WAL frame, but a completed batch
+            // still needs its signature state reconstructed if it was absent.
+            self.sign_batch()?;
+        } else if self.next_seq % BATCH_SIGN_EVERY == BATCH_SIGN_EVERY - 1 {
+            self.batch_hashes.clear();
+        }
+        self.records.push(rec);
+        self.next_seq += 1;
+        Ok(())
     }
 
     fn signatures_path(&self) -> Option<std::path::PathBuf> {
@@ -518,16 +575,29 @@ impl CellBehavior for CrossCheckLedgerCell {
         }
         if let Some(arr) = state.get("batch_signatures").and_then(|v| v.as_array()) {
             for item in arr {
-                self.batch_signatures.push(BatchSignatureRecord::from_cbor(item)?);
+                self.batch_signatures
+                    .push(BatchSignatureRecord::from_cbor(item)?);
             }
         }
+        // Keep the partial batch hash accumulator aligned with the restored
+        // sequence. Completed batches are represented by signatures; only the
+        // current incomplete batch should accept new/replayed records.
+        let batch_start = (self.next_seq / BATCH_SIGN_EVERY) * BATCH_SIGN_EVERY;
+        self.batch_hashes = self
+            .records
+            .iter()
+            .filter(|rec| rec.seq >= batch_start)
+            .map(|rec| sha256(&rec.to_cbor().encode()))
+            .collect();
         Ok(())
     }
 }
 
 fn parse_hex_32(s: &str) -> UcResult<[u8; 32]> {
     if s.len() != 64 {
-        return Err(UcError::schema("cross_check signature hex must be 64 chars"));
+        return Err(UcError::schema(
+            "cross_check signature hex must be 64 chars",
+        ));
     }
     let mut out = [0u8; 32];
     for i in 0..32 {
@@ -568,11 +638,7 @@ mod tests {
     use std::sync::Arc;
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "uc-cross-check-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let d = std::env::temp_dir().join(format!("uc-cross-check-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

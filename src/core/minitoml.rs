@@ -78,8 +78,7 @@ pub fn parse(input: &str) -> Result<TomlDoc, String> {
         if key.is_empty() {
             return Err(format!("line {}: empty key", lineno + 1));
         }
-        let val = parse_value(val_str)
-            .map_err(|e| format!("line {}: {}", lineno + 1, e))?;
+        let val = parse_value(val_str).map_err(|e| format!("line {}: {}", lineno + 1, e))?;
         doc.get_mut(&section).unwrap().insert(key, val);
     }
     Ok(doc)
@@ -256,7 +255,10 @@ adjudicator_pool = ["phi-3.5-mini", "llama-3.2-3b", "smollm2-1.7b"]
         assert_eq!(doc[""]["shards"].as_int(), Some(4));
         assert_eq!(doc[""]["encryption_tier"].as_str(), Some("T1"));
         assert_eq!(doc["listen"]["tcp_enabled"].as_bool(), Some(false));
-        assert_eq!(doc["curator"]["disagreement_quota_low"].as_float(), Some(0.92));
+        assert_eq!(
+            doc["curator"]["disagreement_quota_low"].as_float(),
+            Some(0.92)
+        );
         match &doc["curator"]["adjudicator_pool"] {
             TomlValue::Array(items) => assert_eq!(items.len(), 3),
             _ => panic!("expected array"),

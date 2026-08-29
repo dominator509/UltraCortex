@@ -37,6 +37,28 @@ pub const GROUP_COMMIT_BYTES: usize = 256 * 1024;
 /// (CrossCheckLedgerCell.md §5 — own WAL stream, same format).
 pub const FLAG_CROSS_CHECK: u16 = 0b1;
 
+/// Domain-separated KMS purpose for a WAL payload. Keeping this in the WAL
+/// module makes every producer and the recovery path use the same value.
+pub fn payload_purpose(cell_id: u64, flags: u16) -> String {
+    if flags & FLAG_CROSS_CHECK != 0 {
+        "wal.cross_check".into()
+    } else {
+        format!("wal.cell.{cell_id}")
+    }
+}
+
+/// Derive a nonce seed that is stable for replay but differs for frames that
+/// share a logical timestamp. The authenticated payload still carries the
+/// frame CRC, so this is only nonce-domain separation.
+pub fn payload_nonce(logical_at: u64, cell_id: u64, op: WalOp, payload: &[u8]) -> u64 {
+    let mut seed = Vec::with_capacity(32 + payload.len());
+    seed.extend_from_slice(&logical_at.to_le_bytes());
+    seed.extend_from_slice(&cell_id.to_le_bytes());
+    seed.push(op as u8);
+    seed.extend_from_slice(payload);
+    crate::core::fnv1a64(&seed)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WalOp {
@@ -241,7 +263,14 @@ fn flusher_loop(
         };
         let mut shutdown = false;
         let mut force_sync = false;
-        handle_msg(first, &mut buf, &mut pending_acks, offset, &mut shutdown, &mut force_sync);
+        handle_msg(
+            first,
+            &mut buf,
+            &mut pending_acks,
+            offset,
+            &mut shutdown,
+            &mut force_sync,
+        );
 
         // Group-commit window: gather more frames for up to 250µs / 256KiB.
         if !shutdown && !force_sync {
@@ -253,7 +282,14 @@ fn flusher_loop(
                 }
                 match rx.recv_timeout(deadline - now) {
                     Ok(m) => {
-                        handle_msg(m, &mut buf, &mut pending_acks, offset, &mut shutdown, &mut force_sync);
+                        handle_msg(
+                            m,
+                            &mut buf,
+                            &mut pending_acks,
+                            offset,
+                            &mut shutdown,
+                            &mut force_sync,
+                        );
                         if shutdown || force_sync {
                             break;
                         }
@@ -419,7 +455,7 @@ fn read_frame<R: Read + Seek>(r: &mut R, remaining: u64) -> Result<(WalFrame, u6
     }
     let frame_len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as u64;
     // Sanity: fixed fields (20) + crc (4) minimum; 64 MiB max payload guard.
-    if frame_len < 24 || frame_len > 64 * 1024 * 1024 + 24 {
+    if !(24..=64 * 1024 * 1024 + 24).contains(&frame_len) {
         return Err("implausible frame_len".into());
     }
     if remaining < 8 + frame_len {

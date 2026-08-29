@@ -5,6 +5,7 @@
 //! convention. Everything drives the real Router against a booted node —
 //! no mocks below the SubstrateView seam.
 
+use std::sync::Arc;
 use ultracortex::bootstrap::{self, admin_dispatch};
 use ultracortex::cells::CellType;
 use ultracortex::core::cbor::Cbor;
@@ -19,7 +20,6 @@ use ultracortex::router::envelope::{Envelope, EnvelopeFlags, WorkBudget, PROTO_V
 use ultracortex::router::handle_envelope;
 use ultracortex::trinity::cells::GAP_FIXATION_N;
 use ultracortex::Node;
-use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -73,7 +73,14 @@ fn agent(node: &Node, id: &str) -> ultracortex::router::captoken::CapToken {
     tok
 }
 
-fn write_fact(node: &Node, tok: &ultracortex::router::captoken::CapToken, s: &str, p: &str, o: &str, seed: u64) -> String {
+fn write_fact(
+    node: &Node,
+    tok: &ultracortex::router::captoken::CapToken,
+    s: &str,
+    p: &str,
+    o: &str,
+    seed: u64,
+) -> String {
     let r = handle_envelope(
         node,
         &env_for(
@@ -151,7 +158,9 @@ fn t2_decision_conflict() {
     // step 3.
     let governing = {
         let t = node.trinity.lock().unwrap();
-        t.decision_ledger.active_in_scope("governance")[0].handle.clone()
+        t.decision_ledger.active_in_scope("governance")[0]
+            .handle
+            .clone()
     };
     let r = handle_envelope(
         &node,
@@ -187,7 +196,15 @@ fn t3_congruence_delta() {
     ]);
     let r = handle_envelope(
         &node,
-        &env_for(&node, &tok, Intent::Write, payload.clone(), Some("Architecture.md\u{00a7}2"), 31, false),
+        &env_for(
+            &node,
+            &tok,
+            Intent::Write,
+            payload.clone(),
+            Some("Architecture.md\u{00a7}2"),
+            31,
+            false,
+        ),
     );
     assert!(!r.ok);
     assert_eq!(r.err_code, Some(ErrCode::CongruenceDelta));
@@ -198,7 +215,15 @@ fn t3_congruence_delta() {
     }
     let r = handle_envelope(
         &node,
-        &env_for(&node, &tok, Intent::Write, payload, Some("Architecture.md\u{00a7}2"), 32, false),
+        &env_for(
+            &node,
+            &tok,
+            Intent::Write,
+            payload,
+            Some("Architecture.md\u{00a7}2"),
+            32,
+            false,
+        ),
     );
     assert!(r.ok, "{:?}", r.err_message);
 }
@@ -286,7 +311,10 @@ fn t6_quarantine_no_drop_reinject() {
     {
         let mut t = node.trinity.lock().unwrap();
         let removed = t.quarantine.sweep(node.now() + 1_000_000);
-        assert_eq!(t.quarantine.get(&qid).map(|q| q.qid.clone()), Some(qid.clone()));
+        assert_eq!(
+            t.quarantine.get(&qid).map(|q| q.qid.clone()),
+            Some(qid.clone())
+        );
         let _ = removed;
         assert!(t.quarantine.pending_count() >= 1);
     }
@@ -301,7 +329,10 @@ fn t6_quarantine_no_drop_reinject() {
     )
     .unwrap();
     assert_eq!(result.opt_bool("ok"), Some(true), "{result:?}");
-    assert!(node.active_sp("t6", "state").iter().any(|(_, o)| o == "recoverable"));
+    assert!(node
+        .active_sp("t6", "state")
+        .iter()
+        .any(|(_, o)| o == "recoverable"));
 }
 
 /// T7 — the audit chain verifies end-to-end after boot + activity.
@@ -315,7 +346,8 @@ fn t7_audit_chain() {
         .unwrap()
         .append(node.now(), "conformance.t7", &[("ok", Cbor::Bool(true))])
         .unwrap();
-    let result = admin_dispatch(&node, &Cbor::map(vec![("verb", Cbor::t("audit verify"))])).unwrap();
+    let result =
+        admin_dispatch(&node, &Cbor::map(vec![("verb", Cbor::t("audit verify"))])).unwrap();
     assert_eq!(result.opt_bool("intact"), Some(true));
     assert!(result.opt_u64("records").unwrap() >= 2);
 }
@@ -365,7 +397,14 @@ fn t8_trinity_first() {
 fn c1_private_facet_denied() {
     let node = booted("c1");
     let tok = agent(&node, "c1-agent");
-    let h = write_fact(&node, &tok, "c1", "topic", "asymmetric visibility is structural", 91);
+    let h = write_fact(
+        &node,
+        &tok,
+        "c1",
+        "topic",
+        "asymmetric visibility is structural",
+        91,
+    );
     let output_handle = {
         let lib = node.curators.librarian.lock().unwrap();
         lib.active_skeleton_for(&h).unwrap().output_handle.clone()
@@ -378,7 +417,12 @@ fn c1_private_facet_denied() {
         .register(node.now(), "curator.warden", "curator");
 
     let before = node.metrics.counter("curator.rationale_access_denied");
-    for facet in ["rationale", "considered_alts", "reasoning_trace", "confidence_precise"] {
+    for facet in [
+        "rationale",
+        "considered_alts",
+        "reasoning_trace",
+        "confidence_precise",
+    ] {
         let target = format!("{output_handle}/{facet}");
         let r = handle_envelope(
             &node,
@@ -419,7 +463,14 @@ fn c1_private_facet_denied() {
 fn c2_operator_hydrates_rationale() {
     let node = booted("c2");
     let tok = agent(&node, "c2-agent");
-    let h = write_fact(&node, &tok, "c2", "topic", "operators audit everything", 101);
+    let h = write_fact(
+        &node,
+        &tok,
+        "c2",
+        "topic",
+        "operators audit everything",
+        101,
+    );
     let facet = {
         let lib = node.curators.librarian.lock().unwrap();
         format!(
@@ -458,9 +509,7 @@ fn c3_independent_grounding() {
     let audits: Vec<_> = {
         let w = node.curators.warden.lock().unwrap();
         // Every stored audit satisfies grounding-or-proof.
-        (0..1)
-            .map(|_| w.audit_count())
-            .collect()
+        (0..1).map(|_| w.audit_count()).collect()
     };
     assert!(audits[0] >= 2);
     // Inspect the last audit for the second output directly.
@@ -528,13 +577,13 @@ fn c5_blind_reaudit_determinism() {
         seed: 131,
     };
     let (a1, a2) = {
-        let mut w = node.curators.warden.lock().unwrap();
+        let w = node.curators.warden.lock().unwrap();
         w.blind_reaudit(&*node, &output, Some(&job), node.now(), 777)
     };
     assert_eq!(a1, a2);
     // Rerun with the same seed → identical verdict pair.
     let (b1, b2) = {
-        let mut w = node.curators.warden.lock().unwrap();
+        let w = node.curators.warden.lock().unwrap();
         w.blind_reaudit(&*node, &output, Some(&job), node.now(), 777)
     };
     assert_eq!(a1, b1);
@@ -580,7 +629,10 @@ fn c6_pool_rotation() {
                 seed,
             },
         );
-        assert_eq!(rec.judge.as_deref(), Some(pool[(seed % 3) as usize].as_str()));
+        assert_eq!(
+            rec.judge.as_deref(),
+            Some(pool[(seed % 3) as usize].as_str())
+        );
     }
 }
 
@@ -658,7 +710,14 @@ fn c8_trinity_governs_curator() {
     let node = booted("c8");
     let tok = agent(&node, "c8-agent");
     let before = node.metrics.counter("trinity.contract.checked");
-    write_fact(&node, &tok, "c8", "governance", "curators are agents too", 161);
+    write_fact(
+        &node,
+        &tok,
+        "c8",
+        "governance",
+        "curators are agents too",
+        161,
+    );
     // One check for the fact write + one for the librarian output (P20).
     assert!(
         node.metrics.counter("trinity.contract.checked") >= before + 2,
@@ -672,7 +731,7 @@ fn c8_trinity_governs_curator() {
 fn c9_probe_detection() {
     let node = booted("c9");
     let before_probes = node.metrics.counter("curator.probes");
-    ultracortex::router::run_curation_probe(&node, node.tick());
+    ultracortex::router::run_curation_probe(&node, node.tick()).expect("curator probe");
     assert_eq!(node.metrics.counter("curator.probes"), before_probes + 1);
     assert_eq!(
         node.metrics.counter("curator.probe_missed"),
@@ -686,7 +745,9 @@ fn c9_probe_detection() {
         .filter(|r| r.kind == CrossCheckKind::Probe)
         .collect();
     assert!(!probes.is_empty());
-    assert!(probes.iter().all(|r| r.outcome == CrossCheckOutcome::Disagree));
+    assert!(probes
+        .iter()
+        .all(|r| r.outcome == CrossCheckOutcome::Disagree));
 }
 
 /// C10 — full E2E through the wire types: write → chain → curation →
@@ -707,7 +768,10 @@ fn c10_end_to_end() {
     // The skeleton is Active (not Pending, not Quarantined).
     let (skeleton, status) = {
         let lib = node.curators.librarian.lock().unwrap();
-        let p = lib.active_skeleton_for(&h).expect("active skeleton").clone();
+        let p = lib
+            .active_skeleton_for(&h)
+            .expect("active skeleton")
+            .clone();
         (p.body.clone(), lib.status(&p.output_handle).unwrap())
     };
     assert_eq!(status, OutputStatus::Active);
@@ -728,7 +792,10 @@ fn c10_end_to_end() {
             &node,
             &tok,
             Intent::Recall,
-            Cbor::map(vec![("query", Cbor::t("adversarial audit")), ("k", Cbor::U64(4))]),
+            Cbor::map(vec![
+                ("query", Cbor::t("adversarial audit")),
+                ("k", Cbor::U64(4)),
+            ]),
             None,
             172,
             false,
@@ -736,7 +803,12 @@ fn c10_end_to_end() {
     );
     assert!(r.ok);
     assert!(r.result.opt_u64("items").unwrap_or(0) >= 1);
-    let view_bytes = r.result.get("view").and_then(|v| v.as_bytes()).unwrap().to_vec();
+    let view_bytes = r
+        .result
+        .get("view")
+        .and_then(|v| v.as_bytes())
+        .unwrap()
+        .to_vec();
     let decoded = ultracortex::router::view::decode_view(&view_bytes).unwrap();
     let skeletons = &decoded.skeletons;
     assert!(
@@ -771,13 +843,30 @@ fn c10_end_to_end() {
 #[test]
 fn cell_type_roundtrip() {
     for ct in [
-        CellType::Catalog, CellType::Fact, CellType::Timeline, CellType::Playbook,
-        CellType::Scratchpad, CellType::Vector, CellType::Graph, CellType::Bm25,
-        CellType::Blob, CellType::Cache, CellType::AgentRegistry, CellType::Proposal,
-        CellType::Subscription, CellType::Reranker, CellType::SpecAnchor,
-        CellType::DecisionLedger, CellType::Congruence, CellType::Gap,
-        CellType::Quarantine, CellType::WorkBudget, CellType::Contract,
-        CellType::Librarian, CellType::Warden, CellType::Adjudicator,
+        CellType::Catalog,
+        CellType::Fact,
+        CellType::Timeline,
+        CellType::Playbook,
+        CellType::Scratchpad,
+        CellType::Vector,
+        CellType::Graph,
+        CellType::Bm25,
+        CellType::Blob,
+        CellType::Cache,
+        CellType::AgentRegistry,
+        CellType::Proposal,
+        CellType::Subscription,
+        CellType::Reranker,
+        CellType::SpecAnchor,
+        CellType::DecisionLedger,
+        CellType::Congruence,
+        CellType::Gap,
+        CellType::Quarantine,
+        CellType::WorkBudget,
+        CellType::Contract,
+        CellType::Librarian,
+        CellType::Warden,
+        CellType::Adjudicator,
         CellType::CrossCheckLedger,
     ] {
         assert_eq!(CellType::parse(ct.as_str()), Some(ct));

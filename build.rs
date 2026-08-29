@@ -93,7 +93,10 @@ fn main() {
         writeln!(
             w,
             "    ({:?}, {:?}, {:?}, {}),",
-            doc, sec, format!("{}:{}", path, line), line
+            doc,
+            sec,
+            format!("{}:{}", path, line),
+            line
         )
         .unwrap();
     }

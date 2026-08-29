@@ -149,8 +149,14 @@ mod tests {
         assert!(!glob_match("a?c", "a/c"));
         assert!(glob_match("src/router/**", "src/router/mod.rs"));
         assert!(glob_match("librarian/output/*", "librarian/output/X"));
-        assert!(!glob_match("librarian/output/*", "librarian/output/X/rationale"));
-        assert!(glob_match("librarian/output/*/rationale*", "librarian/output/X/rationale"));
+        assert!(!glob_match(
+            "librarian/output/*",
+            "librarian/output/X/rationale"
+        ));
+        assert!(glob_match(
+            "librarian/output/*/rationale*",
+            "librarian/output/X/rationale"
+        ));
     }
 
     #[test]

@@ -72,11 +72,45 @@ pub fn run_pre_validation(
     metrics: &Metrics,
     ctx: &PreCtx<'_>,
 ) -> UcResult<PreOk> {
+    run_pre_validation_inner(
+        trinity,
+        metrics,
+        ctx,
+        &mut |_qid, _at, _seed, _cause, _detail, _record| Ok(()),
+    )
+}
+
+/// Run the fixed Trinity chain and persist every quarantine absorption before
+/// mutating the in-memory quarantine cell. The callback is supplied by the
+/// Node because the chain itself deliberately does not own a WAL.
+pub fn run_pre_validation_durable<F>(
+    trinity: &mut Trinity,
+    metrics: &Metrics,
+    ctx: &PreCtx<'_>,
+    mut persist: F,
+) -> UcResult<PreOk>
+where
+    F: FnMut(&str, u64, u64, crate::core::ErrCode, &str, &Cbor) -> UcResult<()>,
+{
+    run_pre_validation_inner(trinity, metrics, ctx, &mut persist)
+}
+
+fn run_pre_validation_inner<F>(
+    trinity: &mut Trinity,
+    metrics: &Metrics,
+    ctx: &PreCtx<'_>,
+    persist: &mut F,
+) -> UcResult<PreOk>
+where
+    F: FnMut(&str, u64, u64, crate::core::ErrCode, &str, &Cbor) -> UcResult<()>,
+{
     // Step 1 — Contract.
     metrics.inc("trinity.contract.checked");
     if let Err(e) = trinity.contract.validate_schema(ctx.schema_id, ctx.payload) {
         metrics.inc("trinity.contract.rejected");
-        return Err(absorb(trinity, metrics, ctx, "contract", e));
+        return Err(absorb_failure(
+            trinity, metrics, ctx, "contract", e, persist,
+        )?);
     }
 
     // Step 2 — SpecAnchor.
@@ -86,14 +120,28 @@ pub fn run_pre_validation(
         .validate(ctx.target_type, ctx.spec_anchor.as_ref())
     {
         metrics.inc("trinity.spec_anchor.rejected");
-        return Err(absorb(trinity, metrics, ctx, "spec_anchor", e));
+        return Err(absorb_failure(
+            trinity,
+            metrics,
+            ctx,
+            "spec_anchor",
+            e,
+            persist,
+        )?);
     }
 
     // Step 3 — DecisionLedger.
     metrics.inc("trinity.decision.checked");
     if let Err(e) = trinity.decision_ledger.check_conflicts(ctx.payload) {
         metrics.inc("trinity.decision.rejected");
-        return Err(absorb(trinity, metrics, ctx, "decision_ledger", e));
+        return Err(absorb_failure(
+            trinity,
+            metrics,
+            ctx,
+            "decision_ledger",
+            e,
+            persist,
+        )?);
     }
 
     // Step 4 — WorkBudget (reserve).
@@ -101,7 +149,14 @@ pub fn run_pre_validation(
     trinity.work_budget.ensure(&ctx.task_id, None);
     if let Err(e) = trinity.work_budget.charge_pre(&ctx.task_id, ctx.estimate) {
         metrics.inc("trinity.budget.rejected");
-        return Err(absorb(trinity, metrics, ctx, "work_budget", e));
+        return Err(absorb_failure(
+            trinity,
+            metrics,
+            ctx,
+            "work_budget",
+            e,
+            persist,
+        )?);
     }
 
     // Step 5 — Congruence. On failure the step-4 reservation is released
@@ -109,8 +164,17 @@ pub fn run_pre_validation(
     metrics.inc("trinity.congruence.checked");
     if let Err(e) = trinity.congruence.preview_delta(ctx.payload) {
         metrics.inc("trinity.congruence.rejected");
-        trinity.work_budget.charge_post(&ctx.task_id, ctx.estimate, 0);
-        return Err(absorb(trinity, metrics, ctx, "congruence", e));
+        trinity
+            .work_budget
+            .charge_post(&ctx.task_id, ctx.estimate, 0);
+        return Err(absorb_failure(
+            trinity,
+            metrics,
+            ctx,
+            "congruence",
+            e,
+            persist,
+        )?);
     }
 
     // Step 6 (Warden) is dispatched by the Router — it needs curator state
@@ -121,16 +185,20 @@ pub fn run_pre_validation(
     })
 }
 
-/// Absorb a chain failure into quarantine and decorate the error. The
+/// Persist, then absorb, a chain failure and decorate the error. The
 /// original envelope payload is preserved verbatim so `quarantine reinject`
 /// can replay it after the cause is fixed.
-fn absorb(
+fn absorb_failure<F>(
     trinity: &mut Trinity,
     metrics: &Metrics,
     ctx: &PreCtx<'_>,
     step: &str,
     err: UcError,
-) -> UcError {
+    persist: &mut F,
+) -> UcResult<UcError>
+where
+    F: FnMut(&str, u64, u64, crate::core::ErrCode, &str, &Cbor) -> UcResult<()>,
+{
     metrics.inc("quarantine.absorbed");
     metrics.inc(&format!("quarantine.absorbed.{step}"));
     let record = Cbor::map(vec![
@@ -148,9 +216,23 @@ fn absorb(
                 .unwrap_or(Cbor::Null),
         ),
     ]);
-    let qid = trinity
-        .quarantine
-        .absorb(ctx.logical_at, ctx.seed, err.code, &err.message, record);
+    let qid = trinity.quarantine.next_qid(ctx.logical_at, ctx.seed);
+    persist(
+        &qid,
+        ctx.logical_at,
+        ctx.seed,
+        err.code,
+        &err.message,
+        &record,
+    )?;
+    trinity.quarantine.absorb_with_qid(
+        &qid,
+        ctx.logical_at,
+        ctx.seed,
+        err.code,
+        &err.message,
+        record,
+    )?;
     metrics.gauge_set(
         "quarantine.pending",
         trinity.quarantine.pending_count() as i64,
@@ -166,7 +248,7 @@ fn absorb(
         out = out.with_quarantine(u);
     }
     out.message = format!("{} [absorbed as {}]", out.message, qid);
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -185,8 +267,11 @@ mod tests {
             gap: GapCell::new(CellId(25)),
         };
         t.spec_anchor.register("Architecture.md", "4");
-        t.contract
-            .register(0, "fact.v1", vec!["subject".into(), "predicate".into(), "object".into()]);
+        t.contract.register(
+            0,
+            "fact.v1",
+            vec!["subject".into(), "predicate".into(), "object".into()],
+        );
         t
     }
 
@@ -337,7 +422,10 @@ mod tests {
         let _ = run_pre_validation(
             &mut t,
             &m,
-            &ctx(&decision_blocked, Some(AnchorRef::new("Architecture.md", "4"))),
+            &ctx(
+                &decision_blocked,
+                Some(AnchorRef::new("Architecture.md", "4")),
+            ),
         )
         .unwrap_err();
         assert_counters(&m, (1, 1, 1, 0, 0));

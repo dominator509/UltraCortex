@@ -110,7 +110,10 @@ impl Envelope {
             .opt_str("request_id")
             .and_then(|s| Ulid::from_base32(&s))
             .ok_or_else(|| {
-                UcError::new(ErrCode::ContractViolation, "E4: request_id must be a valid ULID")
+                UcError::new(
+                    ErrCode::ContractViolation,
+                    "E4: request_id must be a valid ULID",
+                )
             })?;
 
         let agent_id = c.req_str("agent_id")?;
@@ -200,6 +203,8 @@ pub struct ResponseEnvelope {
     /// Set when a recall/view was truncated at the requested tier.
     pub next_tier_hint: Option<Tier>,
     pub logical_at: u64,
+    /// Request seed echoed for deterministic replay and client correlation.
+    pub seed: u64,
 }
 
 impl ResponseEnvelope {
@@ -214,6 +219,7 @@ impl ResponseEnvelope {
             tokens_emitted: tokens,
             next_tier_hint: None,
             logical_at,
+            seed: 0,
         }
     }
 
@@ -228,6 +234,7 @@ impl ResponseEnvelope {
             tokens_emitted: 0,
             next_tier_hint: None,
             logical_at,
+            seed: 0,
         }
     }
 
@@ -238,7 +245,9 @@ impl ResponseEnvelope {
             ("result", self.result.clone()),
             (
                 "err_code",
-                self.err_code.map(|c| Cbor::t(c.as_str())).unwrap_or(Cbor::Null),
+                self.err_code
+                    .map(|c| Cbor::t(c.as_str()))
+                    .unwrap_or(Cbor::Null),
             ),
             (
                 "err_message",
@@ -262,6 +271,7 @@ impl ResponseEnvelope {
                     .unwrap_or(Cbor::Null),
             ),
             ("logical_at", Cbor::U64(self.logical_at)),
+            ("seed", Cbor::U64(self.seed)),
         ])
     }
 
@@ -279,6 +289,7 @@ impl ResponseEnvelope {
             tokens_emitted: c.opt_u64("tokens_emitted").unwrap_or(0),
             next_tier_hint: c.opt_str("next_tier_hint").and_then(|s| Tier::from_str(&s)),
             logical_at: c.opt_u64("logical_at").unwrap_or(0),
+            seed: c.opt_u64("seed").unwrap_or(0),
         })
     }
 }
@@ -286,8 +297,8 @@ impl ResponseEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::router::captoken::{issue_agent_token, HmacSigner};
     use crate::core::ulid::DetRng;
+    use crate::router::captoken::{issue_agent_token, HmacSigner};
 
     fn envelope() -> Envelope {
         let signer = HmacSigner::new([1u8; 32]);
@@ -357,7 +368,10 @@ mod tests {
                 }
             }
         }
-        assert!(Envelope::from_cbor(&c).unwrap_err().message.starts_with("E3"));
+        assert!(Envelope::from_cbor(&c)
+            .unwrap_err()
+            .message
+            .starts_with("E3"));
 
         // E3 — write without payload.
         let mut c = e.to_cbor();
@@ -368,7 +382,10 @@ mod tests {
                 }
             }
         }
-        assert!(Envelope::from_cbor(&c).unwrap_err().message.starts_with("E3"));
+        assert!(Envelope::from_cbor(&c)
+            .unwrap_err()
+            .message
+            .starts_with("E3"));
 
         // E4 — malformed request id.
         let mut c = e.to_cbor();
@@ -379,7 +396,10 @@ mod tests {
                 }
             }
         }
-        assert!(Envelope::from_cbor(&c).unwrap_err().message.starts_with("E4"));
+        assert!(Envelope::from_cbor(&c)
+            .unwrap_err()
+            .message
+            .starts_with("E4"));
     }
 
     #[test]
@@ -389,9 +409,21 @@ mod tests {
         let r = ResponseEnvelope::err(Ulid::nil(), 10, &e);
         assert!(!r.ok);
         assert_eq!(r.err_code, Some(ErrCode::AnchorMissing));
-        assert!(r.quarantine_id.as_deref().unwrap().starts_with("quarantine/"));
+        assert!(r
+            .quarantine_id
+            .as_deref()
+            .unwrap()
+            .starts_with("quarantine/"));
         let back = ResponseEnvelope::from_cbor(&r.to_cbor()).unwrap();
         assert_eq!(back.err_code, Some(ErrCode::AnchorMissing));
         assert_eq!(back.quarantine_id, r.quarantine_id);
+    }
+
+    #[test]
+    fn response_seed_roundtrip() {
+        let mut response = ResponseEnvelope::ok(Ulid::nil(), 10, Cbor::Null, 0);
+        response.seed = 0xD15EA5E;
+        let back = ResponseEnvelope::from_cbor(&response.to_cbor()).unwrap();
+        assert_eq!(back.seed, response.seed);
     }
 }

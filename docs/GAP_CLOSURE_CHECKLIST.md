@@ -1,13 +1,13 @@
 # GAP_CLOSURE_CHECKLIST.md — UltraCortex v1.0 Remaining Gap Closure Checklist
 
-**Status date:** 2026-08-13
+**Status date:** 2026-08-27
 **Scope:** Every `open`, `deferred`, or `in_progress` row in `docs/HANDOFF.md`.
 
 This document translates the remaining gap register into the minimum evidence needed to move a gap to `closed`.
 
-Second-pass audit note (2026-08-13):
+Second-pass checklist note (2026-08-27):
 - The DeepSeek section is intentionally empty because every `GAP-DS-*` row is now closed in `docs/HANDOFF.md`.
-- The remaining entries below were re-checked against the current checkout; they are real open gaps, not stale notes.
+- The remaining entries below were re-checked against the current checkout; they are real open gaps, not stale notes. The separate independent release-audit findings and their implementation/runtime boundaries are tracked in [`RELEASE_AUDIT_REMEDIATION.md`](../RELEASE_AUDIT_REMEDIATION.md).
 - One stale wording issue was corrected during this pass: the current checkout records T2+ CrossCheck batch HMACs, not externally custodied Ed25519 audit signatures.
 
 Closure legend:

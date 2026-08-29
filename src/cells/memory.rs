@@ -58,6 +58,37 @@ impl FactCell {
         self.facts.insert(fact.handle.clone(), fact);
     }
 
+    /// Insert a new fact and, when requested, update both sides of its
+    /// supersession edge as one validated cell transition. Callers persist
+    /// the transition before invoking this method.
+    pub fn insert_with_supersede(&mut self, fact: Fact, old: Option<&str>) -> UcResult<()> {
+        if self.facts.contains_key(&fact.handle) {
+            return Err(UcError::schema(format!(
+                "fact {} already exists",
+                fact.handle
+            )));
+        }
+        if let Some(old) = old {
+            let old_fact = self
+                .facts
+                .get(old)
+                .ok_or_else(|| UcError::not_found(format!("old fact {old} not found")))?;
+            if old_fact.superseded_by.is_some() {
+                return Err(UcError::schema(format!("{old} already superseded")));
+            }
+        }
+        let new = fact.handle.clone();
+        self.insert(fact);
+        if let Some(old) = old {
+            self.facts
+                .get_mut(old)
+                .expect("supersede target validated before insert")
+                .superseded_by = Some(new.clone());
+            self.facts.get_mut(&new).unwrap().supersedes = Some(old.to_string());
+        }
+        Ok(())
+    }
+
     pub fn get(&self, handle: &str) -> Option<&Fact> {
         self.facts.get(handle)
     }
@@ -131,16 +162,25 @@ impl FactCell {
             ("object", Cbor::t(f.object.clone())),
             (
                 "confidence",
-                f.confidence.as_ref().map(|c| Cbor::t(c.clone())).unwrap_or(Cbor::Null),
+                f.confidence
+                    .as_ref()
+                    .map(|c| Cbor::t(c.clone()))
+                    .unwrap_or(Cbor::Null),
             ),
             ("written_at", Cbor::U64(f.written_at)),
             (
                 "superseded_by",
-                f.superseded_by.as_ref().map(|s| Cbor::t(s.clone())).unwrap_or(Cbor::Null),
+                f.superseded_by
+                    .as_ref()
+                    .map(|s| Cbor::t(s.clone()))
+                    .unwrap_or(Cbor::Null),
             ),
             (
                 "supersedes",
-                f.supersedes.as_ref().map(|s| Cbor::t(s.clone())).unwrap_or(Cbor::Null),
+                f.supersedes
+                    .as_ref()
+                    .map(|s| Cbor::t(s.clone()))
+                    .unwrap_or(Cbor::Null),
             ),
             ("anchor", Cbor::t(f.anchor.clone())),
         ])
@@ -182,15 +222,21 @@ impl CellBehavior for FactCell {
             }
             Some("by_subject") => {
                 let s = query.req_str("subject")?;
-                let items: Vec<Cbor> =
-                    self.active_for_subject(&s).iter().map(|f| Self::fact_to_cbor(f)).collect();
+                let items: Vec<Cbor> = self
+                    .active_for_subject(&s)
+                    .iter()
+                    .map(|f| Self::fact_to_cbor(f))
+                    .collect();
                 Ok(Cbor::map(vec![("facts", Cbor::Array(items))]))
             }
             Some("by_sp") => {
                 let s = query.req_str("subject")?;
                 let p = query.req_str("predicate")?;
-                let items: Vec<Cbor> =
-                    self.active_for_sp(&s, &p).iter().map(|f| Self::fact_to_cbor(f)).collect();
+                let items: Vec<Cbor> = self
+                    .active_for_sp(&s, &p)
+                    .iter()
+                    .map(|f| Self::fact_to_cbor(f))
+                    .collect();
                 Ok(Cbor::map(vec![("facts", Cbor::Array(items))]))
             }
             _ => Err(UcError::schema("fact: unknown op")),
@@ -675,7 +721,9 @@ impl CellBehavior for BlobCell {
         let mut sha = [0u8; 32];
         sha.copy_from_slice(sha_bytes);
         let size = update.opt_u64("size").unwrap_or(0);
-        let media = update.opt_str("media").unwrap_or_else(|| "application/octet-stream".into());
+        let media = update
+            .opt_str("media")
+            .unwrap_or_else(|| "application/octet-stream".into());
         let handle = self.register(sha, size, media);
         Ok(Cbor::map(vec![("handle", Cbor::t(handle))]))
     }
@@ -835,7 +883,10 @@ mod tests {
         let snap = fc.snapshot_state();
         let mut fc2 = FactCell::new(CellId(2));
         fc2.restore_state(&snap).unwrap();
-        assert_eq!(fc2.get("fact/A").unwrap().superseded_by.as_deref(), Some("fact/B"));
+        assert_eq!(
+            fc2.get("fact/A").unwrap().superseded_by.as_deref(),
+            Some("fact/B")
+        );
         assert_eq!(snap.encode(), fc2.snapshot_state().encode());
     }
 
@@ -868,14 +919,27 @@ mod tests {
     fn cache_lru_eviction_deterministic() {
         let mut cc = CacheCell::new(CellId(10));
         cc.capacity = 2;
-        cc.on_update(1, &Cbor::map(vec![("key", Cbor::t("a")), ("value", Cbor::U64(1))]))
-            .unwrap();
-        cc.on_update(2, &Cbor::map(vec![("key", Cbor::t("b")), ("value", Cbor::U64(2))]))
-            .unwrap();
-        cc.on_update(3, &Cbor::map(vec![("key", Cbor::t("c")), ("value", Cbor::U64(3))]))
-            .unwrap();
+        cc.on_update(
+            1,
+            &Cbor::map(vec![("key", Cbor::t("a")), ("value", Cbor::U64(1))]),
+        )
+        .unwrap();
+        cc.on_update(
+            2,
+            &Cbor::map(vec![("key", Cbor::t("b")), ("value", Cbor::U64(2))]),
+        )
+        .unwrap();
+        cc.on_update(
+            3,
+            &Cbor::map(vec![("key", Cbor::t("c")), ("value", Cbor::U64(3))]),
+        )
+        .unwrap();
         // "a" (oldest) evicted.
-        assert!(cc.on_query(4, &Cbor::map(vec![("key", Cbor::t("a"))])).is_err());
-        assert!(cc.on_query(4, &Cbor::map(vec![("key", Cbor::t("b"))])).is_ok());
+        assert!(cc
+            .on_query(4, &Cbor::map(vec![("key", Cbor::t("a"))]))
+            .is_err());
+        assert!(cc
+            .on_query(4, &Cbor::map(vec![("key", Cbor::t("b"))]))
+            .is_ok());
     }
 }

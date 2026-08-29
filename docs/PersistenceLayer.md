@@ -4,6 +4,15 @@
 **Owner:** Dominic Sarria-Wiley
 **Companion documents:** Architecture.md v1.0, RouterScheduler.md v1.0, CellTaxonomy.md v1.0, McpProtocol.md v1.0, NATIVE_TRINITY.md v1.0, DeepSeekOptimization.md v1.0.
 
+**Current-checkout reconciliation (2026-08-27):** T1+ payload encryption is
+applied at the WAL, CAS, snapshot, and PrefixCacheStore boundaries. Fresh
+provisioning persists its manifest before serving, and recovery can discover
+durable snapshots/WAL without an existing manifest. Normal shard frames are
+replayed for every persistent cell class; CrossCheck frames use the dedicated
+stream and preserve ledger sequence. The implementation evidence and
+remaining runtime gates are tracked in
+`RELEASE_AUDIT_REMEDIATION.md`.
+
 ---
 
 ## §0 — Document Conventions
@@ -89,7 +98,7 @@ L0 holds **no domain logic**. It writes bytes, fsyncs, and reads back identicall
 +------------------------+------------------------+
 | u16 flags                                       |
 +-------------------------------------------------+
-| CBOR payload (canonical, optionally encrypted)  |
+| CBOR payload (canonical; sealed at T1+ storage boundaries) |
 +-------------------------------------------------+
 | u32 crc32c (covers everything above)            |
 +-------------------------------------------------+
@@ -103,7 +112,12 @@ L0 holds **no domain logic**. It writes bytes, fsyncs, and reads back identicall
 
 ### §3.4 Trinity Carve-Outs
 
-Trinity Cells (DecisionLedger, SpecAnchor, GapCell, ContractCell, QuarantineCell) WAL through the same per-shard WAL. Every Trinity frame has `flags.audit_chain = true` → AuditSubsystem (ObservabilityAudit.md §5) hash-chains it.
+Trinity Cells (DecisionLedger, SpecAnchor, GapCell, ContractCell, QuarantineCell)
+use the same per-shard WAL. Current state-changing paths append synchronous
+hash-chained audit events through `Node::audit_event`; a failed audit append
+is fail-closed. CrossCheck records use the dedicated stream described in the
+UltraCortex delta below. The old `flags.audit_chain` pseudofield is not
+part of the current WAL frame format.
 
 ---
 
@@ -135,7 +149,8 @@ Every successful snapshot atomically updates Manifest with new epoch, WAL trunca
 - Files in `cas/<aa>/<bb>/<sha256>` where `aa`, `bb` = first byte-pairs.
 - Refcount in Manifest sidecar.
 - Mark-and-sweep GC on Bulk priority; default 6 h logical.
-- Encryption: per-namespace key (T2+).
+- Encryption: KMS sealing at the WAL/CAS/snapshot/cache boundary for T1+;
+  T2/T3 retain the namespace and custody distinctions below.
 
 ---
 
@@ -168,8 +183,8 @@ trait KmsProvider {
 | Tier | Meaning | KMS interaction |
 |------|---------|-----------------|
 | T0   | plaintext disk | none |
-| T1   | disk-encryption only | local key file |
-| T2   | envelope encryption per namespace | KmsProvider per ns |
+| T1   | storage-boundary sealing | local persisted keyring; review custody before release |
+| T2   | envelope encryption per namespace | KmsProvider per namespace |
 | T3   | per-namespace + auditable rotation | persisted local keyring (upgrade seam to external KMS / HSM) |
 
 **[GAP-009]** closed in the current checkout. KMS ops are themselves audited (ObservabilityAudit.md §5).
@@ -184,11 +199,21 @@ Bit-deterministic sequence:
 1. Read `manifest.cbor`.
 2. For each Cell, mmap its latest snapshot at recorded epoch.
 3. For each shard, open its WAL at manifest's truncation watermark.
-4. Replay WAL frames in order, calling `Cell::on_update` (pre-validation **bypassed**: replay assumes chain already passed at original write time; quarantine outcomes are themselves WAL frames).
-5. Reconstruct Trinity Cells from their WAL frames; audit chain MUST verify.
+4. Replay normal WAL frames in deterministic logical order, calling the
+   cell-specific recovery adapter (pre-validation **bypassed**: replay
+   assumes the chain already passed at original write time; quarantine
+   outcomes are themselves WAL frames). Fact, Blob, Timeline, Scratchpad,
+   Subscription, and CuratorOutput frames are restored; CrossCheck frames
+   are replayed from their dedicated stream in physical WAL order.
+5. Reconstruct Trinity Cells from their WAL frames; the audit chain MUST
+   verify.
 6. Open Router/Scheduler with restored state.
 7. Open MCP surface.
 8. Emit `bootstrap.recovery_complete` audit event.
+
+If `manifest.cbor` is absent, boot chooses recovery whenever a durable
+snapshot or epoch WAL is present. A completely empty directory is the only
+fresh-provisioning path.
 
 Recovery successful iff post-replay hash of every Cell's stable region equals the hash recorded at last clean shutdown.
 Current-checkout note: boot-time verification now covers both the audit hash chain and completed CrossCheck batch signatures; recovery refuses MCP open if either check fails.

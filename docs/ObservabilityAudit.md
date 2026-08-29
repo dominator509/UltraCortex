@@ -26,7 +26,7 @@ Four pillars:
 | **Structured logs** | discrete events with context | days–weeks | best-effort |
 | **Audit** | tamper-evident, hash-chained record of state-changing & security events | months–years | **NEVER drop; ALWAYS detect tampering** |
 
-First three: ops telemetry, disposable. Fourth — **Audit** — is the permanent forensic record. Rides on WAL + KMS audit log + admin/security events + **every Trinity event**, hash-chained and optionally signed.
+First three: ops telemetry, disposable. Fourth — **Audit** — is the permanent forensic record. State-changing paths write WAL first, then append the synchronous hash-chain record before acknowledgment. CrossCheck batches add KMS-backed HMAC evidence at T2+, while the local audit chain is flushed fail-closed.
 
 ---
 
@@ -134,14 +134,15 @@ struct AuditRecord {
     event_kind:  AuditEventKind,
     payload:     CanonicalCbor,
     logical_at:  u64,
-    signing:     Option<Ed25519Sig>,    // KMS-signed (T2+)
+    signing:     Option<HmacSha256>,    // CrossCheck batch evidence at T2+
 }
 ```
 
 ### §5.2 Event Kinds (MUST be audited)
 
 **State-change:**
-- `wal.frame_committed`, `snapshot.taken`, `cas.blob_written`
+- `state.write_durable`, `state.supersede_durable`, `subscription.registered`
+- `snapshot.completed`, `admin.operation_durable`
 
 **Trinity (always):**
 - `decision.applied`, `decision.conflict`, `decision.superseded`
@@ -165,7 +166,7 @@ struct AuditRecord {
 
 ### §5.4 Signing
 
-Current checkout: T2/T3 CrossCheck batches carry key-id HMAC evidence, T3 custody state persists in `kms/keyring.cbor`, `ultracortex kms rotate` emits `kms.key_rotated`, and batch-signature metadata persists in `wal/cross_check/batch-signatures.cbor`.
+Current checkout: T2/T3 CrossCheck batches carry key-id HMAC evidence, T3 custody state persists in `kms/keyring.cbor`, `ultracortex kms rotate` emits `kms.key_rotated`, and batch-signature metadata persists in `wal/cross_check/batch-signatures.cbor`. Required application events are emitted synchronously from Router, Curator, admin, subscription, and snapshot paths; append or flush failure is returned and moves the node toward shutdown rather than being dropped.
 
 ### §5.5 Replay Verification
 
@@ -286,7 +287,8 @@ The HyperCortex four-pillar observability content above remains normative. Ultra
 - `curator.rationale_access_denied`
 - `cross_check.record_appended`
 
-All Trinity audit events remain present. Hash chain replays deterministically with WAL.
+All Trinity audit events remain present. Hash-chain records and CrossCheck
+records replay deterministically with their persisted streams.
 
 ## §A.3 CRITICAL INVARIANT — Rationale-Access-Denied Non-Zero
 

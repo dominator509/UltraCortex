@@ -32,7 +32,9 @@ use crate::curator::{
     CuratorBackend, CuratorConfig, DeterministicBackend, ExternalGgufBackend, SubstrateView,
 };
 use crate::obs::{AuditChain, Logger, Metrics, OtlpConfig, OtlpExporter};
-use crate::persist::wal::WalWriter;
+use crate::persist::wal::{
+    payload_nonce, payload_purpose, WalFrame, WalPos, WalWriter, FLAG_CROSS_CHECK,
+};
 use crate::persist::{CasStore, EncryptionTier, Kms, Manifest, PrefixCacheStore, SnapshotStore};
 use crate::router::captoken::{HmacSigner, Signer};
 use crate::router::events::EventBus;
@@ -79,6 +81,11 @@ pub mod ids {
 }
 
 pub const SNAPSHOT_PAUSE_TARGET_US: u64 = 50_000;
+/// Five logical minutes, expressed in the persistence layer's logical-clock
+/// units. The logical clock is deterministic; operators that need a
+/// wall-clock SLA should use the snapshot metrics separately.
+pub const AUTO_SNAPSHOT_LOGICAL_INTERVAL: u64 = 5 * 60 * 1_000;
+pub const AUTO_SNAPSHOT_WAL_BYTES: u64 = 1 << 30;
 
 fn configured_curator_backend(
     data_dir: &Path,
@@ -186,12 +193,21 @@ pub struct Node {
     pub events: Mutex<EventBus>,
     pub signer: Arc<dyn Signer>,
 
+    /// Serializes durable state transitions with cross-cell snapshot cuts.
+    /// Individual cell locks remain the ownership boundary; this lock makes
+    /// a multi-cell operation and a full snapshot one logical instant.
+    mutation_barrier: Mutex<()>,
+    auto_snapshot_lock: Mutex<()>,
+    durable_wal_bytes: Mutex<u64>,
+    last_snapshot_logical_at: Mutex<u64>,
+
     pub shutting_down: AtomicBool,
 }
 
 impl Node {
     /// Construct with everything empty; the Bootstrap Operator (B1–B6)
     /// provisions cells in Trinity-first order and replays state.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         node_id: &str,
         data_dir: &Path,
@@ -206,9 +222,9 @@ impl Node {
         let metrics = Arc::new(Metrics::new());
         curator_cfg.validate_model_pair()?;
         let kms = Arc::new(Kms::open(data_dir, tier)?);
-        let cas = Arc::new(CasStore::open(data_dir)?);
-        let snapshots = SnapshotStore::open(data_dir)?;
-        let view_cache = PrefixCacheStore::open(data_dir)?;
+        let cas = Arc::new(CasStore::open_with_kms(data_dir, kms.clone())?);
+        let snapshots = SnapshotStore::open_with_kms(data_dir, kms.clone())?;
+        let view_cache = PrefixCacheStore::open_with_kms(data_dir, kms.clone())?;
 
         let mut shard_wals = Vec::with_capacity(shard_count as usize);
         for s in 0..shard_count {
@@ -224,9 +240,9 @@ impl Node {
         // Node key doubles as the HMAC token key (Kms derives a subkey).
         let signer: Arc<dyn Signer> = Arc::new(HmacSigner::new(kms.subkey("captoken")));
 
-        // Curator backends: pinned GGUF when configured + present, else the
-        // deterministic backend. A missing/unverifiable weight file is a
-        // hard error only when explicitly pinned (Bootstrap B3 fail-fast).
+        // Curator backends: development mode is explicitly deterministic;
+        // strict mode requires every configured slot, including every
+        // adjudicator judge, to resolve to a pinned GGUF backend.
         let lib_backend = configured_curator_backend(
             data_dir,
             "librarian",
@@ -245,29 +261,28 @@ impl Node {
             curator_cfg.strict_model_pins,
             &metrics,
         )?;
-        let pool: Vec<(String, Arc<dyn CuratorBackend>)> = curator_cfg
-            .adjudicator_pool
-            .iter()
-            .map(|name| {
-                let backend: Arc<dyn CuratorBackend> = match (
-                    curator_cfg.external_cmd.as_ref(),
-                    curator_cfg.pinned.get(name),
-                ) {
-                    (Some(cmd), Some(sha)) => match ExternalGgufBackend::new(
-                        data_dir,
-                        name,
-                        sha,
-                        cmd,
-                        Some(metrics.clone()),
-                    ) {
-                        Ok(b) => Arc::new(b),
-                        Err(_) => Arc::new(DeterministicBackend),
-                    },
-                    _ => Arc::new(DeterministicBackend),
-                };
-                (name.clone(), backend)
-            })
-            .collect();
+        let mut pool: Vec<(String, Arc<dyn CuratorBackend>)> = Vec::new();
+        for name in &curator_cfg.adjudicator_pool {
+            let backend: Arc<dyn CuratorBackend> = if curator_cfg.strict_model_pins {
+                let cmd = curator_cfg.external_cmd.as_ref().ok_or_else(|| {
+                    UcError::unsupported("strict curator mode requires a GGUF runner")
+                })?;
+                let sha = curator_cfg.pinned.get(name).ok_or_else(|| {
+                    UcError::schema(format!("missing curator pin for adjudicator: {name}"))
+                })?;
+                Arc::new(ExternalGgufBackend::new_for_slot(
+                    data_dir,
+                    name,
+                    name,
+                    sha,
+                    cmd,
+                    Some(metrics.clone()),
+                )?)
+            } else {
+                Arc::new(DeterministicBackend)
+            };
+            pool.push((name.clone(), backend));
+        }
 
         let mut cross_check = CrossCheckLedgerCell::new(ids::CROSS_CHECK);
         cross_check.quota_low = curator_cfg.disagreement_quota_low;
@@ -347,6 +362,10 @@ impl Node {
             audit: Mutex::new(audit),
             events: Mutex::new(EventBus::new()),
             signer,
+            mutation_barrier: Mutex::new(()),
+            auto_snapshot_lock: Mutex::new(()),
+            durable_wal_bytes: Mutex::new(0),
+            last_snapshot_logical_at: Mutex::new(0),
             shutting_down: AtomicBool::new(false),
         })
     }
@@ -375,6 +394,67 @@ impl Node {
         &self.shard_wals[shard]
     }
 
+    /// Append an encrypted, durably committed WAL frame. The frame format
+    /// remains unchanged; only the canonical CBOR payload is sealed before
+    /// it crosses the storage boundary.
+    pub fn append_wal(&self, handle: &str, frame: &WalFrame) -> UcResult<WalPos> {
+        let mut durable = frame.clone();
+        let purpose = payload_purpose(frame.cell_id, frame.flags);
+        durable.payload = self.kms.seal(
+            &purpose,
+            payload_nonce(frame.logical_at, frame.cell_id, frame.op, &frame.payload),
+            &frame.payload,
+        );
+        let wal = if frame.flags & FLAG_CROSS_CHECK != 0 {
+            &self.cross_check_wal
+        } else {
+            self.wal_for(handle)
+        };
+        let frame_bytes = durable.to_bytes().len() as u64;
+        let result = wal.append(&durable).map_err(UcError::internal);
+        if result.is_ok() {
+            let mut durable_bytes = self.durable_wal_bytes.lock().unwrap();
+            *durable_bytes = durable_bytes.saturating_add(frame_bytes);
+        }
+        result
+    }
+
+    /// Decode a WAL payload, accepting pre-encryption frames for a bounded
+    /// migration window. New frames are always marked by KMS.
+    pub fn decode_wal_payload(&self, frame: &WalFrame) -> UcResult<Vec<u8>> {
+        self.kms
+            .unseal_legacy(&payload_purpose(frame.cell_id, frame.flags), &frame.payload)
+    }
+
+    /// Acquire the operation barrier used by Router/admin mutations.
+    pub fn mutation_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.mutation_barrier.lock().unwrap()
+    }
+
+    /// Mark the recovery watermark used by the automatic snapshot policy.
+    /// Existing WAL bytes predate this process and will be covered by the
+    /// recovered manifest; only new writes count toward the next cut.
+    pub fn set_snapshot_watermark(&self, logical_at: u64) {
+        *self.last_snapshot_logical_at.lock().unwrap() = logical_at;
+        *self.durable_wal_bytes.lock().unwrap() = 0;
+    }
+
+    /// Run the configured automatic snapshot policy after a successful
+    /// request. The separate lock prevents two concurrent request threads
+    /// from both deciding that the same threshold is due.
+    pub fn maybe_snapshot(&self, at: u64) -> UcResult<bool> {
+        let _auto = self.auto_snapshot_lock.lock().unwrap();
+        let bytes_due = *self.durable_wal_bytes.lock().unwrap() >= AUTO_SNAPSHOT_WAL_BYTES;
+        let logical_due = at.saturating_sub(*self.last_snapshot_logical_at.lock().unwrap())
+            >= AUTO_SNAPSHOT_LOGICAL_INTERVAL;
+        if !bytes_due && !logical_due {
+            return Ok(false);
+        }
+        self.write_snapshot(at)?;
+        self.metrics.inc("snapshot.automatic");
+        Ok(true)
+    }
+
     pub fn tick(&self) -> u64 {
         self.clock.tick()
     }
@@ -394,6 +474,7 @@ impl Node {
     /// Snapshot every cell's state (cell_id -> canonical CBOR).
     pub fn snapshot_all(&self) -> BTreeMap<u64, Cbor> {
         use crate::cells::CellBehavior;
+        let _barrier = self.mutation_barrier.lock().unwrap();
         let mut out = BTreeMap::new();
         macro_rules! snap {
             ($field:expr, $id:expr) => {
@@ -518,6 +599,31 @@ impl Node {
             .insert(handle.to_string(), body.to_string());
     }
 
+    /// Append a mandatory forensic event and make it durable before the
+    /// associated state transition becomes visible.
+    pub fn audit_event(&self, at: u64, event: &str, fields: &[(&str, Cbor)]) -> UcResult<()> {
+        let result = self
+            .audit
+            .lock()
+            .unwrap()
+            .append(at, event, fields)
+            .map(|_| ())
+            .map_err(UcError::internal);
+        if let Err(err) = &result {
+            // Audit records are mandatory evidence, not best-effort logs. A
+            // failed append permanently stops the node so callers cannot
+            // continue making unaudited state changes.
+            self.metrics.inc("audit.persistence_failure");
+            self.shutting_down.store(true, Ordering::SeqCst);
+            self.logger.error(
+                at,
+                "audit.persistence_failure",
+                &[("event", event.to_string()), ("error", err.message.clone())],
+            );
+        }
+        result
+    }
+
     /// State hashes for the manifest (clean-shutdown integrity record).
     pub fn state_hashes(&self) -> BTreeMap<u64, [u8; 32]> {
         Self::state_hashes_for(&self.snapshot_all())
@@ -569,6 +675,7 @@ impl Node {
             }
             m.save(&self.data_dir)?;
         }
+        self.set_snapshot_watermark(at);
         let manifest_us = manifest_started.elapsed().as_micros() as u64;
 
         let total_us = total_started.elapsed().as_micros() as u64;
@@ -631,9 +738,9 @@ impl Node {
         let at = self.now();
         let snap = self.write_snapshot_internal(at, true)?;
         for w in &self.shard_wals {
-            let _ = w.sync();
+            w.sync().map_err(UcError::internal)?;
         }
-        let _ = self.cross_check_wal.sync();
+        self.cross_check_wal.sync().map_err(UcError::internal)?;
         {
             let mut m = self.manifest.lock().unwrap();
             m.logical_at = at;
@@ -780,6 +887,52 @@ mod tests {
     }
 
     #[test]
+    fn t1_wal_boundary_does_not_store_plaintext_payload() {
+        let dir = std::env::temp_dir().join(format!("uc-node-t1-wal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let node = Node::open(
+            "node-t1-wal",
+            &dir,
+            1,
+            EncryptionTier::T1,
+            42,
+            ShardTopology::Dedicated,
+            CuratorConfig::development(),
+            256,
+        )
+        .unwrap();
+        let sentinel = b"wal-boundary-secret";
+        let payload = Cbor::map(vec![(
+            "secret",
+            Cbor::t(String::from_utf8(sentinel.to_vec()).unwrap()),
+        )])
+        .encode();
+        let frame = crate::persist::wal::WalFrame {
+            logical_at: 1,
+            cell_id: ids::FACT.0,
+            op: crate::persist::wal::WalOp::Write,
+            schema_ver: 1,
+            flags: 0,
+            payload: payload.clone(),
+        };
+        let wal_dir = node.wal_for("fact/t1-wal").dir().to_path_buf();
+        node.append_wal("fact/t1-wal", &frame).unwrap();
+        let wal_file = std::fs::read_dir(&wal_dir)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".wal"))
+            .unwrap();
+        let raw = std::fs::read(wal_file.path()).unwrap();
+        assert!(!raw.windows(sentinel.len()).any(|w| w == sentinel));
+        let replayed = crate::persist::wal::replay_dir(&wal_dir).unwrap().frames;
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(node.decode_wal_payload(&replayed[0]).unwrap(), payload);
+
+        node.shutdown().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn snapshot_outcome_surfaces_pause_measurement() {
         let node = Node::ephemeral("snapshot-outcome").unwrap();
         let at = node.now();
@@ -797,5 +950,14 @@ mod tests {
             snap.pause_us as i64
         );
         assert_eq!(node.metrics.gauge("snapshot.last_cells"), snap.cells as i64);
+    }
+
+    #[test]
+    fn logical_snapshot_threshold_triggers_automatic_snapshot() {
+        let node = Node::ephemeral("automatic-snapshot").unwrap();
+        node.set_snapshot_watermark(0);
+        assert!(node.maybe_snapshot(AUTO_SNAPSHOT_LOGICAL_INTERVAL).unwrap());
+        assert_eq!(node.metrics.counter("snapshot.automatic"), 1);
+        assert!(!node.maybe_snapshot(AUTO_SNAPSHOT_LOGICAL_INTERVAL).unwrap());
     }
 }

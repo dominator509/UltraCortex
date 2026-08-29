@@ -31,7 +31,7 @@ use crate::core::cbor::Cbor;
 use crate::core::crypto::{hex, sha256};
 use crate::core::ulid::{DetRng, Ulid};
 use crate::core::{CellId, ErrCode, SchemaId, UcError, UcResult};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Handle prefixes the Warden treats as substrate references when
 /// harvesting payload text (WardenCell.md §4.1).
@@ -96,10 +96,9 @@ impl WardenCell {
                 let tok = raw.trim_matches(|c: char| ".:!?".contains(c));
                 if HANDLE_PREFIXES.iter().any(|p| tok.starts_with(p))
                     && tok.len() > tok.find('/').unwrap_or(0) + 1
+                    && !out.iter().any(|existing: &String| existing == tok)
                 {
-                    if !out.contains(&tok.to_string()) {
-                        out.push(tok.to_string());
-                    }
+                    out.push(tok.to_string());
                 }
             }
         }
@@ -204,6 +203,32 @@ impl WardenCell {
         logical_at: u64,
         seed: u64,
     ) -> (AuditRecord, AuditVerdict) {
+        let result = self.evaluate_librarian(view, output, job, logical_at, seed);
+        self.store(result.0.clone());
+        result
+    }
+
+    /// Evaluate without mutating Warden state. Router persistence uses this
+    /// preview before committing the audit record to the Warden cell.
+    pub fn audit_librarian_preview(
+        &self,
+        view: &dyn SubstrateView,
+        output: &CuratorPublic,
+        job: Option<&CurationJob>,
+        logical_at: u64,
+        seed: u64,
+    ) -> (AuditRecord, AuditVerdict) {
+        self.evaluate_librarian(view, output, job, logical_at, seed)
+    }
+
+    fn evaluate_librarian(
+        &self,
+        view: &dyn SubstrateView,
+        output: &CuratorPublic,
+        job: Option<&CurationJob>,
+        logical_at: u64,
+        seed: u64,
+    ) -> (AuditRecord, AuditVerdict) {
         let mut rng = DetRng::new(seed ^ logical_at ^ 0xA0D17);
         let ulid = Ulid::from_parts(logical_at, &mut rng);
         let judgment_handle = format!("warden/judgment/{ulid}");
@@ -224,7 +249,6 @@ impl WardenCell {
                 hash_proof: None,
                 logical_at,
             };
-            self.store(rec.clone());
             return (
                 rec,
                 AuditVerdict::Fail {
@@ -250,7 +274,9 @@ impl WardenCell {
         // text (deterministic; proves the evidence was actually hydrated).
         let hash_proof = if independent.is_empty() {
             let mut buf = Vec::new();
-            for h in &output.grounded_in {
+            let mut cited = output.grounded_in.clone();
+            cited.sort();
+            for h in &cited {
                 buf.extend_from_slice(h.as_bytes());
                 buf.push(0);
                 if let Some(t) = view.public_text(h) {
@@ -292,13 +318,38 @@ impl WardenCell {
         // valid output, but never turns a hard grounding failure into a pass.
         let verdict = match structural_verdict {
             AuditVerdict::Pass if self.backend.backend_id() != "deterministic.v1" => {
-                let evidence = vec![
+                // The semantic model must receive the public source material
+                // it is meant to verify, not only a structural assertion that
+                // a handle exists. `SubstrateView` deliberately excludes
+                // private facets, preserving P19 isolation.
+                let mut evidence = Vec::new();
+                for handle in &output.grounded_in {
+                    match view.public_text(handle) {
+                        Some(text) => evidence
+                            .push(format!("supports_initiator: cited_source {handle}: {text}")),
+                        None => evidence.push(format!(
+                            "supports_auditor: cited_source {handle} has no public text"
+                        )),
+                    }
+                }
+                for handle in &independent {
+                    match view.public_text(handle) {
+                        Some(text) => evidence.push(format!(
+                            "supports_initiator: independent_source {handle}: {text}"
+                        )),
+                        None => evidence.push(format!(
+                            "supports_auditor: independent_source {handle} has no public text"
+                        )),
+                    }
+                }
+                evidence.push(format!(
+                    "claim: target={} body={}",
+                    output.target_handle, output.body
+                ));
+                evidence.push(
                     "supports_initiator: structural grounding and schema checks passed".into(),
-                    format!(
-                        "supports_initiator: target={} is auditable",
-                        output.target_handle
-                    ),
-                ];
+                );
+                evidence.sort();
                 match self.backend.adjudicate(seed, &output.body, &evidence) {
                     Verdict::AuditorCorrect => AuditVerdict::Fail {
                         reason: "configured Warden model rejected the Librarian output".into(),
@@ -317,7 +368,6 @@ impl WardenCell {
             hash_proof,
             logical_at,
         };
-        self.store(rec.clone());
         (rec, verdict)
     }
 
@@ -326,14 +376,20 @@ impl WardenCell {
     /// mismatch is an order-sensitivity bug and trips
     /// `curator.blind_reaudit_mismatch` (CURATOR_PAIR_PROTOCOL.md §7.4).
     pub fn blind_reaudit(
-        &mut self,
+        &self,
         view: &dyn SubstrateView,
         output: &CuratorPublic,
         job: Option<&CurationJob>,
         logical_at: u64,
         seed: u64,
     ) -> (AuditVerdict, AuditVerdict) {
-        let (_, original) = self.audit_librarian(view, output, job, logical_at, seed);
+        // Freeze only the public evidence available at the original write.
+        // Each pass gets a fresh Warden with no audit/KV state, so a previous
+        // verdict cannot influence the re-audit.
+        let frozen = FrozenPublicView::capture(view, output, job);
+        let original_reviewer = WardenCell::with_backend(self.id, self.backend.clone());
+        let (_, original) =
+            original_reviewer.audit_librarian_preview(&frozen, output, job, logical_at, seed);
         let mut shuffled = output.clone();
         let mut rng = DetRng::new(seed ^ 0xB11D);
         // Fisher–Yates with the deterministic stream.
@@ -342,7 +398,9 @@ impl WardenCell {
             let j = rng.next_range((i + 1) as u64) as usize;
             shuffled.grounded_in.swap(i, j);
         }
-        let (_, reaudit) = self.audit_librarian(view, &shuffled, job, logical_at, seed ^ 1);
+        let reaudit_reviewer = WardenCell::with_backend(self.id, self.backend.clone());
+        let (_, reaudit) =
+            reaudit_reviewer.audit_librarian_preview(&frozen, &shuffled, job, logical_at, seed);
         (original, reaudit)
     }
 
@@ -350,6 +408,10 @@ impl WardenCell {
         self.seq_by_target
             .insert(rec.target_output.clone(), rec.judgment_handle.clone());
         self.audits.insert(rec.judgment_handle.clone(), rec);
+    }
+
+    pub fn replay_audit(&mut self, rec: AuditRecord) {
+        self.store(rec);
     }
 
     pub fn audit_for_target(&self, target: &str) -> Option<&AuditRecord> {
@@ -360,6 +422,75 @@ impl WardenCell {
 
     pub fn audit_count(&self) -> usize {
         self.audits.len()
+    }
+}
+
+struct FrozenPublicView {
+    handles: BTreeSet<String>,
+    active: BTreeMap<(String, String), Vec<(String, String)>>,
+    texts: BTreeMap<String, String>,
+}
+
+impl FrozenPublicView {
+    fn capture(
+        view: &dyn SubstrateView,
+        output: &CuratorPublic,
+        job: Option<&CurationJob>,
+    ) -> FrozenPublicView {
+        let mut references = output.grounded_in.clone();
+        references.push(output.target_handle.clone());
+        references.extend(WardenCell::harvest_handles(&Cbor::t(output.body.clone())));
+        if let Some(job) = job {
+            references.push(job.written_handle.clone());
+        }
+
+        let mut frozen = FrozenPublicView {
+            handles: BTreeSet::new(),
+            active: BTreeMap::new(),
+            texts: BTreeMap::new(),
+        };
+        for handle in references {
+            if view.handle_exists(&handle) {
+                frozen.handles.insert(handle.clone());
+                if let Some(text) = view.public_text(&handle) {
+                    frozen.texts.insert(handle, text);
+                }
+            }
+        }
+        if let Some(job) = job {
+            if let (Some(subject), Some(predicate)) = (&job.subject, &job.predicate) {
+                let entries = view.active_sp(subject, predicate);
+                for (handle, object) in &entries {
+                    frozen.handles.insert(handle.clone());
+                    if let Some(text) = view.public_text(handle) {
+                        frozen.texts.insert(handle.clone(), text);
+                    } else {
+                        frozen.texts.insert(handle.clone(), object.clone());
+                    }
+                }
+                frozen
+                    .active
+                    .insert((subject.clone(), predicate.clone()), entries);
+            }
+        }
+        frozen
+    }
+}
+
+impl SubstrateView for FrozenPublicView {
+    fn handle_exists(&self, handle: &str) -> bool {
+        self.handles.contains(handle)
+    }
+
+    fn active_sp(&self, subject: &str, predicate: &str) -> Vec<(String, String)> {
+        self.active
+            .get(&(subject.to_string(), predicate.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn public_text(&self, handle: &str) -> Option<String> {
+        self.texts.get(handle).cloned()
     }
 }
 
@@ -406,22 +537,7 @@ impl CellBehavior for WardenCell {
         self.seq_by_target.clear();
         if let Some(arr) = state.get("audits").and_then(|v| v.as_array()) {
             for item in arr {
-                let rec = AuditRecord {
-                    judgment_handle: item.req_str("judgment_handle")?,
-                    target_output: item.req_str("target_output")?,
-                    verdict_pass: item.opt_bool("verdict_pass").unwrap_or(false),
-                    independent_grounds: item
-                        .get("independent_grounds")
-                        .and_then(|v| v.as_array())
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|x| x.as_str().map(str::to_string))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    hash_proof: item.opt_str("hash_proof"),
-                    logical_at: item.opt_u64("logical_at").unwrap_or(0),
-                };
+                let rec = audit_from_cbor(item)?;
                 self.store(rec);
             }
         }
@@ -429,7 +545,26 @@ impl CellBehavior for WardenCell {
     }
 }
 
-fn audit_to_cbor(rec: &AuditRecord) -> Cbor {
+pub(crate) fn audit_from_cbor(item: &Cbor) -> UcResult<AuditRecord> {
+    Ok(AuditRecord {
+        judgment_handle: item.req_str("judgment_handle")?,
+        target_output: item.req_str("target_output")?,
+        verdict_pass: item.opt_bool("verdict_pass").unwrap_or(false),
+        independent_grounds: item
+            .get("independent_grounds")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        hash_proof: item.opt_str("hash_proof"),
+        logical_at: item.opt_u64("logical_at").unwrap_or(0),
+    })
+}
+
+pub(crate) fn audit_to_cbor(rec: &AuditRecord) -> Cbor {
     Cbor::map(vec![
         ("judgment_handle", Cbor::t(rec.judgment_handle.clone())),
         ("target_output", Cbor::t(rec.target_output.clone())),
@@ -572,7 +707,7 @@ mod tests {
 
     #[test]
     fn blind_reaudit_is_order_insensitive() {
-        let mut warden = WardenCell::new(CellId(31));
+        let warden = WardenCell::new(CellId(31));
         let view = FakeView::default()
             .with_fact("fact/A", "s", "p", "alpha")
             .with_fact("fact/B", "s", "p", "beta")

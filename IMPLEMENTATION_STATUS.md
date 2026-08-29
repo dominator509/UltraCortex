@@ -1,19 +1,38 @@
 # IMPLEMENTATION_STATUS — UltraCortex v1.0 Rust tree
 
-Status date: 2026-08-13. Sources of truth: the 22 spec documents in
-`docs/`; conflicts resolved in favor of CURATOR_PAIR_PROTOCOL.md and
+Status date: 2026-08-27. Sources of truth: the specification documents in
+`docs/`, plus `RELEASE_AUDIT_REMEDIATION.md` for the supplied independent
+audit; conflicts are resolved in favor of CURATOR_PAIR_PROTOCOL.md and
 NATIVE_TRINITY.md per Architecture.md §1.
 
 ## 1. Verification status — read this first
 
 This tree was authored in a sandbox **without a Rust toolchain or
-network access**. That was true during authoring, but this checkout has
-since been compiled and locally validated on **2026-07-07**:
+network access**. That was true during authoring, but the checkout has
+since been compiled and locally validated. The 2026-07-07 baseline was:
 
-- `cargo test` now passes locally (`162 passed`, 7 suites);
+- The original historical `cargo test` run passed (`162 passed`, 7 suites);
 - the standard-vector and conformance coverage below still matters, but
   the remaining work is no longer "first compile" uncertainty;
-- the audited open/closed gap register now lives in `docs/HANDOFF.md`.
+- the audited open/closed product gap register lives in `docs/HANDOFF.md`;
+- the independent release-audit reconciliation and remaining external
+  release gates live in `RELEASE_AUDIT_REMEDIATION.md`.
+
+The current remediation pass adds crash-recovery, encrypted-storage,
+WAL-first transition, Curator governance, protocol, and CI gates. Run the
+commands in the remediation record against the final release commit; do not
+use the historical baseline above as release evidence.
+
+The current audit-remediation working-tree gate on 2026-08-27 is:
+
+- `cargo fmt --check` passed;
+- `cargo clippy --all-targets --message-format=short -- -D warnings`
+  passed;
+- `cargo test --all-targets` passed (`171 passed`, 6 suites);
+- `git diff --check` passed with no whitespace errors.
+
+These are local working-tree results, not hosted CI or production-model
+evidence for a release commit.
 
 Mitigations baked in during authoring:
 
@@ -45,7 +64,7 @@ deployment gaps remain open in `docs/HANDOFF.md`.
 | D7 | SIGTERM/SIGINT graceful shutdown | Admin `shutdown` verb over the socket; no signal handler | std has no signal API and libc is a dependency. `ultracortex shutdown` performs the identical snapshot → sync → clean-manifest sequence. Unclean kills are covered by WAL replay + torn-tail truncation. |
 | D8 | TLS on TCP | None; UDS 0600 preferred, TCP loopback-only and fail-closed on non-loopback binds | The current v1.0 transport policy is explicit: local tooling may use plaintext loopback TCP, while LAN/multi-host TCP is out of scope until a future TLS-bearing transport lands. |
 | D9 | Curator models Gemma-2-2B / Qwen-2.5-1.5B / pool via llama.cpp FFI | Production config now selects distinct SHA-pinned Gemma 2 2B and Qwen 2.5 Coder 1.5B GGUF slots; `ExternalGgufBackend` and `WardenCell` are wired to the pinned runner. | Large GGUF files and `llama-cli` remain operator-owned deployment artifacts, not repository contents. Missing or unverifiable production artifacts fail closed; only explicit `--dry-run`/test development mode uses the deterministic backend. |
-| D10 | Blob/Timeline/Scratchpad WAL replay | Snapshot-covered; WAL frames written for forensics but only Fact/Supersede/CuratorOutput frames re-applied on recovery | Bounded loss = one group-commit window between snapshots for those cells. Fact state — the governance-critical surface — replays fully. Extend `bootstrap::replay_frame` per cell to close. |
+| D10 | Blob/Timeline/Scratchpad WAL replay | Fact, Blob, Timeline, Scratchpad, Subscription, CuratorOutput, and dedicated CrossCheck frames are replayed; fresh provisioning persists its manifest before serving | Crash recovery is covered by an abrupt-drop regression. OS-level process death and a complete production crash matrix remain release evidence gates. |
 | D11 | Group commit 250 µs / 256 KiB, epoch roll at 1 GiB | Implemented in `persist::wal` per spec constants | Not perf-validated (no runtime). |
 
 ## 3. Coverage matrix (spec doc → module(s) → state)
@@ -57,9 +76,9 @@ deployment gaps remain open in `docs/HANDOFF.md`.
 | NATIVE_TRINITY.md | trinity/ | ✅ 7 cells, fixed 5-step chain + optional Warden step 6, absorption, reservation-release, fixation N=8 |
 | RouterScheduler.md | router/ | ✅ tokens, E1–E4, gap accounting, tier budgets + R1 truncation, built-in views, events w/ ALWAYS_DELIVER, facet gate |
 | PersistenceLayer.md | persist/ | ✅ WALF frames + CRC, group commit, epoch roll, CAS aa/bb layout + refcount GC, CoW snapshots with measured/enforced `≤50 ms` pause target, manifest atomic rename, KMS T0–T3 with persisted keyring rotation + custody verification, PrefixCacheStore ViewKey, weight pinning |
-| McpProtocol.md | proto/, router/envelope.rs | ✅ u32-LE frames (16 MiB), hello capability bits, 6 verbs, error codes incl. quarantine ids · ⚠️ no TLS (D8) |
+| McpProtocol.md | proto/, router/envelope.rs | ✅ u32-LE frames (16 MiB), seed-echo responses, hello capability bits, authenticated pull events, 6 verbs, error codes incl. quarantine ids · ⚠️ no TLS (D8) |
 | Bootstrap.md | bootstrap/ | ✅ B1 config merge, B2, B3a Trinity-first (fatal), B3b recovery (snapshot + replay + audit verify + weight verify), B5 ×11, B6 ready line · ⚠️ signals (D7) |
-| CURATOR_PAIR_PROTOCOL.md | curator/, router/ | ✅ P19 PUBLIC/PRIVATE split w/ token exclusions enforced at the Router, P20 chain on curator writes, disagreement flow, all nine guardrails (quota band, probes ×10 boost, blind re-audit, boundary probes, calibration degrade, weight pinning, prior-blind referee, sanity-not-veto, ledger forensics) |
+| CURATOR_PAIR_PROTOCOL.md | curator/, router/ | ✅ P19 PUBLIC/PRIVATE split w/ token exclusions enforced at the Router, durable P20 chain on Librarian/Warden/Adjudicator artifacts, disagreement flow, all nine guardrails (quota band, probes ×10 boost, blind re-audit, boundary probes, calibration degrade, weight pinning, prior-blind referee, sanity-not-veto, ledger forensics) |
 | LibrarianCell.md | curator/librarian.rs | ✅ skeleton ≤80 tok / supersede-proposal / archive-tag ops, PENDING→Active/Quarantined lifecycle, private facets in CAS · backend per D9 |
 | WardenCell.md | curator/warden.rs | ✅ envelope gate (hallucination + drift), independent grounding **or** hash-proof (never bare pass), blind re-audit, flags |
 | AdjudicatorCell.md | curator/adjudicator.rs | ✅ policy table (~70–80 % target), seeded pool rotation + per-judge salt, Uncertain→human queue + `resolve`, **structural prior-blindness** (no ledger param; token also excludes `cross_check/**`) |
@@ -103,7 +122,15 @@ skeleton served on recall, cross-node determinism spot-check.
   12.5 % of *dead ties*) yields the spec's ~1–2 % overall human-escalation
   target only because dead ties are rare after the policy table; tune the
   mask if pool composition changes.
-- `recover()` replays shard WALs sequentially; frames across shards are
-  ordered per-shard, and cross-shard ordering relies on `logical_at`
-  monotonicity from the single node clock (true in v0's single-writer
-  design).
+- `recover()` globally orders normal shard frames by logical time and
+  stable frame metadata, while replaying the dedicated CrossCheck stream
+  in its physical WAL order so its sequence remains contiguous. This is
+  deterministic for the single-node writer; distributed writers remain out
+  of scope.
+- Normal Router and admin mutations share a node-wide mutation barrier with
+  snapshot capture. Direct mutation of public Cell fields is not a supported
+  external API and is not covered by that barrier.
+- T1+ storage payloads are sealed at the WAL/CAS/snapshot/cache boundary,
+  but the local keyring remains a custody seam rather than an external
+  KMS/HSM. See `RELEASE_AUDIT_REMEDIATION.md` for the remaining evidence
+  gates.

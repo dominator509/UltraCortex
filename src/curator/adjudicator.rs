@@ -190,6 +190,34 @@ impl AdjudicatorCell {
         rec
     }
 
+    /// Evaluate a dispute without changing the live adjudicator state. This
+    /// is used by the Router to persist the resulting record before making it
+    /// visible, while retaining the same single backend evaluation.
+    pub fn adjudicate_preview(&self, view: &dyn SubstrateView, d: &Dispute<'_>) -> Adjudication {
+        let mut scratch = AdjudicatorCell::new(self.id, self.pool.clone());
+        scratch.adjudicate(view, d)
+    }
+
+    /// Replay or commit a previously computed adjudication without invoking a
+    /// model. The operation is idempotent for snapshot/WAL overlap.
+    pub fn replay_adjudication(&mut self, rec: Adjudication) {
+        if self.records.contains_key(&rec.handle) {
+            return;
+        }
+        match rec.path {
+            ResolutionPath::Policy => self.policy_count += 1,
+            ResolutionPath::Pool => self.pool_count += 1,
+            ResolutionPath::Human => self.human_count += 1,
+        }
+        if rec.resolution == Resolution::HumanEscalation
+            && !rec.human_resolved
+            && !self.escalation_queue.contains(&rec.handle)
+        {
+            self.escalation_queue.push(rec.handle.clone());
+        }
+        self.records.insert(rec.handle.clone(), rec);
+    }
+
     /// The deterministic policy table (AdjudicatorCell.md §4). Returns
     /// `None` when the evidence is genuinely ambiguous and the pool must
     /// decide.
@@ -262,16 +290,25 @@ impl AdjudicatorCell {
     }
 
     /// Operator resolution of an escalated dispute.
-    pub fn resolve_human(&mut self, handle: &str, uphold_auditor: bool) -> UcResult<&Adjudication> {
+    pub fn validate_human_resolution(&self, handle: &str) -> UcResult<&Adjudication> {
         let rec = self
             .records
-            .get_mut(handle)
+            .get(handle)
             .ok_or_else(|| UcError::not_found(format!("adjudication {handle}")))?;
         if rec.resolution != Resolution::HumanEscalation || rec.human_resolved {
             return Err(UcError::schema(format!(
                 "adjudication {handle} is not awaiting human resolution"
             )));
         }
+        Ok(rec)
+    }
+
+    pub fn resolve_human(&mut self, handle: &str, uphold_auditor: bool) -> UcResult<&Adjudication> {
+        self.validate_human_resolution(handle)?;
+        let rec = self
+            .records
+            .get_mut(handle)
+            .expect("validated record exists");
         rec.resolution = if uphold_auditor {
             Resolution::AuditorUpheld
         } else {
@@ -400,7 +437,34 @@ impl CellBehavior for AdjudicatorCell {
     }
 }
 
-fn adjudication_to_cbor(a: &Adjudication) -> Cbor {
+pub(crate) fn adjudication_from_cbor(item: &Cbor) -> UcResult<Adjudication> {
+    let resolution = match item.opt_str("resolution").as_deref() {
+        Some("initiator_upheld") => Resolution::InitiatorUpheld,
+        Some("auditor_upheld") => Resolution::AuditorUpheld,
+        _ => Resolution::HumanEscalation,
+    };
+    let path = match item.opt_str("path").as_deref() {
+        Some("policy") => ResolutionPath::Policy,
+        Some("pool") => ResolutionPath::Pool,
+        _ => ResolutionPath::Human,
+    };
+    Ok(Adjudication {
+        handle: item.req_str("handle")?,
+        initiator_output: item.opt_str("initiator_output").unwrap_or_default(),
+        auditor_flag: item.opt_str("auditor_flag").unwrap_or_default(),
+        kind: item
+            .opt_str("kind")
+            .and_then(|s| CuratorOperation::parse(&s))
+            .unwrap_or(CuratorOperation::FlagDrift),
+        resolution,
+        path,
+        judge: item.opt_str("judge"),
+        logical_at: item.opt_u64("logical_at").unwrap_or(0),
+        human_resolved: item.opt_bool("human_resolved").unwrap_or(false),
+    })
+}
+
+pub(crate) fn adjudication_to_cbor(a: &Adjudication) -> Cbor {
     Cbor::map(vec![
         ("handle", Cbor::t(a.handle.clone())),
         ("initiator_output", Cbor::t(a.initiator_output.clone())),

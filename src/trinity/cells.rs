@@ -141,6 +141,33 @@ impl ContractCell {
         decision_handle: &str,
         deprecated_after: u64,
     ) -> UcResult<()> {
+        self.validate_migration_plan(
+            source_schema_id,
+            target_schema_id,
+            migration_plan_handle,
+            decision_handle,
+        )?;
+        let source = self
+            .contracts
+            .get_mut(source_schema_id)
+            .expect("validate_migration_plan checked source contract");
+        source.superseded_by = Some(target_schema_id.to_string());
+        source.migration_plan_handle = Some(migration_plan_handle.to_string());
+        source.decision_handle = Some(decision_handle.to_string());
+        source.deprecated_after = Some(deprecated_after);
+        source.migration_applied_at = None;
+        Ok(())
+    }
+
+    /// Validate a migration without changing state. Admin WAL records use
+    /// this before the durable intent is appended.
+    pub fn validate_migration_plan(
+        &self,
+        source_schema_id: &str,
+        target_schema_id: &str,
+        migration_plan_handle: &str,
+        decision_handle: &str,
+    ) -> UcResult<()> {
         if migration_plan_handle.trim().is_empty() {
             return Err(UcError::schema("migration_plan_handle is required"));
         }
@@ -160,7 +187,7 @@ impl ContractCell {
         }
         let source = self
             .contracts
-            .get_mut(source_schema_id)
+            .get(source_schema_id)
             .ok_or_else(|| UcError::not_found(format!("contract {source_schema_id}")))?;
         if source.deprecated {
             return Err(UcError::schema(format!(
@@ -172,18 +199,25 @@ impl ContractCell {
                 "source contract `{source_schema_id}` already has a migration plan"
             )));
         }
-        source.superseded_by = Some(target_schema_id.to_string());
-        source.migration_plan_handle = Some(migration_plan_handle.to_string());
-        source.decision_handle = Some(decision_handle.to_string());
-        source.deprecated_after = Some(deprecated_after);
-        source.migration_applied_at = None;
         Ok(())
     }
 
     pub fn apply_migration(&mut self, at: u64, source_schema_id: &str) -> UcResult<()> {
+        self.validate_apply_migration(at, source_schema_id)?;
         let source = self
             .contracts
             .get_mut(source_schema_id)
+            .expect("validate_apply_migration checked source contract");
+        source.deprecated = true;
+        source.migration_applied_at = Some(at);
+        Ok(())
+    }
+
+    /// Validate an application transition without changing state.
+    pub fn validate_apply_migration(&self, at: u64, source_schema_id: &str) -> UcResult<()> {
+        let source = self
+            .contracts
+            .get(source_schema_id)
             .ok_or_else(|| UcError::not_found(format!("contract {source_schema_id}")))?;
         if source.deprecated {
             return Err(UcError::schema(format!(
@@ -206,8 +240,6 @@ impl ContractCell {
                 "migration for `{source_schema_id}` cannot apply before logical {deprecated_after}"
             )));
         }
-        source.deprecated = true;
-        source.migration_applied_at = Some(at);
         Ok(())
     }
 
@@ -216,12 +248,11 @@ impl ContractCell {
             .contracts
             .get(source_schema_id)
             .ok_or_else(|| UcError::not_found(format!("contract {source_schema_id}")))?;
-        let target = source
-            .superseded_by
-            .clone()
-            .ok_or_else(|| UcError::schema(format!(
+        let target = source.superseded_by.clone().ok_or_else(|| {
+            UcError::schema(format!(
                 "contract `{source_schema_id}` has no planned migration"
-            )))?;
+            ))
+        })?;
         Ok(Cbor::map(vec![
             ("schema_id", Cbor::t(source.schema_id.clone())),
             ("target_schema_id", Cbor::t(target)),
@@ -243,10 +274,7 @@ impl ContractCell {
             ),
             (
                 "deprecated_after",
-                source
-                    .deprecated_after
-                    .map(Cbor::U64)
-                    .unwrap_or(Cbor::Null),
+                source.deprecated_after.map(Cbor::U64).unwrap_or(Cbor::Null),
             ),
             (
                 "applied_at",
@@ -345,9 +373,7 @@ impl CellBehavior for ContractCell {
                             ),
                             (
                                 "migration_applied_at",
-                                c.migration_applied_at
-                                    .map(Cbor::U64)
-                                    .unwrap_or(Cbor::Null),
+                                c.migration_applied_at.map(Cbor::U64).unwrap_or(Cbor::Null),
                             ),
                             (
                                 "pinned_weights",
@@ -386,7 +412,11 @@ impl CellBehavior for ContractCell {
                 let fields = update
                     .get("required_fields")
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 self.register(at, &sid, fields);
                 Ok(Cbor::map(vec![("registered", Cbor::t(sid))]))
@@ -501,7 +531,9 @@ impl CellBehavior for ContractCell {
                         .get("required_fields")
                         .and_then(|v| v.as_array())
                         .map(|a| {
-                            a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(str::to_string))
+                                .collect()
                         })
                         .unwrap_or_default(),
                     deprecated: item.opt_bool("deprecated").unwrap_or(false),
@@ -555,11 +587,7 @@ impl SpecAnchorCell {
     /// Chain step 2. Writes to anchor-exempt cell types (Scratchpad, Cache)
     /// pass without an anchor; everything else must cite one that resolves
     /// (NATIVE_TRINITY.md §5.2).
-    pub fn validate(
-        &self,
-        target_type: CellType,
-        anchor: Option<&AnchorRef>,
-    ) -> UcResult<()> {
+    pub fn validate(&self, target_type: CellType, anchor: Option<&AnchorRef>) -> UcResult<()> {
         if target_type.anchor_exempt() {
             return Ok(());
         }
@@ -624,7 +652,10 @@ impl CellBehavior for SpecAnchorCell {
                     .per_doc
                     .iter()
                     .map(|(d, n)| {
-                        Cbor::map(vec![("doc", Cbor::t(d.clone())), ("sections", Cbor::U64(*n))])
+                        Cbor::map(vec![
+                            ("doc", Cbor::t(d.clone())),
+                            ("sections", Cbor::U64(*n)),
+                        ])
                     })
                     .collect();
                 Ok(Cbor::map(vec![
@@ -640,7 +671,10 @@ impl CellBehavior for SpecAnchorCell {
         let doc = update.req_str("doc")?;
         let section = update.req_str("section")?;
         self.register(&doc, &section);
-        Ok(Cbor::map(vec![("registered", Cbor::t(format!("{doc}\u{00a7}{section}")))]))
+        Ok(Cbor::map(vec![(
+            "registered",
+            Cbor::t(format!("{doc}\u{00a7}{section}")),
+        )]))
     }
 
     fn snapshot_state(&self) -> Cbor {
@@ -711,10 +745,7 @@ impl DecisionLedgerCell {
     ) -> String {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        let handle = format!(
-            "decision/{}",
-            sequenced_ulid(at, seed, 0xD0, seq)
-        );
+        let handle = format!("decision/{}", sequenced_ulid(at, seed, 0xD0, seq));
         let d = Decision {
             handle: handle.clone(),
             scope: scope.to_string(),
@@ -865,7 +896,10 @@ impl CellBehavior for DecisionLedgerCell {
                 let old = update.req_str("old")?;
                 let new = update.req_str("new")?;
                 self.supersede(&old, &new)?;
-                Ok(Cbor::map(vec![("superseded", Cbor::t(old)), ("by", Cbor::t(new))]))
+                Ok(Cbor::map(vec![
+                    ("superseded", Cbor::t(old)),
+                    ("by", Cbor::t(new)),
+                ]))
             }
             _ => Err(UcError::schema("decision_ledger: unknown update op")),
         }
@@ -917,7 +951,10 @@ fn decision_to_cbor(d: &Decision) -> Cbor {
         ("made_at", Cbor::U64(d.made_at)),
         (
             "superseded_by",
-            d.superseded_by.as_ref().map(|s| Cbor::t(s.clone())).unwrap_or(Cbor::Null),
+            d.superseded_by
+                .as_ref()
+                .map(|s| Cbor::t(s.clone()))
+                .unwrap_or(Cbor::Null),
         ),
         ("anchor", Cbor::t(d.anchor.clone())),
     ])
@@ -965,7 +1002,7 @@ impl WorkBudgetCell {
 
     pub fn task_namespace(task_id: &str) -> &str {
         task_id
-            .split(|c: char| matches!(c, '.' | ':' | '/' | '-'))
+            .split(|c: char| ['.', ':', '/', '-'].contains(&c))
             .next()
             .unwrap_or(task_id)
     }
@@ -1198,21 +1235,16 @@ impl CongruenceCell {
                 if tok.is_empty() {
                     continue;
                 }
-                if let Some(rest) = tok.strip_prefix("GAP-") {
-                    if !rest.is_empty()
-                        && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-                    {
-                        out.insert(tok.to_string());
-                    }
-                } else if tok.len() == 3
+                let is_gap = tok.strip_prefix("GAP-").is_some_and(|rest| {
+                    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                });
+                let is_principle = tok.len() == 3
                     && tok.starts_with('P')
-                    && tok[1..].chars().all(|c| c.is_ascii_digit())
-                {
-                    out.insert(tok.to_string());
-                } else if tok.len() > 4
+                    && tok[1..].chars().all(|c| c.is_ascii_digit());
+                let is_cell = tok.len() > 4
                     && tok.ends_with("Cell")
-                    && tok.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-                {
+                    && tok.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+                if is_gap || is_principle || is_cell {
                     out.insert(tok.to_string());
                 }
             }
@@ -1618,6 +1650,13 @@ impl QuarantineCell {
 
     /// Absorb a failed envelope. Never fails, never drops — that's the
     /// contract the whole Trinity relies on (conformance test T6).
+    pub fn next_qid(&self, at: u64, seed: u64) -> String {
+        format!(
+            "quarantine/{}",
+            sequenced_ulid(at, seed, 0x0A, self.next_seq)
+        )
+    }
+
     pub fn absorb(
         &mut self,
         at: u64,
@@ -1626,12 +1665,59 @@ impl QuarantineCell {
         detail: &str,
         payload: Cbor,
     ) -> String {
-        let seq = self.next_seq;
+        let qid = self.next_qid(at, seed);
+        self.insert_absorbed(qid.clone(), at, cause, detail, payload);
+        qid
+    }
+
+    /// Insert a record whose WAL entry has already been committed. The
+    /// expected id check prevents a reordered writer from creating a
+    /// different sequence than recovery will later replay.
+    pub fn absorb_with_qid(
+        &mut self,
+        qid: &str,
+        at: u64,
+        seed: u64,
+        cause: ErrCode,
+        detail: &str,
+        payload: Cbor,
+    ) -> UcResult<()> {
+        if self.items.contains_key(qid) {
+            return Ok(());
+        }
+        let expected = self.next_qid(at, seed);
+        if expected != qid {
+            return Err(UcError::internal(format!(
+                "quarantine WAL id {qid} does not match expected {expected}"
+            )));
+        }
+        self.insert_absorbed(qid.to_string(), at, cause, detail, payload);
+        Ok(())
+    }
+
+    /// Replay a durable quarantine absorption without writing a second WAL
+    /// frame. This is idempotent across snapshot/WAL overlap.
+    pub fn replay_absorb(
+        &mut self,
+        qid: &str,
+        at: u64,
+        seed: u64,
+        cause: ErrCode,
+        detail: &str,
+        payload: Cbor,
+    ) -> UcResult<()> {
+        self.absorb_with_qid(qid, at, seed, cause, detail, payload)
+    }
+
+    fn insert_absorbed(
+        &mut self,
+        qid: String,
+        at: u64,
+        cause: ErrCode,
+        detail: &str,
+        payload: Cbor,
+    ) {
         self.next_seq = self.next_seq.wrapping_add(1);
-        let qid = format!(
-            "quarantine/{}",
-            sequenced_ulid(at, seed, 0x0A, seq)
-        );
         self.items.insert(
             qid.clone(),
             QuarantineItem {
@@ -1644,7 +1730,6 @@ impl QuarantineCell {
                 resolved_at: None,
             },
         );
-        qid
     }
 
     /// Prune *resolved* items past retention. Pending items are untouchable.
@@ -1828,7 +1913,11 @@ mod tests {
     #[test]
     fn contract_required_fields_and_deprecation() {
         let mut cc = ContractCell::new(CellId(20));
-        cc.register(1, "fact.v1", vec!["subject".into(), "predicate".into(), "object".into()]);
+        cc.register(
+            1,
+            "fact.v1",
+            vec!["subject".into(), "predicate".into(), "object".into()],
+        );
         let ok = Cbor::map(vec![
             ("subject", Cbor::t("a")),
             ("predicate", Cbor::t("b")),
@@ -1854,8 +1943,14 @@ mod tests {
             .unwrap();
         let planned = cc.migration_status("shape.v1").unwrap();
         assert_eq!(planned.opt_str("target_schema_id"), Some("shape.v2".into()));
-        assert_eq!(planned.opt_str("migration_plan_handle"), Some("blob/plan-01".into()));
-        assert_eq!(planned.opt_str("decision_handle"), Some("decision/01".into()));
+        assert_eq!(
+            planned.opt_str("migration_plan_handle"),
+            Some("blob/plan-01".into())
+        );
+        assert_eq!(
+            planned.opt_str("decision_handle"),
+            Some("decision/01".into())
+        );
         assert_eq!(planned.opt_u64("deprecated_after"), Some(5));
         assert_eq!(planned.opt_str("status"), Some("planned".into()));
 
@@ -1869,7 +1964,9 @@ mod tests {
 
         let v1_payload = Cbor::map(vec![("subject", Cbor::t("s"))]);
         assert_eq!(
-            cc.validate_schema("shape.v1", &v1_payload).unwrap_err().code,
+            cc.validate_schema("shape.v1", &v1_payload)
+                .unwrap_err()
+                .code,
             ErrCode::ContractViolation
         );
 
@@ -1916,7 +2013,14 @@ mod tests {
     #[test]
     fn decision_conflict_detection() {
         let mut dl = DecisionLedgerCell::new(CellId(22));
-        let d1 = dl.append(1, 9, "embedder.dim", "dim is 768", "operator", "EmbeddingReranker.md§2");
+        let d1 = dl.append(
+            1,
+            9,
+            "embedder.dim",
+            "dim is 768",
+            "operator",
+            "EmbeddingReranker.md§2",
+        );
         // Payload in that scope with no reference → conflict.
         let bare = Cbor::map(vec![
             ("decision_scope", Cbor::t("embedder.dim")),
@@ -1933,14 +2037,23 @@ mod tests {
         ]);
         assert!(dl.check_conflicts(&respects).is_ok());
         // Explicit supersede passes and then flips governance.
-        let d2 = dl.append(1, 9, "embedder.dim", "dim is 1536", "operator", "EmbeddingReranker.md§2");
+        let d2 = dl.append(
+            1,
+            9,
+            "embedder.dim",
+            "dim is 1536",
+            "operator",
+            "EmbeddingReranker.md§2",
+        );
         assert_ne!(d1, d2);
         dl.supersede(&d1, &d2).unwrap();
         let active = dl.active_in_scope("embedder.dim");
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].handle, d2);
         // Scope-free payloads pass.
-        assert!(dl.check_conflicts(&Cbor::map(vec![("x", Cbor::U64(1))])).is_ok());
+        assert!(dl
+            .check_conflicts(&Cbor::map(vec![("x", Cbor::U64(1))]))
+            .is_ok());
     }
 
     #[test]
@@ -1989,7 +2102,9 @@ mod tests {
             ("respects_decision", Cbor::t(global)),
         ]);
         assert_eq!(
-            dl.check_conflicts(&stale_global_reference).unwrap_err().code,
+            dl.check_conflicts(&stale_global_reference)
+                .unwrap_err()
+                .code,
             ErrCode::DecisionConflict
         );
         let respects_exact = Cbor::map(vec![
@@ -2031,14 +2146,8 @@ mod tests {
         assert_eq!(wb.default_for_task("curator.librarian"), 10_000_000);
         assert_eq!(wb.default_for_task("admin.reinject"), 250_000);
 
-        assert_eq!(
-            wb.ensure("bootstrap.selftest", None).granted,
-            1_000_000
-        );
-        assert_eq!(
-            wb.ensure("curator.librarian", None).granted,
-            10_000_000
-        );
+        assert_eq!(wb.ensure("bootstrap.selftest", None).granted, 1_000_000);
+        assert_eq!(wb.ensure("curator.librarian", None).granted, 10_000_000);
         assert_eq!(wb.ensure("task-plain", None).granted, 100_000);
 
         let snap = wb.snapshot_state();
@@ -2052,8 +2161,14 @@ mod tests {
             restored.namespace_defaults().get("curator").copied(),
             Some(10_000_000)
         );
-        assert_eq!(restored.get("bootstrap.selftest").unwrap().granted, 1_000_000);
-        assert_eq!(restored.get("curator.librarian").unwrap().granted, 10_000_000);
+        assert_eq!(
+            restored.get("bootstrap.selftest").unwrap().granted,
+            1_000_000
+        );
+        assert_eq!(
+            restored.get("curator.librarian").unwrap().granted,
+            10_000_000
+        );
     }
 
     #[test]
@@ -2099,7 +2214,10 @@ mod tests {
         assert_eq!(err.code, ErrCode::Fixation);
         assert_eq!(gc.get("GAP-777").unwrap().state, GapState::Fixated);
         // Still blocked until a transition.
-        assert_eq!(gc.on_dispatch("GAP-777").unwrap_err().code, ErrCode::Fixation);
+        assert_eq!(
+            gc.on_dispatch("GAP-777").unwrap_err().code,
+            ErrCode::Fixation
+        );
         gc.transition("GAP-777", GapState::Investigating).unwrap();
         assert!(gc.on_dispatch("GAP-777").is_ok());
     }

@@ -13,6 +13,32 @@
 - All bytes little-endian. Payloads are **canonical CBOR** (RFC 8949) — keys lex-sorted, no indefinite-length items, no duplicate keys.
 - All times are logical clocks; wall-clock fields suffixed `*_wall`.
 
+### §0.1 — Current Checkout Wire Contract
+
+The concrete v1 implementation uses canonical CBOR maps. The pseudo-Rust
+shapes in later sections describe logical result content; they are not
+additional wire envelopes.
+
+Request envelopes contain:
+
+- `proto_version` (u64, exactly 1), `request_id` (ULID string), and
+  `agent_id` (string);
+- `capability`, mandatory `work_budget` (`task_id` string plus `units` u64),
+  `intent`, `payload`, optional `spec_anchor`, `severity`, optional `gap_ref`,
+  and `tier`;
+- `seed` (u64) and `flags` (`semantic_check`, `continuation`).
+
+The response envelope always contains `request_id`, `ok`, `result`, optional
+`err_code`, `err_message`, and `quarantine_id`, plus `tokens_emitted`,
+`next_tier_hint`, `logical_at`, and the request `seed`. A response mirrors the
+request seed even when the result is an error.
+
+The handshake is a `hello` map followed by `hello_ack`. The current hello
+requires `type`, `proto_version`, and `agent_id`; the acknowledgement reports
+`node_id`, `proto_version`, and capability bits. Subscription delivery uses
+authenticated `events` and `events_ack` pull messages, not unsolicited push
+frames.
+
 ---
 
 ## §1 — Mission
@@ -53,7 +79,9 @@ Four non-negotiable properties:
 
 - Max frame: 16 MiB (hard cap 256 MiB).
 - One frame = one envelope or one response.
-- Streams (subscribe) use continuation flag.
+- `continuation` is available for truncated request flows. Subscription
+  delivery is the authenticated `events` / `events_ack` pull protocol in §4.4
+  and §9.
 
 ---
 
@@ -61,37 +89,39 @@ Four non-negotiable properties:
 
 ```rust
 struct Envelope {
-    proto_version: u8,            // = 1 in v1.0
+    proto_version: u64,           // = 1 in v1.0
     request_id:    Ulid,
-    agent_id:      Ulid,
+    agent_id:      String,
     capability:    CapToken,
     work_budget:   WorkBudget,    // MANDATORY (P12)
-    spec_anchor:   Option<AnchorRef>,
     intent:        Intent,        // Recall | Hydrate | Write | Subscribe | View | Supersede
     payload:       Payload,
+    spec_anchor:   Option<String>, // "Doc.md§Section"
     severity:      Severity,      // P0 | P1 | P2
     gap_ref:       Option<GapId>,
-    task_id:       TaskId,
+    tier:          Tier,
     seed:          u64,
-    logical_at:    u64,
-    continuation:  bool,
+    flags:         EnvelopeFlags,
 }
 
 struct WorkBudget {
-    tokens_remaining: u32,
-    deadline_logical: u64,
-    retry_count:      u8,
-    severity:         Severity,
+    task_id: String,
+    units:    u64,
 }
 
-struct AnchorRef { doc: SmallString, section: SmallString }
+struct EnvelopeFlags {
+    semantic_check: bool,
+    continuation:  bool,
+}
 ```
 
 **Invariants:**
-- **E1** — `work_budget.tokens_remaining > 0` REQUIRED unless `intent == Subscribe`.
-- **E2** — `task_id` REQUIRED on Write/Supersede.
-- **E3** — `seed` MUST propagate into response envelope.
-- **E4** — `request_id` unique per `(agent_id, connection)`.
+- **E1** — `proto_version == 1` is required.
+- **E2** — `work_budget` is required on every envelope; Router enforces
+  available units and there is no free work.
+- **E3** — `intent` must be known and state-changing intents must carry a
+  non-null payload. The request `seed` is mirrored by the response.
+- **E4** — `request_id` must be a valid ULID.
 
 ---
 
@@ -151,12 +181,23 @@ Pre-validation chain runs before `on_update`. Failure → `QuarantineCell.absorb
 
 ```rust
 struct SubscribeReq {
-    patterns: Vec<EventPattern>,
-    since:    Option<u64>,
+    pattern: String,
+    since:   u64,
 }
 ```
 
-Server streams `EventFrame { event_kind, payload, logical_at }`. Trinity events (`decision.conflict`, `anchor.orphaned`, `task.no_progress`, `task.budget.exceeded`, `task.quarantined`, `contract.deprecated`) ALWAYS delivered to escalation-list subscribers.
+The Router persists the subscription registration before acknowledging it.
+The current transport provides authenticated pull delivery:
+
+- `events` drains pending events for the subscribed agent; an optional
+  `since` cursor replays retained events with a later sequence.
+- `events_ack` acknowledges the delivered sequence/cursor.
+- Each returned event contains its sequence, event name, logical time, and
+  payload.
+
+There is no unsolicited server push channel in the current v1 transport.
+The `continuation` envelope flag is for truncated request flows, not an
+implicit stream.
 
 ### §4.5 `view`
 
@@ -204,19 +245,31 @@ Only way to invalidate a Decision (DecisionLedgerCell invariant D2).
 
 ---
 
-## §5 — Prefix-Stable Response Layout
+## §5 — Response Envelope and Prefix Stability
 
-For every response with visible bytes (`recall`, `hydrate`, `view`), the serializer MUST emit fields in this canonical order:
+Every request receives one canonical CBOR response envelope. Per-verb result
+content is carried in `result`; the wrapper is:
 
-1. **header** — fixed order: `schema_id`, `view_version`, `namespace_id`, `params_canonical_hash`, `logical_at`.
-2. **handles[]** — lex-sorted by handle string.
-3. **skeletons[]** — lex-sorted by handle.
-4. **bodies[]** — lex-sorted by handle (when present).
-5. **footer** — `hydrate_endpoints`, `supersedes_handles`, `tokens_emitted`.
+```rust
+struct ResponseEnvelope {
+    request_id:       Ulid,
+    ok:               bool,
+    result:           CanonicalCbor,
+    err_code:         Option<ErrCode>,
+    err_message:      Option<String>,
+    quarantine_id:    Option<String>,
+    tokens_emitted:   u64,
+    next_tier_hint:   Option<Tier>,
+    logical_at:       u64,
+    seed:             u64,
+}
+```
 
-Inside any record, fields lex-sorted. CBOR map keys canonically ordered.
-
-This is what allows DeepSeek's prefix cache to hit the entire shared prefix when two views differ only in newly-appended content.
+The response `seed` equals the request `seed`. Successful
+recall, hydrate, and view result maps retain canonical CBOR ordering and the
+Router's documented handle/skeleton/body ordering. The response wrapper uses
+canonical map encoding rather than the blueprint's separate receipt/wal
+fields.
 
 ---
 
@@ -261,31 +314,34 @@ Every `Envelope.seed` mirrored in `ResponseEnvelope.seed`. Agents SHOULD pass it
 
 ---
 
-## §7 — Schema Negotiation (ContractCell)
+## §7 — Handshake and Schema Negotiation
 
-Handshake `Hello` frame:
+The current handshake is intentionally small and capability-based:
 
 ```rust
 struct Hello {
-    proto_version:     u8,
-    client_kind:       String,    // "deepseek-v3" | "deepseek-r1" | "deepseek-coder" | ...
-    capability_bits:   BitSet,    // {deepseek_coder, deepseek_r1_strip, fim, streaming, ...}
-    requested_schemas: Vec<SchemaId>,
+    type:          "hello",
+    proto_version: u64,
+    agent_id:      String,
 }
-```
 
-Server `HelloAck`:
-
-```rust
 struct HelloAck {
-    proto_version: u8,
-    accepted:      Vec<(SchemaId, Version)>,
-    rejected:      Vec<(SchemaId, RejectReason)>,
-    server_caps:   BitSet,
+    type:             "hello_ack",
+    node_id:          String,
+    proto_version:    u64,
+    capability_bits:  Map<String, BoolOrArray>,
 }
 ```
 
-Mismatches → negotiated downgrade or connection-level `ContractViolation`. Contract migrations are now tracked through the ContractCell admin surface: `contract plan-migration`, `contract verify-migration`, and `contract apply-migration`.
+The acknowledgement advertises semantic checking, supported tiers, built-in
+views, the CrossCheck ledger, authenticated event pull, and the requirement
+for an operator capability on admin messages. Contract migrations remain
+tracked through the ContractCell admin surface:
+`contract plan-migration`, `contract verify-migration`, and
+`contract apply-migration`.
+
+Mismatches produce a structured `ContractViolation`; there is no
+unversioned downgrade that changes the v1 field contract.
 
 ---
 
@@ -322,21 +378,35 @@ struct ErrorResp {
 
 ---
 
-## §9 — Streaming Semantics
+## §9 — Subscription Pull Semantics
 
 For `subscribe`:
-- Each event frame independently CBOR-encoded.
-- `logical_at` monotonically increasing.
-- Backpressure: full agent buffer → Router buffers up to N=4096 frames to L0; beyond → `subscription.paused`.
-- Resume: reconnect with `since: <last_logical_at>`.
+
+- Registration is persisted in the SubscriptionCell WAL before success is
+  returned.
+- `events` returns pending events for the authenticated agent.
+- A `since` cursor replays retained ring events with a later sequence
+  and respects the subscription's activation cursor.
+- `events_ack` acknowledges the delivered cursor.
+- The in-memory event ring retains up to 4096 events; pending queues provide
+  bounded local backpressure.
+- Reconnect by issuing `events` with the last acknowledged cursor.
+
+The current transport does not open an asynchronous server-push stream. Event
+names under `trinity.`, `curator.`, and `node.fatal` are
+always delivered to registered operator/escalation recipients; other events
+require a matching subscription pattern.
 
 ---
 
-## §10 — Versioning & Handshake
+## §10 — Versioning and Handshake
 
-- Major version = first byte of every envelope (`proto_version`). v1.0 = `0x01`.
-- Minor version inside `Hello`.
-- Breaking changes require new major + ≥ 6 month parallel support window.
+- `proto_version` is a u64 field in every request and response
+  negotiation. v1.0 uses value `1`.
+- Capability bits are advertised in `hello_ack`; there is no separate
+  minor-version field in the current handshake.
+- Breaking changes require a new major version and a documented parallel
+  support window.
 
 ---
 
@@ -353,11 +423,11 @@ struct CapToken {
     expiry:            u64,
     tokens_per_window: Option<u32>,
     caveats:           Vec<Caveat>,
-    sig:               Ed25519Sig,
+    sig:               HmacSha256,
 }
 ```
 
-In-process verification (≤ 2 μs p99). Revocation lazily replicated from `AgentRegistryCell` to Router; SLO ≤ 100 ms.
+The current single-node implementation uses HMAC-SHA256 behind the `Signer` trait; an Ed25519 implementation remains a future multi-node seam. Revocation is checked against the `AgentRegistryCell` at the protocol boundary.
 
 ---
 
@@ -387,6 +457,7 @@ The HyperCortex L3 wire format above remains normative. UltraCortex v1.0 adds on
 ```rust
 struct EnvelopeFlags {
     semantic_check: bool,   // NEW v1.0 — invoke WardenCell sync gate
+    continuation:  bool,    // continue a truncated request flow
 }
 ```
 
@@ -398,7 +469,7 @@ When `true`, Router invokes `WardenCell.judge(env)` synchronously after the Trin
 |---|---|---|
 | **`SemanticDrift`** | WardenCell flagged envelope as drifting from canonical substrate | Envelope → QuarantineCell with grounded counter-rationale. Caller receives `quarantine_id`. |
 | **`HallucinationDetected`** | Warden detected hallucinated handle/fact in envelope | Same; QuarantineCell with `unknown_handles: Vec<Handle>` provenance. |
-| **`AdjudicationPending`** | LibrarianCell and WardenCell disagreed; AdjudicatorCell resolving | Caller MAY poll via `request_id` or receive async resolution event on subscribed stream. |
+| **`AdjudicationPending`** | LibrarianCell and WardenCell disagreed; AdjudicatorCell resolving | Caller MAY poll via `request_id` or use authenticated `events` pull delivery. |
 
 All three errors return either a structured response or a `quarantine_id` — **never silent drop** (consistent with Mission §1.3).
 
@@ -412,7 +483,7 @@ struct CapToken {
 }
 ```
 
-This is what enforces **P19 (Asymmetric Visibility)** at the protocol level. The Warden literally cannot `hydrate` a Librarian rationale blob — the Router rejects the request and emits `curator.rationale_access_denied`. **[GAP-CU-012]** canonicalization.
+This is what enforces **P19 (Asymmetric Visibility)** at the protocol level. The Warden literally cannot `hydrate` a Librarian rationale blob — the Router rejects the request and emits `curator.rationale_access_denied`. Negation-glob canonicalization is implemented and covered by local conformance/self-tests.
 
 ## §A.4 New Capability Bit on Handshake
 
@@ -425,22 +496,20 @@ struct Hello {
 }
 ```
 
-## §A.5 New Always-Delivered Trinity Events (subscribe)
+## §A.5 Event Delivery (subscribe)
 
-In addition to the existing always-delivered Trinity events:
+The current transport uses authenticated pull rather than an always-delivered
+push stream. The EventBus always-deliver prefixes are `trinity.`, `curator.`,
+and `node.fatal` for registered operator/escalation recipients. Events such
+as `cross_check.record_appended` are delivered when the agent has a matching
+subscription pattern; they are not silently persisted as an unsolicited
+socket frame.
 
-- `curator.suspicious_agreement` (>99% Librarian/Warden agreement → collusion signal)
-- `curator.calibration_drift_detected`
-- `curator.rationale_access_denied` (proves P19 active; MUST be non-zero)
-- `adjudicator.invoked`
-- `adjudicator.resolution`
-- `cross_check.record_appended`
-
-## §A.6 New GAPs (Protocol-scoped)
+## §A.6 Protocol-Scoped GAPs
 
 | ID | Description |
 |---|---|
-| GAP-CU-012 | Capability-token negation glob canonicalization |
+| GAP-CU-012 | Capability-token negation glob canonicalization | closed in current checkout; retain regression coverage |
 
 ## §A.7 Congruence Contract (Updated)
 

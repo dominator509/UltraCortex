@@ -120,7 +120,10 @@ impl CellBehavior for AgentRegistryCell {
             }
             Some("is_revoked") => {
                 let tid = query.req_str("token_id")?;
-                Ok(Cbor::map(vec![("revoked", Cbor::Bool(self.is_revoked(&tid)))]))
+                Ok(Cbor::map(vec![(
+                    "revoked",
+                    Cbor::Bool(self.is_revoked(&tid)),
+                )]))
             }
             _ => Err(UcError::schema("agent_registry: unknown op")),
         }
@@ -178,7 +181,13 @@ impl CellBehavior for AgentRegistryCell {
             ("revoked_tokens", Cbor::Array(revoked)),
             (
                 "escalation_subscribers",
-                Cbor::text_array(&self.escalation_subscribers.iter().cloned().collect::<Vec<_>>()),
+                Cbor::text_array(
+                    &self
+                        .escalation_subscribers
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
             ),
         ])
     }
@@ -204,7 +213,10 @@ impl CellBehavior for AgentRegistryCell {
                     .insert(item.req_str("token_id")?, item.opt_u64("at").unwrap_or(0));
             }
         }
-        if let Some(arr) = state.get("escalation_subscribers").and_then(|v| v.as_array()) {
+        if let Some(arr) = state
+            .get("escalation_subscribers")
+            .and_then(|v| v.as_array())
+        {
             for item in arr {
                 if let Some(s) = item.as_str() {
                     self.escalation_subscribers.insert(s.to_string());
@@ -410,12 +422,20 @@ impl CellBehavior for ProposalCell {
                 let approvals = item
                     .get("approvals")
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let rejections = item
                     .get("rejections")
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let p = Proposal {
                     proposal_id: item.req_str("proposal_id")?,
@@ -460,18 +480,51 @@ impl SubscriptionCell {
         }
     }
 
-    pub fn subscribe(&mut self, at: u64, agent_id: &str, pattern: &str) -> String {
+    pub fn next_subscription_id(&self) -> String {
+        format!("sub/{:016}", self.seq + 1)
+    }
+
+    /// Apply a subscription with a caller-supplied id. Recovery uses this
+    /// form so replay can be idempotent without allocating a new id.
+    pub fn subscribe_with_id(
+        &mut self,
+        at: u64,
+        sub_id: &str,
+        agent_id: &str,
+        pattern: &str,
+    ) -> UcResult<()> {
+        if let Some(existing) = self.subs.get(sub_id) {
+            if existing.agent_id == agent_id && existing.pattern == pattern && existing.since == at
+            {
+                return Ok(());
+            }
+            return Err(UcError::schema(format!(
+                "subscription id {sub_id} already has different contents"
+            )));
+        }
+        if sub_id != self.next_subscription_id() {
+            return Err(UcError::internal(format!(
+                "subscription WAL sequence mismatch: expected {}, got {sub_id}",
+                self.next_subscription_id()
+            )));
+        }
         self.seq += 1;
-        let sid = format!("sub/{:016}", self.seq);
         self.subs.insert(
-            sid.clone(),
+            sub_id.to_string(),
             Subscription {
-                sub_id: sid.clone(),
+                sub_id: sub_id.to_string(),
                 agent_id: agent_id.to_string(),
                 pattern: pattern.to_string(),
                 since: at,
             },
         );
+        Ok(())
+    }
+
+    pub fn subscribe(&mut self, at: u64, agent_id: &str, pattern: &str) -> String {
+        let sid = self.next_subscription_id();
+        self.subscribe_with_id(at, &sid, agent_id, pattern)
+            .expect("generated subscription id must be valid");
         sid
     }
 
@@ -490,6 +543,17 @@ impl SubscriptionCell {
         out.sort();
         out.dedup();
         out
+    }
+
+    /// Return whether an agent was entitled to an event at the event's
+    /// logical timestamp. This keeps cursor replay from exposing events that
+    /// predate the subscription that granted access.
+    pub fn entitled_at(&self, agent_id: &str, event: &str, logical_at: u64) -> bool {
+        self.subs.values().any(|s| {
+            s.agent_id == agent_id
+                && logical_at >= s.since
+                && crate::core::glob::glob_match(&s.pattern, event)
+        })
     }
 }
 
@@ -577,8 +641,14 @@ mod tests {
         let mut pc = ProposalCell::new(CellId(12));
         let pid = pc.open(1, "agent-a", Cbor::t("switch embedder dim"));
         // Proposer self-approval doesn't count.
-        assert_eq!(pc.vote(&pid, "agent-a", true).unwrap(), ProposalStatus::Open);
-        assert_eq!(pc.vote(&pid, "agent-b", true).unwrap(), ProposalStatus::Open);
+        assert_eq!(
+            pc.vote(&pid, "agent-a", true).unwrap(),
+            ProposalStatus::Open
+        );
+        assert_eq!(
+            pc.vote(&pid, "agent-b", true).unwrap(),
+            ProposalStatus::Open
+        );
         assert_eq!(
             pc.vote(&pid, "agent-c", true).unwrap(),
             ProposalStatus::Accepted
@@ -616,6 +686,23 @@ mod tests {
         assert_eq!(
             sc.matching("curator.warden.flag"),
             vec!["agent-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn subscription_replay_preserves_id_and_sequence() {
+        let mut sc = SubscriptionCell::new(CellId(13));
+        let sid = sc.next_subscription_id();
+        sc.subscribe_with_id(7, &sid, "agent-a", "node.*").unwrap();
+        sc.subscribe_with_id(7, &sid, "agent-a", "node.*").unwrap();
+        assert_eq!(sc.next_subscription_id(), "sub/0000000000000002");
+        let state = sc.snapshot_state();
+        let mut restored = SubscriptionCell::new(CellId(13));
+        restored.restore_state(&state).unwrap();
+        assert_eq!(restored.next_subscription_id(), "sub/0000000000000002");
+        assert_eq!(
+            restored.matching("node.written"),
+            vec!["agent-a".to_string()]
         );
     }
 }

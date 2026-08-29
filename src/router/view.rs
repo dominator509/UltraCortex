@@ -328,7 +328,14 @@ mod tests {
     #[test]
     fn stream_sections_decode_in_order() {
         let params = Cbor::map(vec![("subject", Cbor::t("svc"))]);
-        let rendered = render_view("fact_subject", "default", 1, &params, &items(2, 12), Tier::L3);
+        let rendered = render_view(
+            "fact_subject",
+            "default",
+            1,
+            &params,
+            &items(2, 12),
+            Tier::L3,
+        );
         let decoded = decode_view(&rendered.bytes).unwrap();
         assert_eq!(decoded.header.req_str("view_id").unwrap(), "fact_subject");
         assert_eq!(decoded.handles.len(), 2);

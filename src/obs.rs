@@ -109,7 +109,10 @@ impl Metrics {
         for (k, h) in self.histos.lock().unwrap().iter() {
             out.insert(format!("{k}.count"), h.count as i64);
             if h.count > 0 {
-                out.insert(format!("{k}.mean"), (h.sum / h.count) as i64);
+                out.insert(
+                    format!("{k}.mean"),
+                    h.sum.checked_div(h.count).unwrap_or(0) as i64,
+                );
                 out.insert(format!("{k}.max"), h.max as i64);
             }
         }
@@ -487,10 +490,22 @@ impl AuditChain {
         if let Some(w) = st.writer.as_mut() {
             w.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
             w.flush().map_err(|e| e.to_string())?;
+            w.get_ref().sync_data().map_err(|e| e.to_string())?;
         }
         st.prev_hash = hash;
         st.seq += 1;
         Ok(hash)
+    }
+
+    /// Flush and sync the audit file for callers that need an explicit
+    /// durability barrier after a batch of forensic records.
+    pub fn sync(&self) -> Result<(), String> {
+        let mut st = self.inner.lock().unwrap();
+        if let Some(w) = st.writer.as_mut() {
+            w.flush().map_err(|e| e.to_string())?;
+            w.get_ref().sync_data().map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     pub fn head(&self) -> ([u8; 32], u64) {

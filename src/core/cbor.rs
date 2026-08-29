@@ -145,7 +145,9 @@ impl Cbor {
             .ok_or_else(|| UcError::internal(format!("missing/invalid uint field `{key}`")))
     }
     pub fn opt_str(&self, key: &str) -> Option<String> {
-        self.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+        self.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
     }
     pub fn opt_u64(&self, key: &str) -> Option<u64> {
         self.get(key).and_then(|v| v.as_u64())
@@ -463,7 +465,10 @@ mod tests {
     #[test]
     fn roundtrip_nested() {
         let v = Cbor::map(vec![
-            ("handles", Cbor::text_array(&["fact/AAA".into(), "blob/bbb".into()])),
+            (
+                "handles",
+                Cbor::text_array(&["fact/AAA".into(), "blob/bbb".into()]),
+            ),
             ("n", Cbor::u(42)),
             ("neg", Cbor::i(-7)),
             ("f", Cbor::f(1.5)),
@@ -472,7 +477,10 @@ mod tests {
             ("raw", Cbor::by(vec![1, 2, 3])),
             (
                 "inner",
-                Cbor::map(vec![("k", Cbor::t("v")), ("arr", Cbor::arr(vec![Cbor::u(1)]))]),
+                Cbor::map(vec![
+                    ("k", Cbor::t("v")),
+                    ("arr", Cbor::arr(vec![Cbor::u(1)])),
+                ]),
             ),
         ]);
         let bytes = v.encode();

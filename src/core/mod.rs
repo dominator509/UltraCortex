@@ -129,6 +129,7 @@ impl Severity {
             Severity::P2 => "P2",
         }
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "P0" => Some(Severity::P0),
@@ -164,6 +165,7 @@ impl Intent {
             Intent::Admin => "admin",
         }
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "recall" => Some(Intent::Recall),
@@ -198,6 +200,7 @@ impl Tier {
             Tier::L3 => "L3",
         }
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "L0" => Some(Tier::L0),
@@ -230,6 +233,7 @@ impl ShardTopology {
             ShardTopology::CoTenantShard0 => "co-tenant-shard-0",
         }
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "dedicated" => Some(ShardTopology::Dedicated),
@@ -285,6 +289,7 @@ impl ErrCode {
             ErrCode::AdjudicationPending => "AdjudicationPending",
         }
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         Some(match s {
             "Quarantined" => ErrCode::Quarantined,
@@ -334,7 +339,7 @@ pub struct UcError {
     pub quarantine_id: Option<QuarantineId>,
     pub cause_chain: Vec<ErrCode>,
     pub retry_after_logical: Option<u64>,
-    pub spec_anchor: Option<AnchorRef>,
+    pub spec_anchor: Option<Box<AnchorRef>>,
 }
 
 impl UcError {
@@ -374,7 +379,7 @@ impl UcError {
         self
     }
     pub fn with_anchor(mut self, a: AnchorRef) -> Self {
-        self.spec_anchor = Some(a);
+        self.spec_anchor = Some(Box::new(a));
         self
     }
 }
@@ -443,7 +448,7 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
 /// SPEC-DERIVED-§9.1 (NATIVE_TRINITY.md): consistent under-estimation is
 /// reconciled by `charge_post`.
 pub fn est_tokens(bytes: usize) -> u32 {
-    ((bytes + 3) / 4) as u32
+    bytes.div_ceil(4) as u32
 }
 
 #[cfg(test)]

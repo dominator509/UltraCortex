@@ -9,7 +9,7 @@ pub mod cells;
 pub mod chain;
 
 pub use cells::{
-    ContractCell, CongruenceCell, DecisionLedgerCell, Gap, GapCell, GapState, QuarantineCell,
+    CongruenceCell, ContractCell, DecisionLedgerCell, Gap, GapCell, GapState, QuarantineCell,
     QuarantineStatus, SpecAnchorCell, WorkBudgetCell, GAP_FIXATION_N,
 };
 pub use chain::{run_pre_validation, PreCtx, Trinity};

@@ -28,8 +28,13 @@ pub mod warden;
 use crate::core::cbor::Cbor;
 use crate::core::{ShardTopology, UcError, UcResult};
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Confidence + operations
@@ -399,17 +404,20 @@ fn split_sentences(text: &str) -> Vec<String> {
 
 /// Shells out to an external llama.cpp-style CLI with pinned weights.
 /// Weight files are SHA-verified at construction (PersistenceLayer.md §7);
-/// any parse failure at inference time falls back to [`DeterministicBackend`]
-/// and increments `curator.backend_fallback` — an LLM hiccup must never
-/// stall the curation pipeline (LibrarianCell.md §6.4).
+/// A failed or timed-out inference is fail-closed: it returns an empty
+/// skeleton or `Uncertain` rather than silently substituting a deterministic
+/// judge for the configured model.
 pub struct ExternalGgufBackend {
     pub slot: String,
     pub model_name: String,
     pub weight_path: PathBuf,
     pub cmd: String, // e.g. "llama-cli"
-    fallback: DeterministicBackend,
     metrics: Option<std::sync::Arc<crate::obs::Metrics>>,
 }
+
+const INFERENCE_TIMEOUT: Duration = Duration::from_secs(30);
+const RUNNER_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_MODEL_OUTPUT_BYTES: u64 = 1024 * 1024;
 
 impl ExternalGgufBackend {
     pub fn new(
@@ -433,13 +441,42 @@ impl ExternalGgufBackend {
         let weight_path = crate::persist::verify_weight_file(data_dir, slot, sha_hex)?;
         // Production bootstrap must not accept a configured model whose
         // runner will only fail later inside the curation path.
-        if std::process::Command::new(cmd)
+        let mut probe = Command::new(cmd)
             .arg("--version")
-            .output()
-            .is_err()
-        {
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| UcError::not_found(format!("GGUF runner not found on PATH: {cmd}")))?;
+        let deadline = Instant::now() + RUNNER_PROBE_TIMEOUT;
+        loop {
+            match probe.try_wait() {
+                Ok(Some(status)) if status.success() => break,
+                Ok(Some(_)) => {
+                    return Err(UcError::unsupported(format!(
+                        "GGUF runner failed its version probe: {cmd}"
+                    )))
+                }
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Ok(None) => {
+                    let _ = probe.kill();
+                    let _ = probe.wait();
+                    return Err(UcError::unsupported(format!(
+                        "GGUF runner version probe timed out: {cmd}"
+                    )));
+                }
+                Err(e) => {
+                    let _ = probe.kill();
+                    let _ = probe.wait();
+                    return Err(UcError::unsupported(format!(
+                        "GGUF runner version probe failed: {cmd}: {e}"
+                    )));
+                }
+            }
+        }
+        if !weight_path.exists() {
             return Err(UcError::not_found(format!(
-                "GGUF runner not found on PATH: {cmd}"
+                "pinned GGUF weight file disappeared: {}",
+                weight_path.display()
             )));
         }
         Ok(ExternalGgufBackend {
@@ -447,13 +484,12 @@ impl ExternalGgufBackend {
             model_name: model_name.to_string(),
             weight_path,
             cmd: cmd.to_string(),
-            fallback: DeterministicBackend,
             metrics,
         })
     }
 
     fn run(&self, seed: u64, prompt: &str, max_tokens: usize) -> Option<String> {
-        let output = Command::new(&self.cmd)
+        let mut child = Command::new(&self.cmd)
             .arg("-m")
             .arg(&self.weight_path)
             .arg("--temp")
@@ -465,12 +501,47 @@ impl ExternalGgufBackend {
             .arg("--no-display-prompt")
             .arg("-p")
             .arg(prompt)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
             .ok()?;
-        if !output.status.success() {
+        let stdout = child.stdout.take()?;
+        let too_large = Arc::new(AtomicBool::new(false));
+        let too_large_reader = too_large.clone();
+        let reader = thread::spawn(move || {
+            let mut limited = stdout.take(MAX_MODEL_OUTPUT_BYTES + 1);
+            let mut bytes = Vec::new();
+            if limited.read_to_end(&mut bytes).is_err() {
+                return None;
+            }
+            if bytes.len() as u64 > MAX_MODEL_OUTPUT_BYTES {
+                too_large_reader.store(true, Ordering::Relaxed);
+                return None;
+            }
+            Some(bytes)
+        });
+        let deadline = Instant::now() + INFERENCE_TIMEOUT;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    self.note_timeout();
+                    break None;
+                }
+                Err(_) => break None,
+            }
+        }?;
+        let output = reader.join().ok()??;
+        if too_large.load(Ordering::Relaxed) || !status.success() {
+            self.note_failure();
             return None;
         }
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let text = String::from_utf8_lossy(&output).trim().to_string();
         if text.is_empty() {
             None
         } else {
@@ -480,9 +551,15 @@ impl ExternalGgufBackend {
         }
     }
 
-    fn note_fallback(&self) {
+    fn note_failure(&self) {
         if let Some(m) = &self.metrics {
-            m.inc("curator.backend_fallback");
+            m.inc("curator.backend_failure");
+        }
+    }
+
+    fn note_timeout(&self) {
+        if let Some(m) = &self.metrics {
+            m.inc("curator.backend_timeout");
         }
     }
 }
@@ -499,8 +576,8 @@ impl CuratorBackend for ExternalGgufBackend {
         match self.run(0, &prompt, max_tokens + 16) {
             Some(s) => s,
             None => {
-                self.note_fallback();
-                self.fallback.skeleton(text, max_tokens)
+                self.note_failure();
+                String::new()
             }
         }
     }
@@ -516,8 +593,8 @@ impl CuratorBackend for ExternalGgufBackend {
             Some(s) if s.contains("AUDITOR") => Verdict::AuditorCorrect,
             Some(s) if s.contains("UNCERTAIN") => Verdict::Uncertain,
             _ => {
-                self.note_fallback();
-                self.fallback.adjudicate(seed, dispute_summary, evidence)
+                self.note_failure();
+                Verdict::Uncertain
             }
         }
     }
@@ -550,6 +627,7 @@ impl CuratorKvBudgetProfile {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         Some(match s {
             "small" => CuratorKvBudgetProfile::Small,
@@ -647,11 +725,12 @@ impl CuratorConfig {
     /// Development/test mode is explicit so production configuration cannot
     /// silently downgrade a missing pinned model to deterministic behavior.
     pub fn development() -> Self {
-        let mut cfg = Self::default();
-        cfg.external_cmd = None;
-        cfg.pinned.clear();
-        cfg.strict_model_pins = false;
-        cfg
+        Self {
+            external_cmd: None,
+            pinned: BTreeMap::new(),
+            strict_model_pins: false,
+            ..Self::default()
+        }
     }
 
     pub fn validate_model_pair(&self) -> UcResult<()> {
@@ -672,6 +751,21 @@ impl CuratorConfig {
                 if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
                     return Err(UcError::schema(format!(
                         "curator pin for {slot} must be a 64-character SHA-256"
+                    )));
+                }
+            }
+            for slot in &self.adjudicator_pool {
+                if slot.is_empty() {
+                    return Err(UcError::schema(
+                        "adjudicator pool entries must not be empty",
+                    ));
+                }
+                let sha = self.pinned.get(slot).ok_or_else(|| {
+                    UcError::schema(format!("missing curator pin for adjudicator: {slot}"))
+                })?;
+                if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(UcError::schema(format!(
+                        "curator pin for adjudicator {slot} must be a 64-character SHA-256"
                     )));
                 }
             }
@@ -780,7 +874,7 @@ mod tests {
     #[test]
     fn production_curator_defaults_are_pinned_and_family_distinct() {
         let cfg = CuratorConfig::default();
-        cfg.validate_model_pair().unwrap();
+        assert!(cfg.validate_model_pair().is_err());
         assert_eq!(cfg.librarian_model, DEFAULT_LIBRARIAN_MODEL);
         assert_eq!(cfg.warden_model, DEFAULT_WARDEN_MODEL);
         assert_ne!(cfg.librarian_model, cfg.warden_model);

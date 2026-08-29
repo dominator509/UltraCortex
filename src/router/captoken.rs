@@ -84,8 +84,8 @@ impl CapToken {
         facet_scope: FacetScope,
         expires_at: u64,
     ) -> CapToken {
-        let body = Self::body_cbor(token_id, agent_id, &ops, &cells, &facet_scope, expires_at)
-            .encode();
+        let body =
+            Self::body_cbor(token_id, agent_id, &ops, &cells, &facet_scope, expires_at).encode();
         let signature = signer.sign(&body);
         CapToken {
             token_id: token_id.to_string(),
@@ -161,12 +161,20 @@ impl CapToken {
             ops: c
                 .get("ops")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default(),
             cells: c
                 .get("cells")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default(),
             facet_scope: FacetScope::parse(&c.opt_str("facet_scope").unwrap_or_default()),
             expires_at: c.opt_u64("expires_at").unwrap_or(0),
@@ -187,7 +195,14 @@ impl CapToken {
 // Standard token shapes (CURATOR_PAIR_PROTOCOL.md §4)
 // ---------------------------------------------------------------------------
 
-const ALL_AGENT_OPS: [&str; 6] = ["recall", "hydrate", "write", "subscribe", "view", "supersede"];
+const ALL_AGENT_OPS: [&str; 6] = [
+    "recall",
+    "hydrate",
+    "write",
+    "subscribe",
+    "view",
+    "supersede",
+];
 
 /// The four private-facet exclusion globs, parameterized by which curator's
 /// outputs are being shielded.
@@ -300,7 +315,7 @@ mod tests {
         let tok = issue_agent_token(&s, "agent-1", 100);
         assert!(tok.verify(&s, 50).is_ok());
         assert!(tok.verify(&s, 100).is_err()); // expired at boundary
-        // Tamper with a field → signature check fails.
+                                               // Tamper with a field → signature check fails.
         let mut evil = tok.clone();
         evil.agent_id = "agent-2".into();
         assert!(evil.verify(&s, 50).is_err());

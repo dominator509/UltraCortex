@@ -162,7 +162,7 @@ mod tests {
         assert_eq!(a, b); // deterministic
         let base_hits = a.iter().filter(|x| **x).count();
         let boosted_hits = run(10.0).iter().filter(|x| **x).count();
-        assert!(base_hits >= 1 && base_hits <= 40, "base_hits={base_hits}");
+        assert!((1..=40).contains(&base_hits), "base_hits={base_hits}");
         assert!(
             boosted_hits > base_hits * 3,
             "boosted={boosted_hits} base={base_hits}"

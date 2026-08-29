@@ -45,7 +45,7 @@ impl Embedder for HashEmbedder {
     fn embed(&self, text: &str) -> Vec<f32> {
         let mut v = vec![0f32; self.dim];
         let tokens: Vec<String> = tokenize(text);
-        let mut bump = |s: &str, weight: f32, v: &mut Vec<f32>| {
+        let bump = |s: &str, weight: f32, v: &mut Vec<f32>| {
             let h = fnv1a64(s.as_bytes());
             let idx = (h % self.dim as u64) as usize;
             let sign = if (h >> 63) & 1 == 0 { 1.0 } else { -1.0 };
@@ -785,7 +785,7 @@ mod tests {
         let hits = h.search(&e.embed("warden audits the librarian"), 3);
         assert!(!hits.is_empty());
         assert_eq!(hits[0].1, 2); // the warden sentence
-        // Determinism: same seed + insert order => same results.
+                                  // Determinism: same seed + insert order => same results.
         let mut h2 = Hnsw::new(42);
         for text in &corpus {
             h2.insert(e.embed(text));

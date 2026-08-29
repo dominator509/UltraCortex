@@ -260,7 +260,9 @@ impl CellBehavior for CatalogCell {
         let entry = CatalogEntry {
             cell_id: update.req_u64("cell_id")?,
             cell_type: update.req_str("cell_type")?,
-            namespace: update.opt_str("namespace").unwrap_or_else(|| "default".into()),
+            namespace: update
+                .opt_str("namespace")
+                .unwrap_or_else(|| "default".into()),
             schema_id: update.opt_str("schema_id").unwrap_or_default(),
             registered_at: at,
         };

@@ -1,12 +1,14 @@
 # HANDOFF.md — UltraCortex v1.0 Live GAP Register
 
-**Status:** v1.0 | Live tracking | Update cadence: every HALT | Audited against current checkout on 2026-08-13 (`cargo test`: 162 passed)
+**Status:** v1.0 | Live tracking | Update cadence: every HALT | Audited against current checkout on 2026-08-27 (historical baseline: `cargo test` 162 passed)
 
 ## §0 Conventions
 Four GAP namespaces: `GAP-NNN` (carryover), `GAP-NT-NNN` (Trinity), `GAP-DS-NNN` (DeepSeek), `GAP-CU-NNN` (Curator pair — NEW v1.0). Status: open / in_progress / blocked / resolved / quarantined / deferred / closed.
 
 Rows marked `closed` below are gaps whose implementation now exists in the current checkout and is covered by local code/tests. Rows marked `in_progress` have concrete behavior implemented but lack a full benchmark/closure proof. Rows left `open` or `deferred` remain real policy, benchmark, deployment, or runtime-environment gaps even if some supporting code already exists.
-Second-pass checklist audit on 2026-08-13 found no stale open/deferred rows; the remaining notes below were tightened to match the live checkout.
+The 2026-08-27 independent-audit remediation pass supersedes stale implementation notes in the status pages. The open and deferred rows below remain real policy, product-scope, benchmark, deployment, or runtime-environment gaps.
+
+Source-confirmed release-audit findings are reconciled in [`RELEASE_AUDIT_REMEDIATION.md`](../RELEASE_AUDIT_REMEDIATION.md). That record covers AUD-001 through AUD-018 without changing the product-gap classifications below: implementation remediations are distinct from hosted, operator-owned, runtime, legal, and external-review evidence.
 
 ## §1 Carryover GAPs
 | ID | Description | Phase | Status | Audit note |
@@ -60,7 +62,7 @@ Second-pass checklist audit on 2026-08-13 found no stale open/deferred rows; the
 | GAP-CU-004 | Disagreement quota bounds (default 92–97%) | 1G | closed | Quota defaults are implemented (`0.92`/`0.97`) in `CuratorConfig`, loaded from TOML/env, and enforced in `CrossCheckLedgerCell::health`. |
 | GAP-CU-005 | Adversarial probe schedule + corpus | 1G | closed | v1.0 ratifies deterministic fabricated-handle probes at base rate `0.001`, with `x10` boost under suspicious agreement; scheduler and probe-path coverage exist locally and the admin plane surfaces the defaults. |
 | GAP-CU-006 | Calibration drift detection window size | 1G | closed | v1.0 ratifies a rolling window of `50` outcomes with degraded mode below `0.85` for High and `0.60` for Medium confidence bands; thresholds are tested and surfaced by `curator status`. |
-| GAP-CU-007 | Adjudicator LLM pool composition (3 vs 5 models) | 1G | closed | Default pool is explicit and concrete (`phi-3.5-mini`, `llama-3.2-3b`, `smollm2-1.7b`) with seeded rotation over configured members. |
+| GAP-CU-007 | Adjudicator LLM pool composition (3 vs 5 models) | 1G | closed | The configured pool is explicit and seeded; strict production boot now requires a verified runner and SHA pin for every configured member, while deterministic backends are development-only. Real pool-model execution remains an operator evidence gate. |
 | GAP-CU-008 | Adjudicator rotation policy details | 1G | closed | Rotation is implemented as `seed % pool.len()`, with judge-specific tie-break salt and policy table precedence before pool voting. |
 | GAP-CU-009 | Cross-check ledger retention horizon | 1G | closed | v1.0 now ratifies indefinite local retention for CrossCheck records (never prune in-process); the admin plane surfaces the policy and snapshot/restore coverage proves records persist. |
 | GAP-CU-010 | Per-Cell KV cache size budget | 1G | closed | v1.0 now ratifies supported KV-budget profiles (`small`, `reference`, `heavy`), surfaces the derived per-Cell MiB limits through `curator status`, and validates operator overrides in bootstrap/config parsing. |
@@ -81,6 +83,10 @@ After Phase 1A.3 (CongruenceCell live): every pair (doc_i, doc_j) in the SoT-13 
 ## §8 Next Actions
 - Per-gap closure criteria now live in `GAP_CLOSURE_CHECKLIST.md`.
 - Assign owners to all `Owner: TBD` rows.
-- Provision the operator-owned `llama-cli` and the two SHA-pinned GGUF files before a production (non-`--dry-run`) boot; no software credential is required.
+- Provision the operator-owned `llama-cli`, Librarian/Warden weights, and every SHA-pinned Adjudicator pool weight before a production (non-`--dry-run`) boot; no software credential is required.
+- Run the crash matrix, snapshot concurrency stress, real-model timeout drill, T1/T2/T3 raw-file inspection, external security scans, and final hosted CI/branch-protection checks listed in `RELEASE_AUDIT_REMEDIATION.md`.
+
+## §9 Independent Release Audit
+The supplied audit targeted commit `8aa52264ee495262824a80edbd261870bd87e54d`. The remediation record maps each AUD item to the current source and local regressions. Engineering does not close AUD-018 (license/legal) or claim hosted/runtime/production-model evidence from local tests.
 
 _End of HANDOFF.md v1.0 (UltraCortex)._

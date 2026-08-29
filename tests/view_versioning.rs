@@ -167,7 +167,11 @@ fn stale_versions_reject_without_migration_and_upgrade_with_opt_in() {
     assert_eq!(migrated.result.opt_u64("view_version"), Some(bumped));
     assert_eq!(migrated.result.opt_u64("migrated_from"), Some(current));
     assert_eq!(migrated.result.opt_bool("cached"), Some(false));
-    let bytes = migrated.result.get("view").and_then(|v| v.as_bytes()).unwrap();
+    let bytes = migrated
+        .result
+        .get("view")
+        .and_then(|v| v.as_bytes())
+        .unwrap();
     let decoded = decode_view(bytes).unwrap();
     assert_eq!(decoded.header.opt_u64("version"), Some(bumped));
 

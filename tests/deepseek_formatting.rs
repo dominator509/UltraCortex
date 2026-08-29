@@ -65,7 +65,10 @@ fn deepseek_coder_uses_real_fim_tags() {
             &tok,
             Cbor::map(vec![
                 ("view_id", Cbor::t("fact_subject")),
-                ("params", Cbor::map(vec![("subject", Cbor::t("repo.router"))])),
+                (
+                    "params",
+                    Cbor::map(vec![("subject", Cbor::t("repo.router"))]),
+                ),
                 ("formatting", Cbor::t("deepseek_fim")),
                 ("client_kind", Cbor::t("deepseek-coder")),
                 ("prefix", Cbor::t("fn main() {\n")),
@@ -92,7 +95,10 @@ fn non_coder_variants_downgrade_to_plain_splice() {
                 &tok,
                 Cbor::map(vec![
                     ("view_id", Cbor::t("fact_subject")),
-                    ("params", Cbor::map(vec![("subject", Cbor::t("repo.router"))])),
+                    (
+                        "params",
+                        Cbor::map(vec![("subject", Cbor::t("repo.router"))]),
+                    ),
                     ("formatting", Cbor::t("deepseek_fim")),
                     ("client_kind", Cbor::t(client_kind)),
                     ("prefix", Cbor::t("fn main() {\n")),

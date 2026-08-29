@@ -28,7 +28,17 @@ Implementation coverage, deviations, and known gaps are tracked in
 - Package: `ultracortex`
 - Toolchain target: Rust `1.75+`
 - License field: `LicenseRef-TBD`
-- Local validation: `cargo test` passes (`162 passed`, 7 suites).
+- Historical local baseline: `cargo test` passed (`162 passed`, 7 suites).
+  The current audit-remediation working-tree gate is
+  `cargo test --all-targets` (`171 passed`, 6 suites), with
+  `cargo fmt --check`, strict Clippy, and `git diff --check` also passing.
+  The current audit-remediation release gates are recorded in
+  [`RELEASE_AUDIT_REMEDIATION.md`](RELEASE_AUDIT_REMEDIATION.md) and must be
+  rerun against the final release commit.
+- Independent audit status: source-confirmed implementation findings are
+  reconciled in [`RELEASE_AUDIT_REMEDIATION.md`](RELEASE_AUDIT_REMEDIATION.md);
+  licensing, hosted CI, production-model, and runtime evidence gates remain
+  open until verified.
 - Acceptance bench: [`tests/acceptance_bench.rs`](tests/acceptance_bench.rs) records `856` bytes p50, `1052` bytes p99, `84.21%` prefix-cache hit rate, and `0.25` hydrate/recall ratio; the measured artifact lives at [`docs/benchmarks/deepseek_acceptance_2026-07-07.json`](docs/benchmarks/deepseek_acceptance_2026-07-07.json).
 - Snapshot bench: [`tests/acceptance_bench.rs`](tests/acceptance_bench.rs) records `392 µs` p50 and `562 µs` p99/max for the admin snapshot pause window on a seeded Router workload; the measured artifact lives at [`docs/benchmarks/snapshot_pause_2026-07-07.json`](docs/benchmarks/snapshot_pause_2026-07-07.json).
 
@@ -80,7 +90,10 @@ Core verbs:
 - `supersede`
 
 Governed rejections are quarantined rather than dropped, and responses
-can carry `tokens_emitted`, `next_tier_hint`, and `quarantine_id`.
+can carry `tokens_emitted`, `next_tier_hint`, `quarantine_id`, and the
+request `seed`. Subscription delivery is an authenticated pull protocol:
+clients use `events` / `events_ack` with pending queues or a `since` cursor;
+the server does not promise unsolicited event frames.
 
 ## Operator commands
 
@@ -111,11 +124,13 @@ rotation seam. `metrics export` posts the in-process registry as OTLP/HTTP
 JSON to the configured collector (default `http://127.0.0.1:4318/v1/metrics`).
 
 Production Curator boot selects SHA-pinned Gemma 2 2B Q4_K_M for the
-Librarian and Qwen 2.5 Coder 1.5B Q4_K_M for the Warden. Place the verified
-files at `ultracortex-data/weights/librarian/<sha256>.gguf` and
-`ultracortex-data/weights/warden/<sha256>.gguf`, and put `llama-cli` on PATH;
-`ultracortex curator verify-weights` checks them. `--dry-run` and the test
-suite intentionally use explicit development mode, so they need neither
+Librarian, Qwen 2.5 Coder 1.5B Q4_K_M for the Warden, and requires a
+verified runner and SHA pin for every configured Adjudicator pool member.
+Place the verified files at `ultracortex-data/weights/librarian/<sha256>.gguf`,
+`ultracortex-data/weights/warden/<sha256>.gguf`, and the configured pool
+locations, and put `llama-cli` on PATH; `ultracortex curator verify-weights`
+checks them. Missing production artifacts fail closed. `--dry-run` and the
+test suite intentionally use explicit development mode, so they need neither
 model files nor software credentials.
 
 ## Repository layout

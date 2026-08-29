@@ -22,7 +22,7 @@ use crate::core::{UcError, UcResult};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // Manifest
@@ -191,7 +191,9 @@ impl KeyRingState {
                     .and_then(|v| v.as_bytes())
                     .ok_or_else(|| UcError::schema("kms keyring: missing key material"))?;
                 if raw.len() != 32 {
-                    return Err(UcError::schema("kms keyring: key material must be 32 bytes"));
+                    return Err(UcError::schema(
+                        "kms keyring: key material must be 32 bytes",
+                    ));
                 }
                 let mut key = [0u8; 32];
                 key.copy_from_slice(raw);
@@ -318,9 +320,11 @@ fn load_or_create_keyring(data_dir: &Path) -> UcResult<(PathBuf, KeyRingState)> 
         generate_root_key(b"ultracortex.kms.root")
     };
 
-    let mut state = KeyRingState::default();
-    state.active_key_id = 1;
-    state.keys.insert(1, key);
+    let state = KeyRingState {
+        active_key_id: 1,
+        keys: BTreeMap::from([(1, key)]),
+        ..KeyRingState::default()
+    };
     atomic_write(&state_path, &state.to_cbor().encode())?;
     restrict_perms(&state_path);
     Ok((state_path, state))
@@ -360,10 +364,7 @@ impl Kms {
     fn derive_active(&self, purpose: &str) -> Option<(u64, [u8; 32])> {
         let state = self.state.lock().unwrap();
         let key = state.keys.get(&state.active_key_id).copied()?;
-        Some((
-            state.active_key_id,
-            hmac_sha256(&key, purpose.as_bytes()),
-        ))
+        Some((state.active_key_id, hmac_sha256(&key, purpose.as_bytes())))
     }
 
     fn derive_for_key_id(&self, key_id: u64, purpose: &str) -> Option<[u8; 32]> {
@@ -541,6 +542,16 @@ impl Kms {
         }
     }
 
+    /// Read a payload written by the current or a pre-encryption checkout.
+    /// Legacy files have no envelope marker; they remain acceptable only to
+    /// the caller's content-integrity check.
+    pub fn unseal_legacy(&self, purpose: &str, sealed: &[u8]) -> UcResult<Vec<u8>> {
+        match sealed.first().copied() {
+            Some(0x00..=0x02) => self.unseal(purpose, sealed),
+            _ => Ok(sealed.to_vec()),
+        }
+    }
+
     /// T2+ batch signature over CrossCheckLedger record batches (§CCL-7).
     pub fn batch_sign(&self, records_hash: &[u8; 32]) -> Option<BatchSignature> {
         if self.tier == EncryptionTier::T2 || self.tier == EncryptionTier::T3 {
@@ -554,14 +565,16 @@ impl Kms {
         }
     }
 
-    pub fn verify_batch_signature(&self, signature: &BatchSignature, records_hash: &[u8; 32]) -> bool {
+    pub fn verify_batch_signature(
+        &self,
+        signature: &BatchSignature,
+        records_hash: &[u8; 32],
+    ) -> bool {
         if self.tier != EncryptionTier::T2 && self.tier != EncryptionTier::T3 {
             return false;
         }
         self.derive_for_key_id(signature.key_id, "cross_check.batch")
-            .map(|key| {
-                crate::core::crypto::ct_eq(&hmac_sha256(&key, records_hash), &signature.mac)
-            })
+            .map(|key| crate::core::crypto::ct_eq(&hmac_sha256(&key, records_hash), &signature.mac))
             .unwrap_or(false)
     }
 
@@ -591,15 +604,22 @@ fn restrict_perms(_path: &Path) {}
 pub struct CasStore {
     root: PathBuf,
     refcounts: Mutex<HashMap<[u8; 32], u64>>,
+    kms: Arc<Kms>,
 }
 
 impl CasStore {
     pub fn open(data_dir: &Path) -> UcResult<CasStore> {
+        let kms = Arc::new(Kms::open(data_dir, EncryptionTier::T0)?);
+        Self::open_with_kms(data_dir, kms)
+    }
+
+    pub fn open_with_kms(data_dir: &Path, kms: Arc<Kms>) -> UcResult<CasStore> {
         let root = data_dir.join("cas");
         std::fs::create_dir_all(&root)?;
         Ok(CasStore {
             root,
             refcounts: Mutex::new(HashMap::new()),
+            kms,
         })
     }
 
@@ -614,7 +634,12 @@ impl CasStore {
         let hash = sha256(bytes);
         let path = self.path_for(&hash);
         if !path.exists() {
-            atomic_write(&path, bytes)?;
+            let sealed = self.kms.seal(
+                "cas.payload",
+                u64::from_le_bytes(hash[..8].try_into().unwrap()),
+                bytes,
+            );
+            atomic_write(&path, &sealed)?;
         }
         *self.refcounts.lock().unwrap().entry(hash).or_insert(0) += 1;
         Ok(hash)
@@ -622,9 +647,20 @@ impl CasStore {
 
     pub fn get(&self, hash: &[u8; 32]) -> UcResult<Vec<u8>> {
         let path = self.path_for(hash);
-        let bytes = std::fs::read(&path).map_err(|_| {
-            UcError::not_found(format!("cas blob {} not found", hex(hash)))
-        })?;
+        let sealed = std::fs::read(&path)
+            .map_err(|_| UcError::not_found(format!("cas blob {} not found", hex(hash))))?;
+        let bytes = self
+            .kms
+            .unseal_legacy("cas.payload", &sealed)
+            .or_else(|e| {
+                // A legacy plaintext blob may begin with an envelope marker by
+                // chance. Accept it only when its content address still matches.
+                if sha256(&sealed) == *hash {
+                    Ok(sealed.clone())
+                } else {
+                    Err(e)
+                }
+            })?;
         // Verify on read — the store is self-checking (§6.2).
         if &sha256(&bytes) != hash {
             return Err(UcError::internal(format!(
@@ -675,13 +711,19 @@ impl CasStore {
 
 pub struct SnapshotStore {
     dir: PathBuf,
+    kms: Arc<Kms>,
 }
 
 impl SnapshotStore {
     pub fn open(data_dir: &Path) -> UcResult<SnapshotStore> {
+        let kms = Arc::new(Kms::open(data_dir, EncryptionTier::T0)?);
+        Self::open_with_kms(data_dir, kms)
+    }
+
+    pub fn open_with_kms(data_dir: &Path, kms: Arc<Kms>) -> UcResult<SnapshotStore> {
         let dir = data_dir.join("snapshots");
         std::fs::create_dir_all(&dir)?;
-        Ok(SnapshotStore { dir })
+        Ok(SnapshotStore { dir, kms })
     }
 
     /// Write a full-state snapshot. `states` is `cell_id -> state cbor`.
@@ -689,12 +731,7 @@ impl SnapshotStore {
     pub fn write(&self, logical_at: u64, states: &BTreeMap<u64, Cbor>) -> UcResult<String> {
         let cells: Vec<Cbor> = states
             .iter()
-            .map(|(id, st)| {
-                Cbor::map(vec![
-                    ("cell_id", Cbor::U64(*id)),
-                    ("state", st.clone()),
-                ])
-            })
+            .map(|(id, st)| Cbor::map(vec![("cell_id", Cbor::U64(*id)), ("state", st.clone())]))
             .collect();
         let snap = Cbor::map(vec![
             ("logical_at", Cbor::U64(logical_at)),
@@ -703,12 +740,14 @@ impl SnapshotStore {
         let bytes = snap.encode();
         let digest = hex(&sha256(&bytes));
         let name = format!("snap-{:016}-{}.cbor", logical_at, &digest[..12]);
-        atomic_write(&self.dir.join(&name), &bytes)?;
+        let sealed = self.kms.seal("snapshot.payload", logical_at, &bytes);
+        atomic_write(&self.dir.join(&name), &sealed)?;
         Ok(name)
     }
 
     pub fn load(&self, name: &str) -> UcResult<(u64, BTreeMap<u64, Cbor>)> {
-        let bytes = std::fs::read(self.dir.join(name))?;
+        let sealed = std::fs::read(self.dir.join(name))?;
+        let bytes = self.kms.unseal_legacy("snapshot.payload", &sealed)?;
         let c = Cbor::decode(&bytes)?;
         let at = c.req_u64("logical_at")?;
         let mut states = BTreeMap::new();
@@ -803,6 +842,7 @@ pub struct PrefixCacheStore {
     root: PathBuf,
     index_path: PathBuf,
     inner: Mutex<CacheInner>,
+    kms: Arc<Kms>,
 }
 
 #[derive(Default)]
@@ -813,6 +853,11 @@ struct CacheInner {
 
 impl PrefixCacheStore {
     pub fn open(data_dir: &Path) -> UcResult<PrefixCacheStore> {
+        let kms = Arc::new(Kms::open(data_dir, EncryptionTier::T0)?);
+        Self::open_with_kms(data_dir, kms)
+    }
+
+    pub fn open_with_kms(data_dir: &Path, kms: Arc<Kms>) -> UcResult<PrefixCacheStore> {
         let root = data_dir.join("cache");
         for t in [CacheTier::L1, CacheTier::L2, CacheTier::L3] {
             std::fs::create_dir_all(root.join(t.dirname()))?;
@@ -823,6 +868,7 @@ impl PrefixCacheStore {
             index_path: index_dir.join("view_keys.cbor"),
             root,
             inner: Mutex::new(CacheInner::default()),
+            kms,
         };
         store.load_index()?;
         Ok(store)
@@ -837,18 +883,17 @@ impl PrefixCacheStore {
                 return None;
             }
             entry.last_used = now;
-            path = self
-                .root
-                .join(entry.tier.dirname())
-                .join(key.file_stem());
+            path = self.root.join(entry.tier.dirname()).join(key.file_stem());
         }
-        std::fs::read(&path).ok()
+        let sealed = std::fs::read(&path).ok()?;
+        self.kms.unseal_legacy("cache.payload", &sealed).ok()
     }
 
     pub fn put(&self, key: ViewKey, bytes: &[u8], deps: Vec<String>, now: u64) -> UcResult<()> {
         let tier = CacheTier::for_size(bytes.len());
         let path = self.root.join(tier.dirname()).join(key.file_stem());
-        atomic_write(&path, bytes)?;
+        let sealed = self.kms.seal("cache.payload", now, bytes);
+        atomic_write(&path, &sealed)?;
         let mut inner = self.inner.lock().unwrap();
         let size = bytes.len() as u64;
         if let Some(old) = inner.entries.insert(
@@ -891,9 +936,8 @@ impl PrefixCacheStore {
     pub fn purge_all(&self) -> UcResult<()> {
         let mut inner = self.inner.lock().unwrap();
         for (key, entry) in inner.entries.iter() {
-            let _ = std::fs::remove_file(
-                self.root.join(entry.tier.dirname()).join(key.file_stem()),
-            );
+            let _ =
+                std::fs::remove_file(self.root.join(entry.tier.dirname()).join(key.file_stem()));
         }
         inner.entries.clear();
         inner.tier_bytes.clear();
@@ -914,9 +958,8 @@ impl PrefixCacheStore {
                 .map(|(k, _)| k.clone());
             let Some(victim) = victim else { break };
             if let Some(e) = inner.entries.remove(&victim) {
-                let _ = std::fs::remove_file(
-                    self.root.join(e.tier.dirname()).join(victim.file_stem()),
-                );
+                let _ =
+                    std::fs::remove_file(self.root.join(e.tier.dirname()).join(victim.file_stem()));
                 *inner.tier_bytes.entry(e.tier.dirname()).or_insert(0) =
                     inner.tier_bytes[e.tier.dirname()].saturating_sub(e.size);
             }
@@ -943,14 +986,17 @@ impl PrefixCacheStore {
                 ])
             })
             .collect();
-        atomic_write(&self.index_path, &Cbor::Array(items).encode())
+        let bytes = Cbor::Array(items).encode();
+        let sealed = self.kms.seal("cache.index", 0, &bytes);
+        atomic_write(&self.index_path, &sealed)
     }
 
     fn load_index(&self) -> UcResult<()> {
         if !self.index_path.exists() {
             return Ok(());
         }
-        let bytes = std::fs::read(&self.index_path)?;
+        let sealed = std::fs::read(&self.index_path)?;
+        let bytes = self.kms.unseal_legacy("cache.index", &sealed)?;
         let c = Cbor::decode(&bytes)?;
         let mut inner = self.inner.lock().unwrap();
         if let Some(arr) = c.as_array() {
@@ -1048,16 +1094,16 @@ mod tests {
     #[test]
     fn manifest_roundtrip() {
         let dir = tmpdir("manifest");
-        let mut m = Manifest {
+        let m = Manifest {
             node_id: "node-01".into(),
             proto_version: 1,
             logical_at: 99,
             clean_shutdown: true,
             encryption_tier: "T1".into(),
             shard_count: 4,
+            state_hashes: BTreeMap::from([(3, [7u8; 32])]),
             ..Default::default()
         };
-        m.state_hashes.insert(3, [7u8; 32]);
         m.save(&dir).unwrap();
         let loaded = Manifest::load(&dir).unwrap().unwrap();
         assert_eq!(loaded.node_id, "node-01");
@@ -1081,7 +1127,10 @@ mod tests {
         assert!(kms.unseal("wal.shard-00", &bad).is_err());
         // Same key file reloads.
         let kms2 = Kms::open(&dir, EncryptionTier::T1).unwrap();
-        assert_eq!(kms2.unseal("wal.shard-00", &sealed).unwrap(), b"secret payload");
+        assert_eq!(
+            kms2.unseal("wal.shard-00", &sealed).unwrap(),
+            b"secret payload"
+        );
         // T0 passthrough.
         let kms0 = Kms::open(&dir, EncryptionTier::T0).unwrap();
         let plain = kms0.seal("x", 0, b"open");
@@ -1152,6 +1201,48 @@ mod tests {
         let p = cas.path_for(&h);
         std::fs::write(&p, b"hello caS").unwrap();
         assert!(cas.get(&h).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t1_storage_boundaries_do_not_store_plaintext_payloads() {
+        let dir = tmpdir("t1-boundaries");
+        let kms = std::sync::Arc::new(Kms::open(&dir, EncryptionTier::T1).unwrap());
+        let sentinel = b"storage-boundary-secret";
+
+        let cas = CasStore::open_with_kms(&dir, kms.clone()).unwrap();
+        let hash = cas.put(sentinel).unwrap();
+        let cas_raw = std::fs::read(cas.path_for(&hash)).unwrap();
+        assert!(!cas_raw.windows(sentinel.len()).any(|w| w == sentinel));
+        assert_eq!(cas.get(&hash).unwrap(), sentinel);
+
+        let snapshots = SnapshotStore::open_with_kms(&dir, kms.clone()).unwrap();
+        let mut states = BTreeMap::new();
+        states.insert(1u64, Cbor::t(String::from_utf8(sentinel.to_vec()).unwrap()));
+        let snapshot = snapshots.write(7, &states).unwrap();
+        let snapshot_raw = std::fs::read(snapshots.dir.join(&snapshot)).unwrap();
+        assert!(!snapshot_raw.windows(sentinel.len()).any(|w| w == sentinel));
+        assert_eq!(
+            snapshots.load(&snapshot).unwrap().1[&1],
+            Cbor::t("storage-boundary-secret")
+        );
+
+        let cache = PrefixCacheStore::open_with_kms(&dir, kms).unwrap();
+        let key = ViewKey {
+            view_id: "boundary".into(),
+            ns: "default".into(),
+            version: 1,
+            params_hash: sha256(b"boundary"),
+        };
+        cache.put(key.clone(), sentinel, Vec::new(), 8).unwrap();
+        let cache_path = cache
+            .root
+            .join(CacheTier::L1.dirname())
+            .join(key.file_stem());
+        let cache_raw = std::fs::read(cache_path).unwrap();
+        assert!(!cache_raw.windows(sentinel.len()).any(|w| w == sentinel));
+        assert_eq!(cache.get(&key, 9).unwrap(), sentinel);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
